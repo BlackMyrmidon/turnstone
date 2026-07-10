@@ -55,7 +55,7 @@ COPY docker/healthcheck.py /usr/local/bin/healthcheck.py
 
 # Entrypoint script — runs migrations before starting
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-
+RUN chmod +x /usr/local/bin/entrypoint.sh
 # Data directory — SQLite DB is created in CWD
 WORKDIR /data
 RUN chown turnstone:turnstone /data
