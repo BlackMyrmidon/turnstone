@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+from tests._session_helpers import as_stream
+from tests._session_helpers import mock_completion_result as _mock_result
 from turnstone.core.judge import IntentJudge, IntentVerdict, JudgeConfig, evaluate_heuristic
+from turnstone.core.trajectory import Role
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -30,16 +33,12 @@ def _make_mock_provider(
     caps.max_output_tokens = 4096
     provider.get_capabilities.return_value = caps
 
-    result = MagicMock()
-    result.content = response_content
-    result.tool_calls = tool_calls
-    result.finish_reason = "stop"
-    result.usage = None
-
     if side_effect:
-        provider.create_completion.side_effect = side_effect
+        provider.create_streaming.side_effect = side_effect
     else:
-        provider.create_completion.return_value = result
+        provider.create_streaming.return_value = as_stream(
+            _mock_result(response_content, tool_calls)
+        )
 
     provider.convert_tools.side_effect = lambda tools, **kw: tools
 
@@ -71,7 +70,7 @@ def _make_judge(
         session_provider=provider,
         session_client=client,
         session_model="test-model",
-        context_window=100_000,
+        session_capabilities=MagicMock(context_window=100_000),
     )
 
 
@@ -256,9 +255,8 @@ class TestErrorHandling:
     def test_empty_content_returns_none(self):
         """Provider returns empty content, no tool calls."""
         provider = _make_mock_provider(response_content="")
-        result_mock = provider.create_completion.return_value
-        result_mock.tool_calls = None
-        result_mock.content = ""
+        result_mock = _mock_result("", None)
+        provider.create_streaming.return_value = as_stream(result_mock)
 
         judge = _make_judge(provider)
         result = judge._evaluate_single(
@@ -272,10 +270,9 @@ class TestErrorHandling:
     def test_empty_content_length_stop_no_retry(self):
         """When finish_reason is 'length', don't retry — return None immediately."""
         provider = _make_mock_provider(response_content="")
-        result_mock = provider.create_completion.return_value
-        result_mock.tool_calls = None
-        result_mock.content = ""
+        result_mock = _mock_result("", None)
         result_mock.finish_reason = "length"
+        provider.create_streaming.return_value = as_stream(result_mock)
 
         judge = _make_judge(provider)
         result = judge._evaluate_single(
@@ -286,7 +283,7 @@ class TestErrorHandling:
         )
         assert result is None
         # Should have been called exactly once — no retries
-        assert provider.create_completion.call_count == 1
+        assert provider.create_streaming.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +329,7 @@ class TestCancelEventSemantics:
         assert all(v.tier == "llm_fallback" for v in results)
         assert all("cancelled" in v.reasoning for v in results)
         # ...and no inference was spent after the abort signal.
-        assert provider.create_completion.call_count == 0
+        assert provider.create_streaming.call_count == 0
 
     def test_unfired_event_runs_every_item_with_default_config(self):
         """The run-to-completion contract: with cancel_on_approval=False
@@ -355,7 +352,7 @@ class TestCancelEventSemantics:
 
         assert [v.call_id for v in results] == ["tc_0", "tc_1", "tc_2"]
         assert all(v.tier == "llm" for v in results)
-        assert provider.create_completion.call_count == 3
+        assert provider.create_streaming.call_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -375,24 +372,23 @@ class TestMultiTurnToolUse:
         provider.convert_tools.side_effect = lambda tools, **kw: tools
 
         # Turn 1: tool call
-        turn1 = MagicMock()
-        turn1.content = ""
-        turn1.tool_calls = [
-            {
-                "id": "tc_judge_1",
-                "function": {
-                    "name": "read_file",
-                    "arguments": json.dumps({"path": "/nonexistent/file.txt"}),
-                },
-            }
-        ]
+        turn1 = _mock_result(
+            "",
+            [
+                {
+                    "id": "tc_judge_1",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": "/nonexistent/file.txt"}),
+                    },
+                }
+            ],
+        )
 
         # Turn 2: verdict
-        turn2 = MagicMock()
-        turn2.content = _good_verdict_json()
-        turn2.tool_calls = None
+        turn2 = _mock_result(_good_verdict_json())
 
-        provider.create_completion.side_effect = [turn1, turn2]
+        provider.create_streaming.side_effect = [as_stream(turn1), as_stream(turn2)]
 
         judge = _make_judge(provider)
         verdict = judge._evaluate_single(
@@ -403,7 +399,7 @@ class TestMultiTurnToolUse:
         )
         assert verdict is not None
         assert verdict.tier == "llm"
-        assert provider.create_completion.call_count == 2
+        assert provider.create_streaming.call_count == 2
 
     def test_max_turns_reached(self):
         """Provider keeps requesting tools — stops at _JUDGE_MAX_TURNS."""
@@ -416,30 +412,29 @@ class TestMultiTurnToolUse:
         provider.convert_tools.side_effect = lambda tools, **kw: tools
 
         # Every turn returns a tool call
-        tool_result = MagicMock()
-        tool_result.content = ""
-        tool_result.tool_calls = [
-            {
-                "id": "tc_loop",
-                "function": {
-                    "name": "read_file",
-                    "arguments": json.dumps({"path": "/tmp/x"}),
-                },
-            }
-        ]
+        tool_result = _mock_result(
+            "",
+            [
+                {
+                    "id": "tc_loop",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": "/tmp/x"}),
+                    },
+                }
+            ],
+        )
 
         # Last turn (no tools param) returns text content
-        final = MagicMock()
-        final.content = _good_verdict_json()
-        final.tool_calls = None
+        final = _mock_result(_good_verdict_json())
 
         # Turns 0-3: tool_call; turn 4 (last, tools=None): final verdict
-        provider.create_completion.side_effect = [
-            tool_result,
-            tool_result,
-            tool_result,
-            tool_result,
-            final,
+        provider.create_streaming.side_effect = [
+            as_stream(tool_result),
+            as_stream(tool_result),
+            as_stream(tool_result),
+            as_stream(tool_result),
+            as_stream(final),
         ]
 
         judge = _make_judge(provider)
@@ -449,8 +444,8 @@ class TestMultiTurnToolUse:
             cancel_event=None,
             client=MagicMock(),
         )
-        # Should have called create_completion exactly _JUDGE_MAX_TURNS times
-        assert provider.create_completion.call_count == 5
+        # Should have called create_streaming exactly _JUDGE_MAX_TURNS times
+        assert provider.create_streaming.call_count == 5
 
 
 # ---------------------------------------------------------------------------
@@ -468,12 +463,12 @@ class TestContextPreparation:
 
         result = judge._prepare_context(_make_item(), messages)
 
-        # Should have system message + single user message with transcript
+        # Should have a system Turn + single user Turn with the transcript
         assert len(result) == 2
-        assert result[0]["role"] == "system"
-        assert result[1]["role"] == "user"
-        assert "pending human approval" in result[1]["content"]
-        assert "Conversation context:" in result[1]["content"]
+        assert result[0].role is Role.SYSTEM
+        assert result[1].role is Role.USER
+        assert "pending human approval" in result[1].text
+        assert "Conversation context:" in result[1].text
 
 
 class TestArgBudget:
@@ -541,7 +536,7 @@ class TestArgBudget:
         )
         # Each included history turn renders one "ASSISTANT:" line; the
         # big-argument call fits strictly fewer of them.
-        assert big[1]["content"].count("ASSISTANT:") < small[1]["content"].count("ASSISTANT:")
+        assert big[1].text.count("ASSISTANT:") < small[1].text.count("ASSISTANT:")
 
 
 # ---------------------------------------------------------------------------
@@ -892,14 +887,115 @@ class TestModelAliasResolution:
         alias_provider: MagicMock,
         alias_client: MagicMock,
         underlying_model: str,
+        *,
+        capabilities: dict[str, Any] | None = None,
     ) -> MagicMock:
         registry = MagicMock()
         cfg = MagicMock()
         cfg.context_window = 50_000
+        cfg.capabilities = capabilities if capabilities is not None else {}
+        # Judges inherit the alias's configured temperature (house rule: no
+        # code pins) — give the mock config a real value so the lane
+        # resolution path is exercised, not a MagicMock leak.
+        cfg.temperature = 0.3
         registry.has_alias.side_effect = lambda a: a == alias
         registry.resolve.return_value = (alias_client, underlying_model, cfg)
+        # The unified lane resolver (model_turn.resolve_capabilities) fetches
+        # the config itself rather than taking resolve()'s copy.
+        registry.get_config.return_value = cfg
         registry.get_provider.return_value = alias_provider
         return registry
+
+    def test_alias_capabilities_merged_and_threaded_to_wire(self):
+        """#823: a judge alias's model-definition ``capabilities`` are merged
+        onto the provider base AND passed to ``create_streaming`` — the same
+        contract as the session / utility / sub-agent lanes.  Without threading,
+        operator overrides (effort passthrough, tool support) were silently
+        ignored on judge calls; deleting ``capabilities=self._capabilities`` from
+        the call site, or breaking the merge, must fail here."""
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        base = ModelCapabilities(supports_tools=True, effort_passthrough=False)
+        alias_provider = _make_mock_provider(response_content=_good_verdict_json())
+        alias_provider.get_capabilities = MagicMock(return_value=base)
+        registry = self._make_alias_registry(
+            "judge-mini",
+            alias_provider,
+            MagicMock(base_url="https://a/v1", api_key="k"),
+            "local-9b",
+            capabilities={"supports_tools": False, "effort_passthrough": True},
+        )
+        judge = IntentJudge(
+            config=JudgeConfig(enabled=True, model="judge-mini"),
+            session_provider=_make_mock_provider(),
+            session_client=MagicMock(base_url="https://s/v1", api_key="s"),
+            session_model="session-model",
+            session_capabilities=MagicMock(context_window=100_000),
+            model_registry=registry,
+        )
+        # Merged at construction: overrides applied, untouched fields survive.
+        assert judge._capabilities.supports_tools is False
+        assert judge._capabilities.effort_passthrough is True
+        assert judge._capabilities.context_window == base.context_window
+        # ...and the SAME merged object reaches the wire.
+        judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "x"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+        passed = alias_provider.create_streaming.call_args.kwargs["capabilities"]
+        assert passed is judge._capabilities
+        # House rule: the judge pins no temperature — the wire carries the
+        # alias's configured value, inherited through the lane.
+        assert alias_provider.create_streaming.call_args.kwargs["temperature"] == 0.3
+
+    def test_constructor_resolves_from_one_config_fetch(self):
+        """The constructor consumes the ModelConfig that registry.resolve()
+        already returned (the ``cfg=`` pass-through) — ZERO independent
+        get_config fetches, so a registry hot-reload between two lookups
+        cannot bind the resolved client/window to a different capability
+        generation."""
+        alias_provider = _make_mock_provider(response_content=_good_verdict_json())
+        registry = self._make_alias_registry(
+            "judge-mini",
+            alias_provider,
+            MagicMock(base_url="https://a/v1", api_key="k"),
+            "local-9b",
+        )
+        IntentJudge(
+            config=JudgeConfig(enabled=True, model="judge-mini"),
+            session_provider=_make_mock_provider(),
+            session_client=MagicMock(base_url="https://s/v1", api_key="s"),
+            session_model="session-model",
+            session_capabilities=MagicMock(context_window=100_000),
+            model_registry=registry,
+        )
+        assert registry.get_config.call_count == 0
+
+    def test_fallback_threads_session_capabilities_to_wire(self):
+        """No judge alias → the judge inherits the session model AND the
+        session's resolved capabilities, threaded to ``create_streaming``."""
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        sess_caps = ModelCapabilities(context_window=54_321, effort_passthrough=True)
+        provider = _make_mock_provider(response_content=_good_verdict_json())
+        judge = IntentJudge(
+            config=JudgeConfig(enabled=True, model=""),  # no alias → fallback
+            session_provider=provider,
+            session_client=MagicMock(base_url="https://s/v1", api_key="s"),
+            session_model="session-model",
+            session_capabilities=sess_caps,
+        )
+        assert judge._capabilities is sess_caps
+        assert judge._judge_context_window == 54_321
+        judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "x"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+        assert provider.create_streaming.call_args.kwargs["capabilities"] is sess_caps
 
     def test_alias_uses_registry_provider_not_session_provider(self):
         """Judge with model=alias should resolve via registry — provider, client,
@@ -932,7 +1028,6 @@ class TestModelAliasResolution:
             session_provider=session_provider,
             session_client=session_client,
             session_model="session-default-model",
-            context_window=100_000,
             model_registry=registry,
         )
 
@@ -959,7 +1054,6 @@ class TestModelAliasResolution:
             session_provider=_make_mock_provider(),
             session_client=MagicMock(base_url="https://s/v1", api_key="s"),
             session_model="session-model",
-            context_window=100_000,
             model_registry=registry,
         )
         assert judge._judge_context_window == 50_000
@@ -980,7 +1074,7 @@ class TestModelAliasResolution:
             session_provider=_make_mock_provider(),
             session_client=MagicMock(base_url="http://s", api_key="s"),
             session_model="session-model",
-            context_window=100_000,
+            session_capabilities=MagicMock(context_window=100_000),
             model_registry=registry,
         )
         assert judge._judge_context_window == 100_000  # session window, not 0
@@ -1008,7 +1102,7 @@ class TestModelAliasResolution:
             session_provider=session_provider,
             session_client=session_client,
             session_model="session-default-model",
-            context_window=100_000,
+            session_capabilities=MagicMock(context_window=100_000),
             model_registry=registry,
         )
 
@@ -1031,7 +1125,6 @@ class TestModelAliasResolution:
             session_provider=session_provider,
             session_client=session_client,
             session_model="session-default-model",
-            context_window=100_000,
         )
 
         assert judge._provider is session_provider

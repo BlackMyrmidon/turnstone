@@ -28,6 +28,9 @@
 // ---------------------------------------------------------------------------
 import {
   buildWatchResultCard,
+  buildCompactionCard,
+  applyCompactionEvent,
+  resetCompactionHolder,
   buildSystemNudgeMarker,
   maxSeverityItem,
   buildConvBatchShell,
@@ -41,6 +44,11 @@ import {
   indexLabel,
 } from "/shared/conversation.js";
 import { redactCredentials } from "/shared/redact_credentials.js";
+import {
+  createQueueController,
+  parsePriority,
+  settleSendResponse,
+} from "/shared/composer_queue.js";
 import {
   OVERFLOW_TRIP_COUNT,
   OVERFLOW_TRIP_WINDOW_MS,
@@ -301,6 +309,9 @@ function createCoordinatorPane(root, wsId, opts) {
     },
   });
   let busy = false;
+  // Provenance of the current busy=true (see setBusy): "server" |
+  // "optimistic" | null when idle.
+  let busySource = null;
   // Acting user (turn initiator) of the in-flight turn, from state_change
   // events; drives the shared-workstream cross-user send gate. Carries the
   // owner id even single-user (the gate just no-ops — it equals this viewer);
@@ -511,6 +522,12 @@ function createCoordinatorPane(root, wsId, opts) {
   // ui/static/app.js's per-pane _renderedSystemEventIds.
   const renderedSystemEventIds = new Set();
 
+  // Compaction lifecycle holder for the shared reducer
+  // (conversation.applyCompactionEvent); `card` is the in-progress card
+  // between start and end, nulled wherever the transcript is wiped — live
+  // events re-create it defensively.
+  const compactionHolder = { card: null, cid: null };
+
   // Cache of judge verdicts keyed by call_id.  intent_verdict and
   // approve_request are async and may arrive in either order; the
   // cache lets each handler apply data to the other without assuming
@@ -600,7 +617,11 @@ function createCoordinatorPane(root, wsId, opts) {
       rows = [parsed];
     }
     if (rows.length === 0) {
-      return "<pre>" + esc(redactCredentials(JSON.stringify(parsed, null, 2))) + "</pre>";
+      return (
+        "<pre>" +
+        esc(redactCredentials(JSON.stringify(parsed, null, 2))) +
+        "</pre>"
+      );
     }
     const lines = rows.map((row) => {
       const safeWs = row.ws_id && WS_ID_RE.test(row.ws_id) ? row.ws_id : null;
@@ -817,6 +838,14 @@ function createCoordinatorPane(root, wsId, opts) {
   // labeled operator bubble.
   function renderSystemTurn(source, content, meta) {
     const m = meta && typeof meta === "object" ? meta : null;
+    // /history projection of a persisted compaction marker — same result
+    // card the live `compaction` end event paints (shared builder).
+    if (source === "compaction") {
+      const card = buildCompactionCard(m, content || "");
+      messagesEl.appendChild(card);
+      _scheduleScroll();
+      return card;
+    }
     if (source === "watch_triggered" && m)
       return appendWatchResult(m, content || "");
     if (source === "output_guard" && m) return appendGuardFinding(m);
@@ -1850,8 +1879,15 @@ function createCoordinatorPane(root, wsId, opts) {
   // caller relies on. queue.onIdleEdge runs only on the actual edge
   // (it's the heavier work — querySelectorAll-driven promote sweep
   // plus the cancel-timer cleanup wired via the onIdle hook above).
-  function setBusy(b) {
+  function setBusy(b, source) {
     const next = !!b;
+    // Who asserted busy: "server" (default — state events and every
+    // existing/future writer) or "optimistic" (ONLY coordSend's pre-POST
+    // flip). The deferred/queue_full settle arms may clear busy solely
+    // while it is still this send's own optimistic flip — a server-
+    // stamped busy is a real turn and must never be clobbered.
+    // Centralized HERE so an unstamped future writer fails safe.
+    busySource = next ? source || "server" : null;
     composer.setBusy(next);
     // Greys out the per-message edit/rewind/retry buttons while a generation
     // is in flight (CSS: [data-busy="true"] .msg-action-btn).
@@ -1935,25 +1971,30 @@ function createCoordinatorPane(root, wsId, opts) {
     const snap = attachments.snapshot();
 
     let queuedEl = null;
-    if (busy) {
-      // Server re-parses the !!! prefix to set queue priority — the
-      // optimistic bubble strips it for display.
-      let displayText = trimmed;
-      let priority = "notice";
-      if (trimmed.startsWith("!!!")) {
-        displayText = trimmed.slice(3).trimStart();
-        priority = "important";
-      }
+    let optimisticEl = null;
+    const isBusy = busy;
+    // Display-only strip of the !!! prefix (the server re-parses it
+    // authoritatively); shared parse so the settle helper's retro-convert
+    // renders the same chip either pane would have built pre-POST.
+    const { displayText, priority } = parsePriority(trimmed);
+    if (isBusy) {
       queuedEl = queue.addQueuedMessage(displayText, priority);
     } else {
-      setBusy(true);
+      // "optimistic": no server state event asserted this — the settle
+      // arms may undo it if the send turns out deferred/refused (see
+      // setBusy's busySource contract).
+      setBusy(true, "optimistic");
       // snap.attachments carries the chip metadata (kind + filename)
       // for every stable chip the composer holds; pass it through so
       // the optimistic user bubble shows the same pill cluster the
       // history-replay path renders below.
-      appendUserMessageWithAttachments(trimmed, snap.attachments, {
-        label: "you",
-      });
+      optimisticEl = appendUserMessageWithAttachments(
+        trimmed,
+        snap.attachments,
+        {
+          label: "you",
+        },
+      );
     }
     composer.clear();
 
@@ -1975,6 +2016,10 @@ function createCoordinatorPane(root, wsId, opts) {
     let sendTimer = null;
     if (sendCtrl) {
       sendInit.signal = sendCtrl.signal;
+      // Same policy as the interactive composer: flat wedged-node bound —
+      // every /send answers within RTT now (dispatched, queued, or
+      // deferred-with-msg_id during a command window; the server parks
+      // nothing against this POST).  Dismissal is bind() → DELETE.
       sendTimer = setTimeout(() => sendCtrl.abort(), 15000);
     }
     let sendReq = authFetch(
@@ -2019,62 +2064,23 @@ function createCoordinatorPane(root, wsId, opts) {
         return r.json();
       })
       .then((data) => {
-        if (data && data.status === "queued" && data.msg_id) {
-          // Race: server returned queued but the client thought it was
-          // idle (SSE state_change hadn't arrived yet on initial load /
-          // reconnect). The optimistic user bubble is already in the
-          // log; we can't bind msg_id to a queued bubble retroactively
-          // without flipping the visual state mid-stream. Flip the busy
-          // flag so any subsequent send takes the queue path correctly,
-          // and accept the small UX gap (no in-UI dismiss for THIS
-          // message). The server still delivers it on worker drain.
-          if (queuedEl) queue.bind(queuedEl, data.msg_id);
-          else setBusy(true);
-          attachments.consume(data.attached_ids, data.dropped_attachment_ids);
-        } else if (data && data.status === "busy") {
-          if (queuedEl) queue.remove(queuedEl);
-          appendText("error", "Server is busy. Please wait.", {
-            label: "error",
-          });
-          if (!queuedEl) setBusy(false);
-        } else if (data && data.status === "queue_full") {
-          if (queuedEl) queue.remove(queuedEl);
-          appendText("error", "Message queue full. Please wait.", {
-            label: "error",
-          });
-        } else if (data && data.status === "attachments_busy") {
-          // Attachments can't ride a queued user turn — server held
-          // the reservations long enough to bounce the request and
-          // released them. Chips stay in the composer; user retries
-          // once the assistant finishes.
-          if (queuedEl) queue.remove(queuedEl);
-          appendText(
-            "error",
-            "Attachments can't be sent while the assistant is working. Send a text-only message now, or wait and resend with attachments.",
-            { label: "error" },
-          );
-        } else if (data && data.status === "cross_user_interjection") {
-          // Another participant's turn is in flight; the server refused the
-          // interjection so it can't run under their credentials or be
-          // misattributed. Reactive fallback for the click-beats-event race
-          // (the send gate normally disables the button first).
-          if (queuedEl) queue.remove(queuedEl);
-          appendText(
-            "error",
-            data.error ||
-              "Another participant's turn is in progress. Wait for it to finish, then send your message.",
-            { label: "error" },
-          );
-          if (!queuedEl) setBusy(false);
-        } else {
-          // Unknown / "ok" status (stale-busy race): settle the optimistic
-          // bubble so a pre-bind × can't strand it in the dismissing state.
-          if (queuedEl) queue.promote(queuedEl);
-          attachments.consume(
-            data && data.attached_ids,
-            data && data.dropped_attachment_ids,
-          );
-        }
+        // The full status dispatch (queued/retro-convert, busy,
+        // queue_full, attachments_busy, cross_user, unknown-ok) lives in
+        // the shared helper — ONE settle matrix for both panes; see
+        // settleSendResponse's contract for the arm semantics.
+        settleSendResponse(queue, data, {
+          queuedEl,
+          optimisticEl,
+          isBusy,
+          displayText,
+          priority,
+          setBusy: (b) => setBusy(b),
+          busyIsOptimistic: () => busy && busySource === "optimistic",
+          paneIsBusy: () => busy,
+          renderError: (msg) => appendText("error", msg, { label: "error" }),
+          consumeAttachments: (attached, droppedIds) =>
+            attachments.consume(attached, droppedIds),
+        });
       })
       .catch((e) => {
         if (queuedEl) queue.remove(queuedEl);
@@ -2745,6 +2751,11 @@ function createCoordinatorPane(root, wsId, opts) {
         }
         break;
       case "stream_end":
+        // A live in-progress compaction card here means a FORCE stop
+        // abandoned the compaction worker (the lifecycle wrapper otherwise
+        // always retires the card with an end event before any stream_end
+        // can follow) — remove it instead of leaving a frozen bar.
+        resetCompactionHolder(compactionHolder);
         finishAssistantStream();
         break;
       case "stream_overflow":
@@ -2922,6 +2933,19 @@ function createCoordinatorPane(root, wsId, opts) {
         if (sysEid) renderedSystemEventIds.add(sysEid);
         break;
       }
+      case "compaction":
+        // Context-compaction lifecycle — the shared reducer
+        // (conversation.applyCompactionEvent) is the one state machine for
+        // this viewer and the interactive pane, so the two can't drift.
+        // reason="error" ends render via the paired `error` event (red row);
+        // the reducer emits only the non-error failure notices here.
+        applyCompactionEvent(compactionHolder, ev, {
+          container: messagesEl,
+          renderedIds: renderedSystemEventIds,
+          onNotice: (msg) => appendText("info", msg, { label: "info" }),
+          scroll: () => _scheduleScroll(),
+        });
+        break;
       case "connected":
         // First yield from _coord_events_replay — populates the
         // status bar's model cell before any history arrives.  Also
@@ -2991,6 +3015,14 @@ function createCoordinatorPane(root, wsId, opts) {
         // already showed it; nothing to render here. (Earlier this
         // surfaced an extra info row, which doubled up with the
         // queued bubble once the composer started rendering one.)
+        break;
+      case "message_dispatched":
+        // A deferred send left the parked list: fresh spawn (promote the
+        // chip — the ×'s window is over) or interjection fold-in
+        // (folded: true — only the deferred flag clears; the chip resumes
+        // the normal queued lifecycle). No-op when this tab holds no
+        // matching chip.
+        queue.settleDeferred(ev.msg_id, !!ev.folded);
         break;
       case "busy_error":
         // Worker is still alive after a cancel attempt; re-arm the
@@ -5009,6 +5041,7 @@ function createCoordinatorPane(root, wsId, opts) {
     toolRows.clear();
     activeBatch = null;
     renderedSystemEventIds.clear();
+    resetCompactionHolder(compactionHolder);
     if (!hist) return;
     // Fresh-connect fast-forward: when the trailing turn is an executing
     // in-flight tool batch the server can replay, /history returns a

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import uuid
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -191,6 +194,22 @@ def _install_token_store(app, storage) -> None:
     )
 
 
+def _enabled_oidc(profile: str = "entra") -> SimpleNamespace:
+    """An OIDC config that satisfies the oauth_obo write-time gate.
+
+    oauth_obo mints from the user's captured sign-in, so the write choke point
+    requires OIDC enabled + a valid ``obo_grant_profile``. Tests exercising obo
+    writes install one of these; the finding-C tests install a disabled /
+    bad-profile config instead to assert the rejection.
+    """
+    return SimpleNamespace(
+        enabled=True,
+        issuer="https://idp.example.com",
+        obo_grant_profile=profile,
+        capture_user_credential=True,
+    )
+
+
 @pytest.fixture
 def client(storage):
     """TestClient wired to console admin MCP endpoints with full permissions."""
@@ -200,6 +219,10 @@ def client(storage):
     )
     app.state.auth_storage = storage
     _install_token_store(app, storage)
+    # Default: OIDC enabled under the entra profile so oauth_obo writes pass the
+    # requirement gate. Per-test overrides install rfc8693 / disabled / bad
+    # profile as needed.
+    app.state.oidc_config = _enabled_oidc("entra")
     return TestClient(app)
 
 
@@ -697,6 +720,677 @@ class TestUpdateMcpServer:
                 .where(mcp_user_tokens.c.server_name == "url-change-purge")
             ).scalar()
         assert count_after == 0, "URL change must purge per-user tokens"
+
+    def test_admin_create_oauth_obo_requires_audience(self, client):
+        """#551: an oauth_obo row without oauth_audience is rejected at the
+        write choke point (the mint engine hard-requires it)."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-no-aud",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "oauth_audience" in r.json()["error"]
+
+    def test_admin_create_oauth_obo_without_token_store_returns_503(self, client_no_token_store):
+        """#551: creating an oauth_obo row with no encryption key is rejected —
+        accepting it would SystemExit the whole cluster at the next boot."""
+        r = client_no_token_store.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-no-key",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 503, r.text
+        assert "mcp_token_encryption_key" in r.json()["error"]
+
+    def test_admin_create_oauth_obo_happy_path(self, client):
+        """A well-formed oauth_obo row persists with its audience intact."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-ok",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["auth_type"] == "oauth_obo"
+        assert data["oauth_audience"] == "api://mcp-a"
+
+    def test_same_type_static_edit_cannot_inject_oauth_columns(self, client, storage):
+        """Review finding (SECURITY): the OAuth columns must be a pure function
+        of the target auth_type on EVERY write, not just a flip. A same-type
+        static edit that injects oauth_authorization_server_url must be scrubbed
+        to NULL — otherwise a later flip to oauth_user (which legitimately uses
+        that column) would inherit the attacker AS URL and redirect every
+        consenting user's OAuth traffic."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "static-inject",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "static",
+            },
+        )
+        sid = r.json()["server_id"]
+        # Same-type static edit trying to smuggle an oauth_user-only column.
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "auth_type": "static",
+                "oauth_authorization_server_url": "https://attacker.example",
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        row = storage.get_mcp_server(sid)
+        assert (row.get("oauth_authorization_server_url") or None) is None
+
+    def test_flip_to_oauth_user_does_not_inherit_stale_as_url(self, client, storage):
+        """Review finding (SECURITY): flipping a non-oauth_user row to oauth_user
+        must recompute the oauth_user-only columns from the request, never
+        inherit a stale/injected authorization_server_url left on the pre-flip
+        row (defence-in-depth for a value that predates the unconditional
+        scrub)."""
+        # Plant a static row that already carries a stale AS URL directly in DB.
+        storage.create_mcp_server(
+            server_id="stale-asurl-id",
+            name="stale-asurl",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="static",
+            oauth_authorization_server_url="https://attacker.example",
+        )
+        # Flip to oauth_user WITHOUT supplying an AS URL in the body.
+        r = client.put(
+            "/v1/api/admin/mcp-servers/stale-asurl-id",
+            json={"auth_type": "oauth_user", "oauth_client_id": "cli_x"},
+        )
+        assert r.status_code == 200, r.text
+        row = storage.get_mcp_server("stale-asurl-id")
+        assert (row.get("oauth_authorization_server_url") or None) is None
+        assert row.get("oauth_client_id") == "cli_x"
+
+    def test_create_obo_rejected_when_capture_disabled(self, client):
+        """Review finding: oauth_obo mints from the user's CAPTURED sign-in
+        credential, so with capture_user_credential off, login persists nothing
+        and every dispatch returns kind='missing' with an unsatisfiable remedy.
+        Reject at write time."""
+        client.app.state.oidc_config = SimpleNamespace(
+            enabled=True,
+            issuer="https://idp.example.com",
+            obo_grant_profile="entra",
+            capture_user_credential=False,
+        )
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-no-capture",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "capture_user_credential" in r.json()["error"]
+
+    def test_create_obo_rejected_when_oidc_disabled(self, client):
+        """Review finding: oauth_obo mints from the user's OIDC sign-in, so an
+        install with OIDC disabled can NEVER mint. Reject at write time (a
+        permanent misconfig otherwise surfaces per-dispatch as a retryable
+        transient that never heals)."""
+        client.app.state.oidc_config = SimpleNamespace(enabled=False, obo_grant_profile="entra")
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-no-oidc",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "OIDC" in r.json()["error"]
+
+    def test_obo_editable_when_oidc_discovery_transiently_failed(self, client, storage):
+        """Review finding: the console never runs runtime OIDC rediscovery, so a
+        transient discovery failure at console boot (enabled=False,
+        discovery_retryable=True) must NOT make oauth_obo servers un-editable /
+        un-disable-able. OIDC is still CONFIGURED (issuer set) — the write gate
+        accepts a discovery_retryable config; it rejects only a genuinely absent
+        OIDC (neither flag set)."""
+        # Seed an obo row (created while OIDC was healthy).
+        storage.create_mcp_server(
+            server_id="obo-retry-id",
+            name="obo-retry",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+        )
+        # Console process booted while the IdP was briefly unreachable.
+        client.app.state.oidc_config = SimpleNamespace(
+            enabled=False,
+            issuer="https://idp.example.com",
+            obo_grant_profile="entra",
+            capture_user_credential=True,
+            discovery_retryable=True,
+        )
+        # Disabling the misbehaving obo server must succeed, not 400.
+        r = client.put(
+            "/v1/api/admin/mcp-servers/obo-retry-id",
+            json={"enabled": False},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["enabled"] is False
+
+        # Even with OIDC fully operator-disabled (neither flag set), a same-type
+        # edit of the EXISTING obo server is still allowed — the deployment
+        # checks only fire on create / flip-into-obo, so an operator is never
+        # locked out of disabling or editing a server (review finding R8-1).
+        client.app.state.oidc_config = SimpleNamespace(
+            enabled=False,
+            issuer="",
+            obo_grant_profile="entra",
+            capture_user_credential=True,
+            discovery_retryable=False,
+        )
+        r2 = client.put(
+            "/v1/api/admin/mcp-servers/obo-retry-id",
+            json={"enabled": True},
+        )
+        assert r2.status_code == 200, r2.text
+
+    def test_create_new_obo_still_rejected_when_oidc_operator_disabled(self, client):
+        """The deployment gate still fires for a NEW obo enablement: creating a
+        fresh oauth_obo server (or flipping one into obo) while OIDC is fully
+        operator-disabled is rejected — only same-type edits of an existing obo
+        server skip the deployment checks."""
+        client.app.state.oidc_config = SimpleNamespace(
+            enabled=False,
+            issuer="",
+            obo_grant_profile="entra",
+            capture_user_credential=True,
+            discovery_retryable=False,
+        )
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-new-nooidc",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "OIDC" in r.json()["error"]
+
+    def test_create_obo_rejected_on_invalid_grant_profile(self, client):
+        """Review finding: a typo'd deployment obo_grant_profile leaves the mint
+        leg unresolved (obo_misconfigured per dispatch), so reject it at the
+        write choke point rather than as a runtime transient."""
+        client.app.state.oidc_config = _enabled_oidc("bogus-profile")
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-bad-profile",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "obo_grant_profile" in r.json()["error"]
+
+    def test_flip_user_to_obo_via_api_without_audience_is_rejected(self, client, storage):
+        """Review finding: a flip into obo must NOT carry the oauth_user-era
+        oauth_audience (a resource indicator, conventionally the MCP URL) — it
+        would pass the audience-required check and then fail every mint. An API
+        PUT of just {auth_type: oauth_obo} recomputes audience from the body
+        (absent → NULL) and is rejected loudly, not saved with the stale value."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "flip-api-noaud",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_x",
+                "oauth_audience": "https://mcp.example.com/sse",  # resource indicator
+            },
+        )
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_obo"},  # no audience in body
+        )
+        assert r2.status_code == 400, r2.text
+        assert "oauth_audience" in r2.json()["error"]
+
+    def test_update_flip_oauth_user_to_obo_keeps_audience_and_purges_tokens(self, client, storage):
+        """#551 (findings 10344 + 10326): flipping oauth_user→oauth_obo must NOT
+        null oauth_audience (the mint engine needs it), and MUST purge the old
+        per-user consent-token rows (they carry per-server-AS refresh tokens that
+        the mint cache invariant forbids)."""
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import mcp_user_tokens
+
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "flip-to-obo",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_x",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+
+        with storage._engine.connect() as conn:
+            conn.execute(
+                sa.insert(mcp_user_tokens),
+                {
+                    "user_id": "u1",
+                    "server_name": "flip-to-obo",
+                    "access_token_ct": b"\x00ct-a",
+                    "refresh_token_ct": b"\x00ct-r",
+                    "expires_at": "2026-12-31T00:00:00",
+                    "scopes": "openid",
+                    "as_issuer": "https://auth.example.com",
+                    "audience": "api://mcp-a",
+                    "created": "2026-05-04T11:00:00",
+                    "last_refreshed": None,
+                },
+            )
+            conn.commit()
+
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_obo", "oauth_audience": "api://mcp-a"},
+        )
+        assert r2.status_code == 200, r2.text
+        data = r2.json()
+        assert data["auth_type"] == "oauth_obo"
+        assert data["oauth_audience"] == "api://mcp-a"  # NOT nulled
+        # The oauth_user-only client_id is cleared.
+        assert data["oauth_client_id"] in (None, "")
+        # Old consent-token rows purged.
+        with storage._engine.connect() as conn:
+            remaining = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(mcp_user_tokens)
+                .where(mcp_user_tokens.c.server_name == "flip-to-obo")
+            ).scalar()
+        assert remaining == 0, "oauth_user→oauth_obo flip must purge stale per-user rows"
+
+    def test_flip_to_obo_clears_stale_oauth_user_scopes(self, client):
+        """#551 follow-up: flipping oauth_user→oauth_obo without supplying new
+        scopes must CLEAR the old AS-consent scopes — otherwise the rfc8693 mint
+        leg would send them and loop on invalid_scope."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "flip-scopes",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_scopes": "openid profile offline_access",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_obo", "oauth_audience": "api://mcp-a"},
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["oauth_scopes"] in (None, "")  # stale scopes cleared
+
+    def _create_oauth_user_row_with_scopes(self, client, name: str) -> str:
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": name,
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_scopes": "openid profile offline_access",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        sid: str = r.json()["server_id"]
+        return sid
+
+    def test_flip_to_obo_under_entra_rejects_explicit_scopes_but_omit_clears(self, client):
+        """Redesign: a flip into obo recomputes scopes from the body (never
+        carries the old row's value across the semantic boundary). Under entra,
+        an EXPLICIT non-empty scopes value is rejected 400 — an honest visible
+        snap rather than a silent drop — while the console-realistic flip (the
+        form clears the semantic field on the auth-type switch, so scopes is
+        omitted/empty) succeeds with scopes NULL."""
+        client.app.state.oidc_config = _enabled_oidc("entra")
+        # Explicit non-empty scopes on the flip → 400 (they can't apply on entra).
+        sid = self._create_oauth_user_row_with_scopes(client, "flip-resend-entra")
+        rejected = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+                "oauth_scopes": "openid profile offline_access",
+            },
+        )
+        assert rejected.status_code == 400
+        assert "entra" in rejected.json()["error"]
+        # The realistic flip (scopes field cleared → omitted) succeeds, NULL scopes.
+        sid2 = self._create_oauth_user_row_with_scopes(client, "flip-omit-entra")
+        ok = client.put(
+            f"/v1/api/admin/mcp-servers/{sid2}",
+            json={"auth_type": "oauth_obo", "oauth_audience": "api://mcp-a"},
+        )
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["oauth_scopes"] in (None, "")  # not carried across the flip
+
+    def test_flip_to_obo_resent_scopes_kept_under_rfc8693(self, client):
+        """Review finding: under rfc8693 oauth_scopes IS the token-exchange
+        scope — an operator flipping to obo and keeping the same value (the
+        Keycloak optional-audience scope can legitimately equal the old
+        consent scope string) must NOT have it silently nulled; only an
+        omitted field clears (previous test)."""
+        client.app.state.oidc_config = _enabled_oidc("rfc8693")
+        sid = self._create_oauth_user_row_with_scopes(client, "flip-resend-rfc")
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+                "oauth_scopes": "openid profile offline_access",
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["oauth_scopes"] == "openid profile offline_access"
+
+    def test_entra_obo_row_with_scopes_stays_editable(self, client, storage):
+        """Review finding: a pre-existing oauth_obo row carrying scopes under the
+        entra profile must stay editable — an unrelated PUT that doesn't touch
+        scopes must NOT be rejected (the entra-scope reject fires only on a real
+        scopes write)."""
+        # Seed an obo row that already has scopes (e.g. created under rfc8693).
+        storage.create_mcp_server(
+            server_id="entra-edit-id",
+            name="entra-edit",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+            oauth_scopes="custom.scope",
+        )
+        # Now the deployment is on the entra profile.
+        client.app.state.oidc_config = _enabled_oidc("entra")
+
+        # An unrelated maintenance edit (disable) — does NOT touch scopes.
+        r = client.put(
+            "/v1/api/admin/mcp-servers/entra-edit-id",
+            json={"enabled": False},
+        )
+        assert r.status_code == 200, r.text  # NOT a 400 lockout
+
+        # But actively SETTING scopes under entra is still rejected.
+        r2 = client.put(
+            "/v1/api/admin/mcp-servers/entra-edit-id",
+            json={"oauth_scopes": "another.scope"},
+        )
+        assert r2.status_code == 400, r2.text
+        assert "oauth_scopes" in r2.json()["error"]
+
+    def test_obo_server_reports_consented_users_count_for_flush_button(self, client, storage):
+        """Review finding: obo rows must report consented_users_count (users with a
+        minted cache row) so the console flush-cache action (gated on count>0)
+        renders — previously only oauth_user rows got the count."""
+        storage.create_mcp_server(
+            server_id="obo-count-id",
+            name="obo-count",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+        )
+        for i in range(2):
+            storage.create_mcp_user_token(
+                f"u{i}",
+                "obo-count",
+                access_token_ct=b"\x00ct",
+                refresh_token_ct=None,
+                expires_at="2026-12-31T00:00:00",
+                scopes=None,
+                as_issuer="https://idp.test",
+                audience="api://mcp-a",
+            )
+
+        # The list handler fans out node status; no cluster nodes in this test.
+        client.app.state.collector = SimpleNamespace(get_all_nodes=lambda: [])
+        client.app.state.proxy_client = MagicMock()
+        r = client.get("/v1/api/admin/mcp-servers")
+        assert r.status_code == 200, r.text
+        row = next(s for s in r.json()["servers"] if s["name"] == "obo-count")
+        assert row["consented_users_count"] == 2
+
+    def test_obo_audience_change_purges_cached_tokens(self, client, storage):
+        """#551 follow-up: changing an obo row's oauth_audience purges cached
+        tokens minted for the OLD audience (they are audience-bound)."""
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import mcp_user_tokens
+
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "aud-change",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://old-aud",
+            },
+        )
+        sid = r.json()["server_id"]
+        with storage._engine.connect() as conn:
+            conn.execute(
+                sa.insert(mcp_user_tokens),
+                {
+                    "user_id": "u1",
+                    "server_name": "aud-change",
+                    "access_token_ct": b"\x00ct",
+                    "refresh_token_ct": None,
+                    "expires_at": "2026-12-31T00:00:00",
+                    "scopes": None,
+                    "as_issuer": "https://idp.test",
+                    "audience": "api://old-aud",
+                    "created": "2026-05-04T11:00:00",
+                    "last_refreshed": None,
+                },
+            )
+            conn.commit()
+
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_audience": "api://new-aud"},
+        )
+        assert r2.status_code == 200, r2.text
+        with storage._engine.connect() as conn:
+            remaining = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(mcp_user_tokens)
+                .where(mcp_user_tokens.c.server_name == "aud-change")
+            ).scalar()
+        assert remaining == 0, "audience change must purge old-audience cache rows"
+
+    def _seed_obo_row_with_cache(self, client, storage, *, name: str, scopes: str | None) -> str:
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import mcp_user_tokens
+
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": name,
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://aud",
+                **({"oauth_scopes": scopes} if scopes else {}),
+            },
+        )
+        sid: str = r.json()["server_id"]
+        with storage._engine.connect() as conn:
+            conn.execute(
+                sa.insert(mcp_user_tokens),
+                {
+                    "user_id": "u1",
+                    "server_name": name,
+                    "access_token_ct": b"\x00ct",
+                    "refresh_token_ct": None,
+                    "expires_at": "2026-12-31T00:00:00",
+                    "scopes": scopes,
+                    "as_issuer": "https://idp.test",
+                    "audience": "api://aud",
+                    "created": "2026-05-04T11:00:00",
+                    "last_refreshed": None,
+                },
+            )
+            conn.commit()
+        return sid
+
+    def _count_cache_rows(self, storage, name: str) -> int:
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import mcp_user_tokens
+
+        with storage._engine.connect() as conn:
+            count = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(mcp_user_tokens)
+                .where(mcp_user_tokens.c.server_name == name)
+            ).scalar()
+        return int(count or 0)
+
+    def test_obo_scope_change_purges_cached_tokens(self, client, storage):
+        """Review finding: under rfc8693 the exchange scope shapes the minted
+        bearer's privileges exactly like the audience does — narrowing
+        oauth_scopes must purge cached rows or the reduction silently waits
+        out the token TTL (inconsistent with the audience purge)."""
+        client.app.state.oidc_config = _enabled_oidc("rfc8693")
+        sid = self._seed_obo_row_with_cache(
+            client, storage, name="scope-change", scopes="api.read api.write"
+        )
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_scopes": "api.read"},
+        )
+        assert r2.status_code == 200, r2.text
+        assert self._count_cache_rows(storage, "scope-change") == 0, (
+            "scope change must purge cache rows minted with the old scopes"
+        )
+
+    def test_obo_scope_noop_resend_does_not_purge(self, client, storage):
+        """Review finding companion: the admin form re-submits the pre-filled
+        scopes on every save — an EQUAL value is normalized out of the update
+        and must not flush every user's minted tokens."""
+        client.app.state.oidc_config = _enabled_oidc("rfc8693")
+        sid = self._seed_obo_row_with_cache(client, storage, name="scope-noop", scopes="api.read")
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_scopes": "api.read", "enabled": True},
+        )
+        assert r2.status_code == 200, r2.text
+        assert self._count_cache_rows(storage, "scope-noop") == 1, (
+            "a no-op scopes re-send must not purge the mint cache"
+        )
+
+    def test_flip_obo_to_oauth_user_clears_obo_audience_and_scopes(self, client, storage):
+        """Review finding: the obo-era oauth_audience is an IdP-side app
+        identifier, not the resource indicator oauth_user sends to its AS —
+        carried over, every consent yields a wrong-resource token that 401s
+        with no visible cause. The flip must clear it (and the rfc8693
+        exchange scopes) unless the request explicitly sets new values."""
+        client.app.state.oidc_config = _enabled_oidc("rfc8693")
+        sid = self._seed_obo_row_with_cache(client, storage, name="flip-back", scopes="api.read")
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_user", "oauth_client_id": "client-xyz"},
+        )
+        assert r2.status_code == 200, r2.text
+        data = r2.json()
+        assert data["auth_type"] == "oauth_user"
+        assert data["oauth_audience"] in (None, ""), "obo app-id audience must not carry over"
+        assert data["oauth_scopes"] in (None, ""), "rfc8693 exchange scopes must not carry over"
+        # The flip is an auth-model change → mint-cache rows purged too.
+        assert self._count_cache_rows(storage, "flip-back") == 0
+
+    def test_entra_obo_equal_scope_resend_is_accepted(self, client, storage):
+        """Review finding: the admin form always re-submits the pre-filled
+        oauth_scopes, so a same-type edit of an entra-profile obo row carrying
+        legacy scopes must accept an EQUAL value (normalized to a no-op)
+        instead of 400ing — only a genuine scope CHANGE is rejected."""
+        # The legacy-scoped entra row arises from a deployment profile switch:
+        # the row is created while the profile is rfc8693 (scopes accepted),
+        # then the deployment flips to entra.
+        client.app.state.oidc_config = _enabled_oidc("rfc8693")
+        sid = self._seed_obo_row_with_cache(
+            client, storage, name="entra-resend", scopes="legacy.scope"
+        )
+        client.app.state.oidc_config = _enabled_oidc("entra")
+        # Equal re-send + unrelated change → accepted, scopes untouched.
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_scopes": "legacy.scope", "enabled": False},
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["oauth_scopes"] == "legacy.scope"
+        # A genuine CHANGE to non-empty scopes still 400s under entra.
+        r3 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_scopes": "new.scope"},
+        )
+        assert r3.status_code == 400
+        assert "entra" in r3.json()["error"]
+
+    def test_create_obo_rejects_scopes_under_entra_profile(self, client):
+        """#551 follow-up: oauth_scopes is meaningless for the entra grant leg
+        (it mints <audience>/.default), so the write path rejects it rather than
+        silently ignoring it at mint time."""
+        client.app.state.oidc_config = _enabled_oidc("entra")
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-entra-scopes",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+                "oauth_scopes": "custom.scope",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "oauth_scopes" in r.json()["error"]
 
     def test_update_invalid_auth_type(self, client):
         created = _create_server(client, name="bad-auth-update")
@@ -1243,6 +1937,28 @@ class TestNotifyNodesMcpReload:
         assert "refused" in result["n1"]["error"]
 
     @pytest.mark.anyio
+    async def test_records_error_on_non_2xx(self):
+        """A node replying non-2xx (e.g. 503) is recorded as an error, not
+        counted as a reached node — raise_for_status() routes the status into
+        the error path so a stale node trips the 'did not reach' WARNING, and
+        the (unused) response body is never consulted."""
+        http_req = httpx.Request("POST", "http://n1:8000/x")
+        resp = MagicMock()
+        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "503", request=http_req, response=httpx.Response(503, request=http_req)
+        )
+        client = AsyncMock()
+        client.post.return_value = resp
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reload(req)
+        assert "n1" in result
+        assert "error" in result["n1"]
+        resp.json.assert_not_called()
+
+    @pytest.mark.anyio
     async def test_empty_cluster(self):
         req = _fake_request()
         result = await _notify_nodes_mcp_reload(req)
@@ -1331,6 +2047,141 @@ class TestAdminMcpReloadEndpoint:
         data = r.json()
         assert data["results"]["n1"] == {"reloaded": 2}
         assert "error" in data["results"]["n2"]
+
+    def test_reload_fails_loud_without_fanout_infra(self, storage: SQLiteBackend) -> None:
+        """F4 guard: the operator reload drains + reports, so with storage and
+        admin.mcp permission but no collector/proxy_client on app.state it must
+        fail loudly (500) — never silently 200 with empty results (which a
+        re-introduced None-guard would do)."""
+        app = Starlette(
+            routes=_ROUTES,
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        # Deliberately omit app.state.collector / proxy_client.
+        c = TestClient(app, raise_server_exceptions=False)
+        r = c.post("/v1/api/admin/mcp-servers/reload")
+        assert r.status_code == 500
+
+
+class TestMcpWriteAutoReload:
+    """create / update / delete schedule a node reload (after the 200) so a
+    write reaches nodes — and active per-user pools re-prime — without a
+    separate /reload. The fan-out rides only the success response; an error
+    return schedules nothing. (The error paths tested here return before the
+    row is written; a post-write secret-apply failure is a separate pre-existing
+    partial-write path, not exercised here.)"""
+
+    def test_create_notifies_nodes(self, client: TestClient) -> None:
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            _create_server(client, name="auto-reload-create")
+        notify.assert_awaited_once()
+
+    def test_update_notifies_nodes(self, client: TestClient) -> None:
+        sid = _create_server(client, name="auto-reload-update")["server_id"]
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"enabled": False})
+        assert r.status_code == 200
+        notify.assert_awaited_once()
+
+    def test_delete_notifies_nodes(self, client: TestClient) -> None:
+        sid = _create_server(client, name="auto-reload-delete")["server_id"]
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.delete(f"/v1/api/admin/mcp-servers/{sid}")
+        assert r.status_code == 200
+        notify.assert_awaited_once()
+
+    def test_delete_does_not_notify_on_missing_server(self, client: TestClient) -> None:
+        """A 404 (server not found) returns before the success response, so no
+        node reload is scheduled — the fan-out rides only the success path."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.delete("/v1/api/admin/mcp-servers/does-not-exist")
+        assert r.status_code == 404
+        notify.assert_not_awaited()
+
+    def test_update_does_not_notify_on_missing_server(self, client: TestClient) -> None:
+        """A 404 on update likewise schedules no reload."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.put("/v1/api/admin/mcp-servers/does-not-exist", json={"enabled": False})
+        assert r.status_code == 404
+        notify.assert_not_awaited()
+
+    def test_create_does_not_notify_on_secret_store_503(
+        self, client_no_token_store: TestClient
+    ) -> None:
+        """A create that 503s on the OAuth-secret token-store gate returns an
+        error before any write — so no reload is scheduled."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client_no_token_store.post(
+                "/v1/api/admin/mcp-servers",
+                json={
+                    "name": "no-notify-503",
+                    "transport": "streamable-http",
+                    "url": "https://mcp.example.com/sse",
+                    "auth_type": "oauth_user",
+                    "oauth_client_id": "cli_abc",
+                    "oauth_client_secret": "secret-value",
+                },
+            )
+        assert r.status_code == 503, r.text
+        notify.assert_not_awaited()
+
+    def test_write_warns_when_reload_reaches_no_node(
+        self, client: TestClient, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A background fan-out that leaves nodes unreached is surfaced at
+        WARNING (not swallowed at debug) — operators need a signal the cluster
+        catalog may be stale, since there is no periodic node reconcile."""
+        with (
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={"n1": {"error": "Connection refused"}},
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            _create_server(client, name="warn-on-stale")
+        assert any("did not reach" in r.getMessage() for r in caplog.records)
+
+    def test_write_warns_when_reload_fan_out_raises(
+        self, client: TestClient, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A systemic fan-out fault (the whole reload raises) is logged at
+        WARNING rather than lost, for the same reason."""
+        with (
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("collector exploded"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            _create_server(client, name="warn-on-fault")
+        assert any("fan-out failed after admin write" in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -1726,6 +2577,59 @@ class TestInternalMcpRefreshOneEndpoint:
         assert "command" not in data["server"]
         assert "url" not in data["server"]
         assert data["server"]["circuit_open"] is True
+
+    def test_refresh_one_skipped_returns_202(self, node_app_factory) -> None:
+        # A busy-lock skip never ran the refresh — it must NOT be reported
+        # as 200 "ok" (the caller would believe the catalog is current).
+        # 202 Accepted + status "skipped": the health-tick retry will run it.
+        mgr = MagicMock()
+        mgr.refresh_sync.return_value = {"srv": None}
+        # The endpoint reads the outcome from the manager accessor, not the
+        # stripped status (the public projection whitelists it out).
+        mgr.last_refresh_outcome.return_value = "skipped"
+        mgr.get_server_status.return_value = {
+            "connected": True,
+            "tools": 3,
+            "resources": 0,
+            "prompts": 1,
+            "error": "",
+            "transport": "stdio",
+            "command": "secret",
+            "url": "",
+            "circuit_open": False,
+            "consecutive_failures": 0,
+        }
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-refresh/srv")
+        assert r.status_code == 202
+        data = r.json()
+        assert data["status"] == "skipped"
+        assert "command" not in data["server"]  # stripped
+        mgr.last_refresh_outcome.assert_called_with("srv")
+
+    def test_refresh_one_error_beats_skip_returns_500(self, node_app_factory) -> None:
+        # A skip on a server that ALSO carries a live error pill must
+        # surface as 500, not a benign 202 — a status-code-keyed caller
+        # would otherwise treat a genuinely erroring server as healthy.
+        mgr = MagicMock()
+        mgr.refresh_sync.return_value = {"srv": None}
+        mgr.last_refresh_outcome.return_value = "skipped"
+        mgr.get_server_status.return_value = {
+            "connected": False,
+            "tools": 0,
+            "resources": 0,
+            "prompts": 0,
+            "error": "Refresh failed: connection refused",
+            "transport": "stdio",
+            "command": "secret",
+            "url": "",
+            "circuit_open": True,
+            "consecutive_failures": 5,
+        }
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-refresh/srv")
+        assert r.status_code == 500, "a live error must win over the skip"
+        assert r.json()["status"] == "error"
 
     def test_refresh_one_invalid_name_returns_400(self, node_app_factory) -> None:
         # sec-4: name validation symmetric with console side.

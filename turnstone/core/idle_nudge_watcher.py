@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 from turnstone.core import session_worker
 from turnstone.core.log import get_logger
-from turnstone.core.nudge_queue import USER_DRAIN, NudgeQueue
+from turnstone.core.nudge_queue import WAKE_PENDING, NudgeQueue
 from turnstone.core.workstream import WorkstreamState
 
 if TYPE_CHECKING:
@@ -75,7 +75,13 @@ def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") 
       queue at its own seams (``ATTENTION``/``THINKING``/``RUNNING``
       all imply a live worker), and ``ERROR`` stays parked for the
       operator rather than burning inference unattended.
-    * nothing drainable under ``USER_DRAIN`` — tool-only entries
+    * ``ws.send_barrier_active()`` — deferred sends hold the order
+      barrier (pending entries, or a claimed entry's dispatch in
+      flight); the wake yields and is re-armed by the deferred turns'
+      exit backstops (or the drain's clean exit when everything was
+      retracted).  See the predicate's docstring for the staleness
+      argument.
+    * nothing gate-eligible under ``WAKE_PENDING`` — tool-only/quiet entries
       belong to the next tool-result seam, not a synthetic empty user
       turn (``deliver_wake_nudge_from_queue`` would no-op on them).
 
@@ -101,8 +107,28 @@ def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") 
     session = ws.session
     if session is None or ws._closed or ws.state is not WorkstreamState.IDLE:
         return False
+    if ws.send_barrier_active():
+        # Order-barrier yield: deferred sends (acknowledged "queued" —
+        # see _PendingSend) are older than any nudge, and a wake worker
+        # claiming the slot would push them behind its whole turn.  The
+        # shared predicate carries BOTH terms — the pending list AND the
+        # drain-alive clause covering a CLAIMED entry (popped, dispatch
+        # in flight but not yet holding the slot); checking the list
+        # alone let a wake jump an acknowledged send in exactly that
+        # window.  Lockless call, benign both ways (staleness ruling in
+        # the predicate's docstring).  Convergence is structural —
+        # every path that clears the barrier re-runs this gate: each
+        # deferred turn's exit via ``_retry_pending_wake``, and the
+        # drain's own clean exit (trigger="drain-exit"), which covers a
+        # list that empties by pure retraction and so never runs a
+        # turn.
+        log.info("nudge_wake.yielded_to_pending_sends ws=%s trigger=%s", ws.id[:8], trigger)
+        return False
     nudge_queue = getattr(session, "_nudge_queue", None)
-    if not isinstance(nudge_queue, NudgeQueue) or not nudge_queue.has_pending(USER_DRAIN):
+    # Gate on WAKE_PENDING, not USER_DRAIN: ``"quiet"`` entries (external
+    # events demoted by a user cancel) deliver at the next legitimate seam
+    # but must never themselves wake the workstream the user just stopped.
+    if not isinstance(nudge_queue, NudgeQueue) or not nudge_queue.has_pending(WAKE_PENDING):
         return False
 
     deferred = False
@@ -135,7 +161,7 @@ class IdleNudgeWatcher:
     :func:`wake_workstream_if_pending` (the shared gate — see its
     docstring for the full gate order).  If the workstream's
     :class:`NudgeQueue` has any drainable entry for the wake's drain
-    filter (``USER_DRAIN`` — channels ``"user"`` or ``"any"``), the
+    gate (``WAKE_PENDING`` — channels ``"user"`` or ``"any"``), the
     gate dispatches via ``session_worker.send`` with a no-op
     ``enqueue`` callback.  Tool-only entries don't fire the wake —
     they belong to the next tool-result seam, not a synthetic empty

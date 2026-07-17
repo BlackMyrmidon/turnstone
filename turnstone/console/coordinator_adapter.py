@@ -15,6 +15,7 @@ for the storage-seeded children rebuild.
 
 from __future__ import annotations
 
+import queue
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core import session_worker
@@ -372,6 +373,16 @@ class CoordinatorAdapter:
             # fresh workstream so the catch is defense-in-depth.  Nothing to
             # release: the staged bytes were peeked, not soft-locked, and a
             # rejected enqueue never drained them.
+            if ws.worker_kind == "command":
+                # A slash-command worker (e.g. a minutes-long /compact aimed
+                # at this workstream from the interactive UI) holds the
+                # raced slot: the interjection queue is turn-shaped and must
+                # stay unreachable during command windows — same rule as the
+                # /send route's defer.  Fail the dispatch (returns False, the
+                # caller's retryable-backpressure surface) rather than queue
+                # a message that would be capped and could cross a /resume
+                # identity swap.
+                raise queue.Full()
             att_ids = [a.attachment_id for a in _attachments] if _attachments else None
             session.queue_message(
                 message,
@@ -380,6 +391,25 @@ class CoordinatorAdapter:
                 interjector_user_id=acting_user_id,
             )
 
+        # Order-barrier yield, mirroring the /send route's pre-check: once
+        # deferred sends are pending (or a claimed entry's dispatch is in
+        # flight — the drain-alive term the shared predicate carries), a
+        # spawn here would overtake messages already acknowledged
+        # "queued".  Refuse via the return value — the adapter's
+        # documented backpressure surface, which the sole call site
+        # reports as queue_full/undelivered — NEVER by raising queue.Full
+        # from the body: only enqueue closures may (the dispatcher
+        # catches it there); a body-raise would escape into the create
+        # handler as a crash.  Unreachable today (that caller dispatches
+        # on a freshly created workstream, which cannot have pending
+        # sends); the guard exists for future dispatch callers.
+        if ws.send_barrier_active():
+            log.warning(
+                "coord_adapter.send_refused_pending_sends ws=%s count=%d",
+                ws.id[:8],
+                len(ws._pending_sends),
+            )
+            return False
         return session_worker.send(
             ws,
             enqueue=_enqueue,

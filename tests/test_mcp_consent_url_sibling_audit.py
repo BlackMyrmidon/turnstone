@@ -97,10 +97,12 @@ def test_every_user_actionable_structured_error_passes_consent_url() -> None:
 def test_audit_finds_all_known_user_actionable_sites() -> None:
     """Lock the count so accidental deletions are caught.
 
-    There are 13 user-actionable ``_structured_error`` call sites today
-    (4 each in the tool / resource / prompt token-classify branches +
-    3 in the post-retry-failed branches + 1 in ``_handle_auth_403``'s
-    insufficient-scope branch). If a new exec path is added the count
+    There are 5 user-actionable ``_structured_error`` call sites today:
+    1 in ``_pool_lookup_error`` (the ``_pool_lookup_verdict`` split
+    collapsed the former 3 consent-required renderings into one site —
+    the per-kind branches now select only the DETAIL copy), 3 in the
+    post-retry-failed branches, and 1 in ``_handle_auth_403``'s
+    insufficient-scope branch. If a new exec path is added the count
     can rise; if a branch is removed the count can fall — both are
     fine, but require an intentional bump of this number to confirm
     the change went through review.
@@ -110,8 +112,8 @@ def test_audit_finds_all_known_user_actionable_sites() -> None:
     user_actionable_count = sum(
         1 for _, blk in blocks if any(f'code="{code}"' in blk for code in _USER_ACTIONABLE_CODES)
     )
-    assert user_actionable_count == 13, (
-        f"Expected 13 user-actionable _structured_error sites, got "
+    assert user_actionable_count == 5, (
+        f"Expected 5 user-actionable _structured_error sites, got "
         f"{user_actionable_count}. If this is intentional, bump the "
         f"expected count and document why in the commit message."
     )

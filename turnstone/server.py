@@ -58,6 +58,7 @@ from turnstone.core.auth import (
 from turnstone.core.idle_nudge_watcher import wake_workstream_if_pending
 from turnstone.core.log import get_logger
 from turnstone.core.metrics import metrics as _metrics
+from turnstone.core.model_turn import resolve_effort_setting, resolve_temperature_setting
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
 from turnstone.core.session_manager import SessionManager
@@ -697,6 +698,14 @@ def _interactive_dispatch_retry(ws: Workstream, user_msg: str) -> None:
     the pre-lift inline behaviour). The shared dispatcher owns the
     ``_worker_running`` lifecycle, so the ``run`` closure needs no
     ``finally`` flag-clear of its own.
+
+    Deliberately NOT gated on the /send order barrier
+    (``ws._pending_sends``): a retry is an explicit user action that
+    rewinds a COMPLETED turn — dispatching it ahead of deferred sends is
+    an accepted overtake (the user just asked for exactly that turn to
+    run again), not the silent send-vs-send inversion the barrier exists
+    to prevent.  Deferred entries dispatch after it, order among
+    themselves preserved.
     """
     from turnstone.core import session_worker
 
@@ -1615,6 +1624,15 @@ async def metrics_endpoint(request: Request) -> Response:
     return Response(content, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
+# Quick-command completion backstop.  MUST stay strictly below the
+# console proxy's client timeout (console/server.py
+# _PROXY_CLIENT_TIMEOUT_S = 30) or the degraded ``running`` answer can
+# never traverse a proxied pane — the proxy aborts first, the pane's
+# dispatch swallows the 5xx, and the caller sees nothing at all.  The
+# inequality is pinned by a test importing both constants.
+_COMMAND_RESPONSE_BACKSTOP_S = 25
+
+
 def _capture_cancel_forensics(session: Any, ui: Any, *, was_running: bool) -> dict[str, Any]:
     """Snapshot in-flight session state for the cancel response.
 
@@ -1714,23 +1732,228 @@ async def command(request: Request) -> JSONResponse:
                 status_code=400,
             )
 
-        should_exit = ws.session.handle_command(cmd)
-        if should_exit:
-            ui.on_info("Session ended. You can close this tab.")
-        # Handle UI updates for workstream-changing commands
-        if cmd_word in ("/clear", "/new"):
-            ui._enqueue({"type": "clear_ui"})
-        elif cmd_word == "/resume":
-            # clear_ui signals the frontend to re-fetch history via REST.
-            ui._enqueue({"type": "clear_ui"})
-        # Sync in-memory workstream name after any command that can change it.
-        # This ensures /api/workstreams and future page loads see the right name.
-        if cmd_word in ("/name", "/resume"):
-            from turnstone.core.memory import get_workstream_display_name
+        from turnstone.core import session_worker
 
-            updated_name = get_workstream_display_name(ws.session.ws_id) if ws.session else None
-            if updated_name:
-                ws.name = updated_name
+        session = ws.session
+        cmd_ui = ui
+        busy_hit = False
+
+        def _reject_busy() -> None:
+            # Worker already running (a turn or another command is in
+            # flight).  Commands aren't queueable work — surface "busy"
+            # instead.  Server-side mirror of the composer's client guard,
+            # and a strict improvement for API callers: the old inline path
+            # let /clear & co. mutate the session mid-turn.
+            nonlocal busy_hit
+            busy_hit = True
+
+        def _dispatch_command(
+            run: Callable[[], None], thread_name: str, busy_hint: str
+        ) -> JSONResponse | None:
+            """Dispatch a command worker; return the refusal response or None.
+
+            One envelope for both command branches: the unknown-workstream
+            404 and the busy refusal differ only in the retry hint.  The
+            worker slot is claimed with ``worker_kind="command"`` — the
+            /send route DEFERS (never queues) while that kind holds the
+            slot, so the mid-turn interjection queue and its turn-shaped
+            semantics (length cap, cross-user guard) are unreachable for
+            the whole command window; messages sent mid-command are
+            answered ``queued`` immediately and dispatched as ordinary
+            full-fidelity sends by the pending-send drain when the window
+            closes.
+            """
+            try:
+                dispatched = session_worker.send(
+                    ws,
+                    enqueue=_reject_busy,
+                    run=run,
+                    thread_name=thread_name,
+                    worker_kind="command",
+                )
+            except Exception:
+                # Thread.start failed (exhaustion, MemoryError) — the
+                # dispatcher rolled the slot claim back and re-raised.
+                # Answer 503, NOT the endpoint's generic 200-ok arm: a
+                # command worker that never spawned must be as loud as
+                # the busy 409 below — a status-code-only SDK caller
+                # would otherwise believe its /clear//name//resume
+                # applied and silently run against un-changed state.
+                log.exception("command.worker_spawn_failed ws=%s", ws.id[:8])
+                return JSONResponse(
+                    {
+                        "status": "error",
+                        "error": "Command worker could not be started — retry shortly.",
+                    },
+                    status_code=503,
+                )
+            if not dispatched:
+                return JSONResponse({"error": "Unknown workstream"}, status_code=404)
+            if busy_hit:
+                # 409, not 200: the refusal is deliberate (mutual exclusion
+                # replaced the old inline mid-turn interleave) but it must
+                # be LOUD — a status-code-only SDK caller treats a 200 as
+                # "command ran" and silently loses the rename/clear/config
+                # change.  Same shape as /send's cross-user 409.
+                return JSONResponse(
+                    {
+                        "status": "busy",
+                        "error": (
+                            "Session is busy — wait for the current turn to "
+                            f"finish, then {busy_hint}."
+                        ),
+                    },
+                    status_code=409,
+                )
+            return None
+
+        if cmd_word == "/compact":
+            # Manual compaction runs LLM summary calls — seconds to minutes.
+            # It gets the send path's worker dispatch instead of an inline
+            # call so (a) the event loop stays free to stream the compaction
+            # progress events this very command produces (inline, they only
+            # flushed in one burst after the blocking call returned — the
+            # "no visible indicator" bug), and (b) a message sent
+            # mid-compaction takes the existing queue path instead of racing
+            # the history swap on a second worker.  compact_now() carries
+            # send()'s generation discipline, so a force-abandoned compact
+            # thread goes stale instead of swapping history under a
+            # successor, and a cancel aimed at it is consumed on exit.
+            # Fire-and-forget: the response returns as soon as the worker is
+            # dispatched and NO completion bound applies — a large context
+            # can legitimately compact for many minutes; progress streams
+            # over SSE and Stop cancels it.  (The 25s wait below is for the
+            # quick commands only.)
+
+            def _run_compact() -> None:
+                me = threading.current_thread()
+                # Snapshot for the exit restore: with the slot free to
+                # claim, only IDLE or ERROR are reachable here (the live
+                # states imply a held slot and _dispatch_command refuses
+                # busy).  ERROR is the user-investigatable badge (same
+                # carve-out the orphan reaper honors) and /compact neither
+                # retries nor resolves the failed turn — the old inline
+                # /compact never touched ws.state — so the badge must
+                # survive the window; everything else exits to idle.
+                prev_state = ws.state
+                try:
+                    cmd_ui.on_state_change("thinking")
+                    session.compact_now()
+                except GenerationCancelled:
+                    # User stopped it — including a Stop that landed in the
+                    # completion tail, which compact_now re-raises after
+                    # consuming.
+                    pass
+                finally:
+                    # Abandoned-worker guard — mirrors the send/retry
+                    # closures: a force-cancelled compact thread must not
+                    # touch state a successor worker now owns.
+                    if ws.worker_thread is me:
+                        try:
+                            # Backstop only: sends during the command window
+                            # DEFER in the /send route (they cannot reach the
+                            # interjection queue — see _dispatch_command), so
+                            # anything found here predates the window (a
+                            # message stranded by a dying send worker's
+                            # closing race).  Record it in the transcript
+                            # rather than leaving it invisible.
+                            if session.flush_queued_messages():
+                                log.warning("ws.compact.stranded_queue_flushed ws=%s", ws.id[:8])
+                        except Exception:
+                            log.exception("ws.compact.exit_seam_failed ws=%s", ws.id[:8])
+                        cmd_ui.on_state_change(
+                            "error" if prev_state is WorkstreamState.ERROR else "idle"
+                        )
+
+            refusal = _dispatch_command(
+                _run_compact, f"compact-worker-{ws.id[:8]}", "run /compact again"
+            )
+            if refusal is not None:
+                return refusal
+            return JSONResponse({"status": "ok"})
+
+        # Every other command ALSO runs on the workstream's worker slot —
+        # the inline call this replaced was serialized by the event loop
+        # itself (nothing else could interleave with it); to_thread alone
+        # would let /clear & co. race a running /compact worker, a live
+        # send, or another command.  The slot restores that mutual
+        # exclusion with an explicit busy answer, and the endpoint awaits
+        # completion off-loop so the response still reflects the outcome.
+        loop = asyncio.get_running_loop()
+        done = asyncio.Event()
+
+        def _run_cmd() -> None:
+            me = threading.current_thread()
+            try:
+                should_exit = session.handle_command(cmd)
+                # Post-command follow-ups run HERE, on the worker, not
+                # after the endpoint's done-wait: past the 25s backstop the
+                # endpoint has already answered {"status": "running"}, and
+                # follow-ups parked there were silently skipped — a slow
+                # /resume left every pane rendering the pre-resume
+                # transcript against a session whose history had changed,
+                # and the workstream list kept the stale name.
+                # Abandoned-worker guard, mirroring every sibling closure:
+                # a force-cancelled wedged command that unwedges minutes
+                # later must not fire clear_ui into a successor turn's live
+                # stream (every pane would wipe mid-answer) nor write a
+                # post-swap name from a stale session read.
+                if ws.worker_thread is me:
+                    if should_exit:
+                        cmd_ui.on_info("Session ended. You can close this tab.")
+                    if cmd_word in ("/clear", "/new", "/resume"):
+                        # clear_ui signals the frontend to re-fetch history
+                        # via REST.
+                        cmd_ui._enqueue({"type": "clear_ui"})
+                    if cmd_word in ("/name", "/resume"):
+                        # Sync the in-memory workstream name after any
+                        # command that can change it, so /api/workstreams
+                        # and future page loads see the right name.
+                        from turnstone.core.memory import get_workstream_display_name
+
+                        updated_name = get_workstream_display_name(session.ws_id)
+                        if updated_name:
+                            ws.name = updated_name
+            except Exception as e:
+                # Same guard: a late "Command error:" from an abandoned
+                # worker would land mid-successor-turn.
+                if ws.worker_thread is me:
+                    cmd_ui.on_error(f"Command error: {e}")
+            finally:
+                # Unblock the endpoint response.  Suppress the loop-closed
+                # RuntimeError (process shutdown mid-command): nobody is
+                # waiting anymore.  No queue drain here: sends during the
+                # command window DEFER in the /send route (the interjection
+                # queue is unreachable while worker_kind == "command"), so
+                # the pending-send drain dispatches them as ordinary sends
+                # when this worker exits — the stranded-message backstop
+                # lives on the /compact seam, the only command window long
+                # enough to matter.
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(done.set)
+
+        refusal = _dispatch_command(_run_cmd, f"command-worker-{ws.id[:8]}", "retry the command")
+        if refusal is not None:
+            return refusal
+        # Commands are quick (the long-runner, /compact, took the branch
+        # above); the bound is a backstop so a wedged command can't hold
+        # this request open forever — the worker keeps running, its output
+        # reaches the pane via SSE, and the post-command follow-ups run on
+        # the worker itself, so a late completion still refreshes the
+        # panes.  Loop-native wait (call_soon_threadsafe from the worker's
+        # finally): a thread parked in Event.wait via to_thread would hold
+        # a shared default-executor slot for the whole wait per wedged
+        # command.  The bound (_COMMAND_RESPONSE_BACKSTOP_S) sits strictly
+        # under the console proxy's client timeout so the degraded
+        # ``running`` answer can actually traverse a proxied pane — at 60s
+        # the proxy aborted first, the pane's dispatch swallowed the 5xx,
+        # and the user saw nothing at all (the same bounded-caller
+        # reasoning that redesigned /send's command-window path).
+        try:
+            async with asyncio.timeout(_COMMAND_RESPONSE_BACKSTOP_S):
+                await done.wait()
+        except TimeoutError:
+            return JSONResponse({"status": "running"})
     except Exception as e:
         ui.on_error(f"Command error: {e}")
 
@@ -2274,6 +2497,7 @@ async def _interactive_create_post_install(
             resolved_atts, staged_ord, _drop = _resolve_staged(attachment_ids, ws.id, uid)
 
         def _run_initial() -> None:
+            me = threading.current_thread()
             try:
                 session.send(
                     initial_message,
@@ -2281,10 +2505,26 @@ async def _interactive_create_post_install(
                     send_id=send_id if resolved_atts else None,
                 )
             except (Exception, GenerationCancelled):
-                if isinstance(ws.ui, WebUI):
+                # Abandoned-worker guard (sibling of _run_cmd/_run_compact/
+                # the send closures): a force-cancelled init that unwedges
+                # late must not stamp idle over — or emit stream_end into —
+                # a successor turn.
+                if ws.worker_thread is me and isinstance(ws.ui, WebUI):
                     ws.ui.on_stream_end()
                     ws.ui.on_state_change("idle")
             finally:
+                # Deliberately NOT owner-gated, unlike the except arm above
+                # and the _run_cmd/_run_compact follow-ups: those mutate
+                # live slot/UI state a successor now owns, while the notify
+                # is workstream-scoped — an outward signal that this
+                # workstream's initial turn ran to completion and its
+                # answer is in the transcript.  _fire_notify_targets has
+                # exactly ONE call site (here); successor turns never
+                # notify, so there is no successor duplicate for an owner
+                # gate to prevent — gating it turned force-cancel into
+                # permanent notification loss for scheduled/unattended
+                # workstreams (the empty-content fallback covers the
+                # error/cancel exits, as it always did).
                 try:
                     last_content = _extract_last_assistant_content(session)
                     _fire_notify_targets(ws, last_content)
@@ -2310,6 +2550,15 @@ async def _interactive_create_post_install(
             # message were delivered.
             nonlocal init_enqueued
             init_enqueued = True
+            if ws.worker_kind == "command":
+                # A command worker (e.g. a minutes-long /compact) holds the
+                # raced slot: the interjection queue is turn-shaped (length
+                # cap, and the text would cross a /resume identity swap) and
+                # must stay unreachable during command windows — same rule
+                # as the /send route's defer.  queue.Full is the existing
+                # backpressure surface: the create reports the first message
+                # as undelivered (``queue_full``) and the client retries.
+                raise queue.Full()
             session.queue_message(initial_message)
             if resolved_atts:
                 log.warning(
@@ -2329,6 +2578,9 @@ async def _interactive_create_post_install(
         # creation) unless a caller-supplied ws_id is raced — hence
         # ``_enqueue_init`` preserves the message and leaves the staged
         # attachments recoverable instead of assuming the branch is dead.
+        # No /send order-barrier pre-check for the same by-construction
+        # reason: a freshly created workstream cannot have deferred sends
+        # pending (``ws._pending_sends`` only ever grows via that route).
         init_ok = session_worker.send(
             ws,
             enqueue=_enqueue_init,
@@ -3458,8 +3710,21 @@ def internal_mcp_refresh_one(request: Request) -> JSONResponse:
         return JSONResponse({"status": "error", "error": "refresh failed"}, status_code=500)
 
     # _refresh_all swallows per-server errors into _last_error rather than
-    # raising, so a 200-OK from refresh_sync isn't enough — re-check status
-    # and surface 500 if the refresh actually failed for this server.
+    # raising, so a 200-OK from refresh_sync isn't enough — re-check the
+    # authoritative outcome. A refresh can (a) run and fail → 500, (b) be
+    # SKIPPED because the server's connect lock was busy (a reconnect / a
+    # push refresh already running) → 202 with status "skipped", the
+    # health-tick retry will run it, or (c) run cleanly → 200 ok. Reporting
+    # a skip as 200 "ok" told the caller the catalog is current when
+    # nothing ran. The outcome is read from the manager directly — the
+    # public status projection whitelists ``last_refresh_outcome`` out (it
+    # encodes the error class, which read-scope deliberately coarsens to
+    # ``has_error``), so it cannot be recovered from the stripped dict.
+    #
+    # Error is checked BEFORE the skip: a live error pill (a server in a
+    # genuine failure state whose refresh was skipped because its lock was
+    # busy) MUST surface as 500 — reporting a benign 202 for an erroring
+    # server would let a status-code-keyed caller treat it as healthy.
     status = _public_server_status(mcp_mgr, name)
     if status.get("error"):
         log.warning(
@@ -3469,6 +3734,8 @@ def internal_mcp_refresh_one(request: Request) -> JSONResponse:
             {"status": "error", "error": "refresh failed", "server": status},
             status_code=500,
         )
+    if mcp_mgr.last_refresh_outcome(name) == "skipped":
+        return JSONResponse({"status": "skipped", "server": status}, status_code=202)
     return JSONResponse({"status": "ok", "server": status})
 
 
@@ -4179,6 +4446,30 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     state_writer = getattr(app.state, "state_writer", None)
     if state_writer is not None:
         await asyncio.to_thread(state_writer.shutdown)
+    # Reap every loaded session's background shells (#817) before MCP
+    # teardown — a GRACEFUL server shutdown must not orphan detached
+    # process groups (the leaked-server class #816 removed; a hard crash
+    # remains the documented acceptance).  Two phases like the CLI exit:
+    # signal every session's shells first (instant — after this nothing
+    # can outlive us), then pay the bounded per-session join budgets off
+    # the event loop.  Session close() also removes MCP listeners, hence
+    # the ordering before mcp_client.shutdown().
+    mgr = WebUI._workstream_mgr
+    if mgr is not None:
+        loaded = [(ws.id, ws.session) for ws in mgr.list_all() if ws.session is not None]
+        for _ws_id, session in loaded:
+            with contextlib.suppress(Exception):
+                session._background_shells.signal_all()
+
+        def _close_loaded() -> None:
+            for ws_id, session in loaded:
+                try:
+                    session.close()
+                except Exception:
+                    log.exception("server.session_close_failed", ws_id=ws_id[:8])
+
+        if loaded:
+            await asyncio.to_thread(_close_loaded)
     # health_registry is stateless (no background threads) — nothing to stop
     if app.state.mcp_client:
         app.state.mcp_client.shutdown()
@@ -4272,7 +4563,7 @@ def create_app(
         magic-mocked ``ws.user_id``."""
         return _require_ws_access(request, ws_id)
 
-    def _interactive_spawn_metrics(_request: Request, ui: Any) -> None:
+    def _interactive_spawn_metrics(ui: Any) -> None:
         """Per-conversation metrics fired once per send that spawns a
         fresh worker. Coord wires its own
         :func:`turnstone.console.server._coord_spawn_metrics` (the
@@ -4997,22 +5288,16 @@ def main() -> None:
             except Exception as e:
                 log.warning("Failed to resolve judge_model %r: %s", judge_model, e)
 
-        # Per-model sampling overrides take priority over global defaults
-        eff_temperature = (
-            r_cfg.temperature
-            if r_cfg.temperature is not None
-            else config_store.get("model.temperature")
-        )
+        # Sampling knobs ride the shared assignment scheme (alias > stored
+        # config > unset); unset means the wire omits the field and the
+        # inference engine's own default rules.
+        eff_temperature = resolve_temperature_setting(r_cfg, config_store)
         eff_max_tokens = (
             r_cfg.max_tokens
             if r_cfg.max_tokens is not None
             else config_store.get("model.max_tokens")
         )
-        eff_reasoning_effort = (
-            r_cfg.reasoning_effort
-            if r_cfg.reasoning_effort is not None
-            else config_store.get("model.reasoning_effort")
-        )
+        eff_reasoning_effort = resolve_effort_setting(r_cfg, config_store)
 
         return ChatSession(
             client=r_client,

@@ -57,6 +57,7 @@ from turnstone.core.auth import (
     require_permission,
 )
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
+from turnstone.core.mcp_crypto import is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
 from turnstone.core.rendezvous import NoAvailableNodeError
 from turnstone.core.session_replay import session_replay_preamble
@@ -586,6 +587,14 @@ _CONSOLE_PROXY_STYLE = (
 
 _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
 _VALID_WS_ID_RE = re.compile(r"^[a-f0-9]{1,64}$")
+
+# Client timeout for the REST proxy pool (BOTH constructions: startup and
+# the mTLS re-create).  Node endpoints that answer degraded-but-in-time
+# responses size their backstops strictly UNDER this bound — e.g. the
+# quick-command ``running`` answer (turnstone/server.py
+# _COMMAND_RESPONSE_BACKSTOP_S); a test pins the inequality.  The SSE
+# proxy client's granular Timeout is a separate contract.
+_PROXY_CLIENT_TIMEOUT_S = 30
 
 _PROXY_JWT_EXPIRY_SECONDS = 300  # 5 min — ample for any request round-trip
 
@@ -3886,7 +3895,7 @@ def _audit_coordinator_create(
     )
 
 
-def _coord_spawn_metrics(_request: Request, ui: Any) -> None:
+def _coord_spawn_metrics(ui: Any) -> None:
     """Per-spawn counter writes for coord — mirrors interactive's pattern.
 
     Wired onto :attr:`SessionEndpointConfig.spawn_metrics`. Increments
@@ -5321,7 +5330,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     _proxy_verify: Any = _proxy_ssl if _proxy_ssl else True
 
     app.state.proxy_client = httpx.AsyncClient(
-        timeout=30,
+        timeout=_PROXY_CLIENT_TIMEOUT_S,
         limits=httpx.Limits(
             max_connections=fan_out + 50,
             max_keepalive_connections=min(fan_out // 4, 100),
@@ -5463,7 +5472,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 await app.state.proxy_client.aclose()
                 await app.state.proxy_sse_client.aclose()
                 app.state.proxy_client = httpx.AsyncClient(
-                    timeout=30,
+                    timeout=_PROXY_CLIENT_TIMEOUT_S,
                     limits=httpx.Limits(
                         max_connections=app.state.fan_out_limit + 50,
                         max_keepalive_connections=min(app.state.fan_out_limit // 4, 100),
@@ -6002,6 +6011,47 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
 
     storage.delete_oidc_identity(issuer, subject)
 
+    # #551: unlinking the identity must revoke the captured IdP refresh
+    # credential (keyed on (user_id, issuer)) AND purge the already-minted
+    # oauth_obo access-token cache rows — otherwise a deprovisioned user's
+    # scheduled/autonomous runs keep executing MCP tool calls with the still-fresh
+    # cached bearer until it expires (deleting only the credential stops FUTURE
+    # mints but not the live cache). Best-effort: a failure must not leave the
+    # identity un-deleted.
+    user_id = identity["user_id"]
+    credential_revoked = False
+    obo_cache_purged = 0
+    token_store = getattr(request.app.state, "mcp_token_store", None)
+    if token_store is not None:
+        try:
+            credential_revoked = bool(token_store.delete_oidc_credential(user_id, issuer))
+        except Exception:
+            log.warning(
+                "admin.oidc_identity.credential_revoke_failed user=%s", user_id, exc_info=True
+            )
+        try:
+            from turnstone.core.mcp_oauth import obo_server_names
+
+            obo_servers = sorted(obo_server_names(storage))
+        except Exception:
+            obo_servers = []
+            log.warning(
+                "admin.oidc_identity.obo_server_list_failed user=%s", user_id, exc_info=True
+            )
+        for server_name in obo_servers:
+            # Per-server try/except: a failure on one server must not leave the
+            # remaining servers' cached bearers un-purged for a deprovisioned user.
+            try:
+                if token_store.delete_user_token(user_id, server_name):
+                    obo_cache_purged += 1
+            except Exception:
+                log.warning(
+                    "admin.oidc_identity.obo_cache_purge_failed user=%s server=%s",
+                    user_id,
+                    server_name,
+                    exc_info=True,
+                )
+
     audit_uid, ip = _audit_context(request)
     record_audit(
         storage,
@@ -6009,11 +6059,26 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
         "oidc_identity.delete",
         "oidc_identity",
         f"{issuer}:{subject}",
-        {"user_id": identity["user_id"]},
+        {
+            "user_id": user_id,
+            "obo_credential_revoked": credential_revoked,
+            "obo_cache_rows_purged": obo_cache_purged,
+        },
         ip,
     )
 
-    return JSONResponse({"status": "ok"})
+    # Note: warmed per-user pool sessions on server nodes hold the bearer
+    # in-memory and self-clear at token TTL / idle eviction; the console has no
+    # per-user cross-node eviction primitive. Credential + cache purge stop all
+    # FUTURE dispatch (next call re-reads the now-empty cache → mint → missing
+    # credential → re-login), bounding residual access to the current token TTL.
+    return JSONResponse(
+        {
+            "status": "ok",
+            "obo_credential_revoked": credential_revoked,
+            "obo_cache_rows_purged": obo_cache_purged,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -9669,11 +9734,13 @@ async def admin_registry_install(request: Request) -> JSONResponse:
         ip,
     )
 
-    # Auto-reload nodes for one-click UX
-    await _notify_nodes_mcp_reload(request)
-
     server_row = storage.get_mcp_server(server_id)
-    return JSONResponse(_mcp_server_to_detail(_mask_mcp_secrets(server_row or {})))
+    # Auto-reload nodes for one-click UX — scheduled after the response so the
+    # install isn't blocked on cluster fan-out (see _schedule_mcp_reload).
+    return JSONResponse(
+        _mcp_server_to_detail(_mask_mcp_secrets(server_row or {})),
+        background=_schedule_mcp_reload(request),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -9682,7 +9749,7 @@ async def admin_registry_install(request: Request) -> JSONResponse:
 
 _MCP_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 _MCP_MAX_SERVERS = 200  # fallback; prefer cluster.mcp_max_servers from storage
-_MCP_AUTH_TYPES = frozenset({"none", "static", "oauth_user"})
+_MCP_AUTH_TYPES = frozenset({"none", "static", "oauth_user", "oauth_obo"})
 
 
 def _clean_oauth_text(value: Any, *, max_length: int = 512) -> str | None:
@@ -9714,20 +9781,23 @@ def _parse_auth_type(body: dict[str, Any]) -> tuple[str | None, JSONResponse | N
     auth_type = str(body["auth_type"]).strip()
     if auth_type not in _MCP_AUTH_TYPES:
         return None, JSONResponse(
-            {"error": "auth_type must be 'none', 'static', or 'oauth_user'"},
+            {"error": "auth_type must be 'none', 'static', 'oauth_user', or 'oauth_obo'"},
             status_code=400,
         )
     return auth_type, None
 
 
 def _enforce_oauth_user_https(auth_type: str, url: str | None) -> JSONResponse | None:
-    """Reject oauth_user MCP server URLs that aren't https (or loopback http).
+    """Reject per-user-auth MCP server URLs that aren't https (or loopback http).
 
-    Belt-and-braces with :func:`turnstone.core.mcp_client._validate_oauth_user_url`
+    Applies to both pool-backed types — ``oauth_user`` and ``oauth_obo`` —
+    since both transmit per-user bearers to the server URL. Belt-and-braces
+    with :func:`turnstone.core.mcp_client._validate_oauth_user_url`
     so a misconfigured row never persists. Returns the error response or
     ``None`` when the input is acceptable.
     """
-    if auth_type != "oauth_user":
+
+    if not is_user_scoped_auth(auth_type):
         return None
     if not url:
         return None  # presence checked elsewhere; this helper only checks scheme
@@ -9737,6 +9807,173 @@ def _enforce_oauth_user_https(auth_type: str, url: str | None) -> JSONResponse |
         _validate_oauth_user_url(url)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
+    return None
+
+
+def _obo_profile(request: Request) -> str:
+    """Deployment-level ``[oidc] obo_grant_profile`` (``""`` when OIDC absent).
+
+    One reader for the profile so the create handler, the update handler, and
+    the write-time enforcement never diverge on how they resolve it.
+    """
+    oidc_config = getattr(request.app.state, "oidc_config", None)
+    return str(getattr(oidc_config, "obo_grant_profile", "") or "")
+
+
+def _oauth_columns_to_clear(auth_type: str | None) -> dict[str, None]:
+    """OAuth columns to force-NULL for a row of *auth_type* (shared write policy).
+
+    Single source of the "which OAuth columns does this auth model use" policy,
+    consumed by both the create and update handlers so they cannot drift.
+    ``oauth_user`` uses every column (nothing cleared); ``oauth_obo`` uses
+    ``oauth_audience`` (+ ``oauth_scopes`` under rfc8693) but none of the
+    oauth_user-only columns; ``static``/``none`` use no OAuth columns at all.
+    ``oauth_client_secret_ct`` is owned by a dedicated write path and is not
+    included here. Callers that cannot persist ``oauth_as_issuer_cached`` (the
+    create path) drop that key.
+    """
+    if auth_type == "oauth_user":
+        return {}
+    if auth_type == "oauth_obo":
+        return {
+            "oauth_client_id": None,
+            "oauth_registration_mode": None,
+            "oauth_authorization_server_url": None,
+            "oauth_as_issuer_cached": None,
+        }
+    return {  # static / none
+        "oauth_client_id": None,
+        "oauth_scopes": None,
+        "oauth_audience": None,
+        "oauth_registration_mode": None,
+        "oauth_authorization_server_url": None,
+        "oauth_as_issuer_cached": None,
+    }
+
+
+def _enforce_oauth_obo_requirements(
+    request: Request,
+    auth_type: str,
+    *,
+    audience: str | None,
+    scopes: str | None,
+    check_oidc_deployment: bool = True,
+) -> JSONResponse | None:
+    """Write-time validation for ``oauth_obo`` rows (issue #551).
+
+    ``check_oidc_deployment`` splits the checks by what they guard. The
+    DEPLOYMENT-level checks (token-encryption key, OIDC configured/enabled,
+    capture opt-in, valid grant profile) reject configuring a NEW obo mint that
+    could never work — they run on create and on a flip INTO obo. They are
+    SKIPPED for a same-type edit of an existing obo server (``False``): OIDC
+    being operator-disabled is a deployment state, not a per-server one, so
+    blocking every edit — including the natural remedy of setting
+    ``enabled=false`` — would only lock the operator out (the row can still be
+    DELETEd, but not disabled). The PER-SERVER validity checks (audience
+    required; ``oauth_scopes`` rejected under the entra profile) always run so a
+    same-type edit can't leave the row itself invalid.
+
+    Rejects at the write choke point what would otherwise fail per-dispatch at
+    runtime (or worse, at the next boot):
+
+    - **No token-encryption key** → 503. An oauth_obo row persists encrypted
+      per-user mint-cache rows AND makes ``initialize_mcp_crypto_state``
+      ``SystemExit(1)`` at the next restart, so accepting one keyless plants a
+      deferred whole-cluster boot failure.
+    - **OIDC not enabled / no captured-credential source** → 400. The mint
+      redeems the user's captured IdP credential, so an install with no
+      ``[oidc]`` issuer (or OIDC operator-disabled) can NEVER mint — every tool
+      call would return ``mcp_refresh_unavailable`` ("please retry") forever, a
+      permanent misconfig dressed as a transient. Reject at write time.
+    - **Invalid ``obo_grant_profile``** → 400. A typo'd deployment profile
+      leaves the mint leg unresolved (``obo_misconfigured`` per dispatch), so
+      surface it here rather than as a runtime transient that never heals.
+    - **No ``oauth_audience``** → 400. The mint engine hard-requires the
+      downstream audience; without it every tool call fails transient and logs
+      ``obo_misconfigured``. Reject here, exactly as bad URL schemes are.
+    - **``oauth_scopes`` under the entra grant profile** → 400. Entra's ``scope``
+      is its only audience carrier (the leg pins ``<audience>/.default``), so a
+      per-server scope list is silently ignored at mint time — reject it at the
+      form instead of letting the operator believe it took effect. (The rfc8693
+      profile does use ``oauth_scopes``, so it is allowed there.)
+    """
+    if auth_type != "oauth_obo":
+        return None
+    profile = _obo_profile(request)
+    if check_oidc_deployment:
+        if getattr(request.app.state, "mcp_token_store", None) is None:
+            return JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
+        oidc_config = getattr(request.app.state, "oidc_config", None)
+        # Accept a config that is enabled OR merely transiently un-discovered
+        # (``discovery_retryable`` — the IdP was unreachable at this process's
+        # boot). OIDC is still CONFIGURED there (issuer set); reject only a
+        # genuinely absent / operator-disabled OIDC (neither flag set).
+        oidc_configured = oidc_config is not None and (
+            getattr(oidc_config, "enabled", False)
+            or getattr(oidc_config, "discovery_retryable", False)
+        )
+        if not oidc_configured:
+            return JSONResponse(
+                {
+                    "error": (
+                        "auth_type=oauth_obo requires OIDC sign-in to be configured and "
+                        "enabled (it mints per-server tokens from each user's Turnstone "
+                        "sign-in). Configure [oidc] and capture_user_credential, or use "
+                        "auth_type=oauth_user for per-server consent."
+                    )
+                },
+                status_code=400,
+            )
+        if not getattr(oidc_config, "capture_user_credential", False):
+            # The mint redeems the user's CAPTURED IdP refresh token; with capture
+            # off, login persists nothing, so every dispatch returns kind="missing"
+            # and the "sign in again" remedy can never succeed — a permanent
+            # misconfig this choke point exists to reject. (Enabling capture also
+            # requires the encryption key, checked at boot.)
+            return JSONResponse(
+                {
+                    "error": (
+                        "auth_type=oauth_obo requires [oidc] capture_user_credential=true "
+                        "so each user's sign-in credential is captured for minting; it is "
+                        "currently disabled, so this server could never obtain a token."
+                    )
+                },
+                status_code=400,
+            )
+        from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
+
+        if profile not in OBO_GRANT_PROFILES:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"[oidc] obo_grant_profile={profile!r} is not a valid grant profile "
+                        f"({', '.join(sorted(OBO_GRANT_PROFILES))}); fix the deployment "
+                        "config before configuring oauth_obo servers"
+                    )
+                },
+                status_code=400,
+            )
+    if not (audience or "").strip():
+        return JSONResponse(
+            {
+                "error": (
+                    "auth_type=oauth_obo requires oauth_audience "
+                    "(the downstream resource the access token is minted for)"
+                )
+            },
+            status_code=400,
+        )
+    if (scopes or "").strip() and profile == "entra":
+        return JSONResponse(
+            {
+                "error": (
+                    "oauth_scopes is not used by the entra grant profile "
+                    "(it mints <audience>/.default); leave it empty or switch "
+                    "the deployment to the rfc8693 profile"
+                )
+            },
+            status_code=400,
+        )
     return None
 
 
@@ -9978,13 +10215,18 @@ async def admin_list_mcp_servers(request: Request) -> JSONResponse:
     # stack the DB latency on top of the fan-out latency.  Skipped
     # entirely when no row is oauth_user so static-only installs
     # exercise zero new storage queries.
-    has_oauth_user = any(s.get("auth_type") == "oauth_user" for s in servers)
+
+    # Both pool-backed types populate mcp_user_tokens (oauth_user: consents;
+    # oauth_obo: minted cache), so run the count for either — it drives the
+    # per-row pill: oauth_user's consented-users count and oauth_obo's
+    # flush-cache action (gated on count>0 in the UI).
+    has_user_scoped = any(is_user_scoped_auth(s.get("auth_type")) for s in servers)
     status_task: asyncio.Task[dict[str, dict[str, dict[str, Any]]]] = asyncio.create_task(
         _collect_mcp_status(request)
     )
     count_task: asyncio.Task[dict[str, int]] | None = (
         asyncio.create_task(asyncio.to_thread(storage.count_mcp_consented_users_grouped_by_server))
-        if has_oauth_user
+        if has_user_scoped
         else None
     )
 
@@ -10006,11 +10248,11 @@ async def admin_list_mcp_servers(request: Request) -> JSONResponse:
             status = node_servers.get(s["name"])
             if status:
                 per_node[node_id] = status
-        # Phase 9: surface the consented-users-count pill for
-        # oauth_user rows.  Aggregate was pre-computed above with a
+        # Surface the count for both pool-backed types (oauth_user consents /
+        # oauth_obo minted-token cache). Aggregate was pre-computed above with a
         # single bulk GROUP BY query; we just look up here.
         consent_count: int | None = None
-        if s.get("auth_type") == "oauth_user":
+        if is_user_scoped_auth(s.get("auth_type")):
             consent_count = consent_counts.get(s["name"], 0)
         s = _mask_mcp_secrets(s, reveal)
         result.append(_mcp_server_to_detail(s, per_node, consent_count))
@@ -10109,8 +10351,24 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     # Helper returns None when key is absent — fall back to the default.
     auth_type = auth_type_value if auth_type_value is not None else "static"
 
-    # sec-1: oauth_user must use https:// (loopback http allowed for dev).
+    # Clean the OAuth text fields ONCE — reused by both the write-time validator
+    # and the persisted ``oauth_cols`` below, so the validated and persisted
+    # values (and the 2048 max_length) can't silently diverge.
+    clean_audience = _clean_oauth_text(body.get("oauth_audience"), max_length=2048)
+    clean_scopes = _clean_oauth_text(body.get("oauth_scopes"))
+
+    # sec-1: oauth_user/oauth_obo must use https:// (loopback http allowed for dev).
     err_resp = _enforce_oauth_user_https(auth_type, str(body.get("url", "")).strip())
+    if err_resp is not None:
+        return err_resp
+
+    # #551: oauth_obo needs an encryption key + an audience at write time.
+    err_resp = _enforce_oauth_obo_requirements(
+        request,
+        auth_type,
+        audience=clean_audience,
+        scopes=clean_scopes,
+    )
     if err_resp is not None:
         return err_resp
 
@@ -10143,6 +10401,24 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     headers_dict = body.get("headers", {})
     env_dict = body.get("env", {})
 
+    # Column policy — the SAME ``_oauth_columns_to_clear`` rule the update
+    # handler applies on a flip: persist only the OAuth columns the target
+    # auth_type actually uses, so a row created as oauth_obo can't carry a
+    # client_id / registration_mode / AS-URL straight into a later oauth_user
+    # flip. ``oauth_as_issuer_cached`` (nulled by the cleared set for a
+    # non-oauth_user type) IS a valid create parameter, so it passes through
+    # to ``create_mcp_server`` as its default None.
+    oauth_cols: dict[str, Any] = {
+        "oauth_client_id": _clean_oauth_text(body.get("oauth_client_id")),
+        "oauth_scopes": clean_scopes,
+        "oauth_audience": clean_audience,
+        "oauth_registration_mode": _clean_oauth_text(body.get("oauth_registration_mode")),
+        "oauth_authorization_server_url": _clean_oauth_text(
+            body.get("oauth_authorization_server_url"), max_length=2048
+        ),
+    }
+    oauth_cols.update(_oauth_columns_to_clear(auth_type))
+
     storage.create_mcp_server(
         server_id=server_id,
         name=name,
@@ -10156,13 +10432,7 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         enabled=bool(body.get("enabled", True)),
         created_by=audit_uid,
         auth_type=auth_type,
-        oauth_client_id=_clean_oauth_text(body.get("oauth_client_id")),
-        oauth_scopes=_clean_oauth_text(body.get("oauth_scopes")),
-        oauth_audience=_clean_oauth_text(body.get("oauth_audience"), max_length=2048),
-        oauth_registration_mode=_clean_oauth_text(body.get("oauth_registration_mode")),
-        oauth_authorization_server_url=_clean_oauth_text(
-            body.get("oauth_authorization_server_url"), max_length=2048
-        ),
+        **oauth_cols,
     )
 
     # Encrypt + persist the operator-supplied client secret via the dedicated
@@ -10195,7 +10465,13 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     )
 
     server = storage.get_mcp_server(server_id)
-    return JSONResponse(_mcp_server_to_detail(_mask_mcp_secrets(server or {})))
+    # Auto-reload nodes so the new server reaches them (and per-user pools
+    # re-prime for active sessions) without a separate /reload — scheduled after
+    # the response so the write isn't blocked on cluster fan-out.
+    return JSONResponse(
+        _mcp_server_to_detail(_mask_mcp_secrets(server or {})),
+        background=_schedule_mcp_reload(request),
+    )
 
 
 async def admin_get_mcp_server(request: Request) -> JSONResponse:
@@ -10313,48 +10589,113 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         if _oauth_url_key in body:
             updates[_oauth_url_key] = _clean_oauth_text(body[_oauth_url_key], max_length=2048)
 
-    # When auth_type is changed away from oauth_user, clear the OAuth
-    # columns so a stale client_id / audience can't leak back if the
-    # row is later flipped to a different oauth_user provider.
-    # ``oauth_client_secret_ct`` is owned by a dedicated write path
-    # (not the generic update); the matching clear-on-transition is
-    # applied below via ``token_store.set_oauth_client_secret(..., None)``
-    # (or a direct storage call when no encryption key is configured).
-    transitioning_away_from_oauth_user = (
-        updates.get("auth_type") in {"static", "none"} and existing.get("auth_type") == "oauth_user"
-    )
-    # Renaming an oauth_user row needs the same per-user-token purge as
+    old_auth = existing.get("auth_type")
+    new_auth = updates.get("auth_type")
+    # A flip is any auth_type transition. ``oauth_audience`` and ``oauth_scopes``
+    # keep their meaning only WITHIN an auth type — across oauth_user↔oauth_obo
+    # the audience is a resource indicator vs. an IdP-side app identifier, and
+    # the scopes are AS-consent scopes vs. an rfc8693 exchange scope — so on a
+    # flip they must NEVER carry from the old row; they are recomputed from the
+    # request body (or NULLed) for the target type below.
+    is_flip = new_auth is not None and new_auth != old_auth
+
+    if not is_flip:
+        # SAME-TYPE edit: a re-send of oauth_scopes / oauth_audience equal to the
+        # row's current value is a genuine no-op — drop it from ``updates`` so the
+        # admin form's unconditional re-send of pre-filled fields doesn't (a)
+        # trip the mint-cache purge triggers or (b) trip the entra scope
+        # rejection that would otherwise make a legacy-scoped row un-editable.
+        # (On a flip this comparison is meaningless — the old value is in the
+        # other auth model's semantics — so it is skipped.)
+        for _noop_key in ("oauth_scopes", "oauth_audience"):
+            if _noop_key in updates and (updates[_noop_key] or None) == (
+                existing.get(_noop_key) or None
+            ):
+                del updates[_noop_key]
+
+    # Scrub the OAuth columns the target auth_type does NOT use — on EVERY write,
+    # not just a flip. This is a SECURITY invariant, not a flip nicety: a
+    # same-type edit can still inject a column the type doesn't use (e.g. an API
+    # PUT of {"auth_type":"static","oauth_authorization_server_url":"…attacker…"}
+    # onto a static row), which — because oauth_user legitimately USES that
+    # column — would then survive a later flip to oauth_user and redirect every
+    # consenting user's OAuth traffic. The persisted OAuth columns must be a pure
+    # function of the target auth_type (the create handler enforces the same via
+    # ``_oauth_columns_to_clear``). ``oauth_client_secret_ct`` is owned by a
+    # dedicated write path (see below). ``target_auth`` is the effective
+    # post-update auth type — reused below by the write-time validators.
+    target_auth = new_auth if new_auth is not None else (old_auth or "static")
+    if is_flip and new_auth is not None and is_user_scoped_auth(new_auth):
+        # FLIP into a user-scoped type: the columns whose MEANING differs across
+        # oauth_user↔oauth_obo must be recomputed from the body — present → that
+        # value, absent → NULL — never inherited from the old model's row. For
+        # oauth_audience/oauth_scopes this is the semantic-boundary rule; for a
+        # flip INTO oauth_user the oauth_user-only columns (client_id /
+        # registration / AS-URL) are also recomputed, so a stale/injected value
+        # left on the pre-flip static/none/obo row cannot carry in (those models
+        # don't use these columns, so the operator supplies them fresh here).
+        updates["oauth_audience"] = updates.get("oauth_audience")
+        updates["oauth_scopes"] = updates.get("oauth_scopes")
+        if new_auth == "oauth_user":
+            for _user_col in (
+                "oauth_client_id",
+                "oauth_registration_mode",
+                "oauth_authorization_server_url",
+            ):
+                updates[_user_col] = updates.get(_user_col)
+    updates.update(_oauth_columns_to_clear(target_auth))
+    # Renaming a pool-backed row needs the same per-user-token purge as
     # delete: the tokens are keyed on the OLD ``server_name`` and a row
     # later created with that old name (with attacker-controlled URL)
     # would otherwise silently rebind them.
     name_changing = "name" in updates and existing.get("name", "") != updates["name"]
-    # URL change on an oauth_user row needs the same purge: bearer tokens
+    # Any auth_type transition touching a pool-backed type (oauth_user or
+    # oauth_obo) purges the per-user rows: leaving to static/none orphans them;
+    # oauth_user↔oauth_obo mixes semantically different rows (per-server-AS
+    # refresh tokens vs minted cache) and would otherwise leave a live grant at
+    # the old AS unrevoked and refresh-bearing rows in the mint cache.
+    auth_type_purge = is_flip and (is_user_scoped_auth(old_auth) or is_user_scoped_auth(new_auth))
+    # URL change on a pool-backed row needs the same purge: bearer tokens
     # are bound (via OAuth resource / audience) to the URL active at
-    # consent time, so sending them to a new URL is a token-binding
+    # mint/consent time, so sending them to a new URL is a token-binding
     # violation. A compromised admin who flips the URL to an attacker
     # endpoint would otherwise replay every user's bearer there silently.
-    # Re-consent forces fresh token issuance bound to the new resource.
     url_changing = (
-        existing.get("auth_type") == "oauth_user"
+        is_user_scoped_auth(old_auth)
         and "url" in updates
         and existing.get("url", "") != updates["url"]
     )
-    if updates.get("auth_type") and updates["auth_type"] != "oauth_user":
-        updates.update(
-            {
-                "oauth_client_id": None,
-                "oauth_scopes": None,
-                "oauth_audience": None,
-                "oauth_registration_mode": None,
-                "oauth_authorization_server_url": None,
-                "oauth_as_issuer_cached": None,
-            }
-        )
+    # Changing oauth_audience on a pool-backed row is a token-binding change too:
+    # minted obo bearers (and oauth_user tokens) are audience-scoped, so cached
+    # rows for the OLD audience must be purged or a privilege reduction silently
+    # doesn't take effect until they expire. (auth_type flips already purge, so
+    # only guard the same-type edit here.) Like ``scopes_changing`` below, the
+    # same-type no-op normalization above already dropped an equal re-sent value
+    # from ``updates``, so "in updates" already means a genuine change.
+    audience_changing = (
+        is_user_scoped_auth(old_auth) and not is_flip and "oauth_audience" in updates
+    )
+    # Changing oauth_scopes on an oauth_obo row is the same token-binding
+    # change under the rfc8693 profile: the exchange scope shapes the minted
+    # bearer's privileges, so cached rows minted with the OLD scopes must be
+    # purged or a scope narrowing silently doesn't take effect until token
+    # TTL — inconsistent with the audience purge above. oauth_user scope
+    # edits deliberately do NOT purge (consent scopes bind per-grant at the
+    # AS; step-up re-consent handles widening). The no-op normalization
+    # above guarantees "in updates" here means a genuine change.
+    scopes_changing = old_auth == "oauth_obo" and not is_flip and "oauth_scopes" in updates
+    # Leaving oauth_user (to static/none OR to oauth_obo, which doesn't use the
+    # per-server client secret) clears the encrypted secret column below.
+    leaving_oauth_user = (
+        old_auth == "oauth_user" and new_auth is not None and new_auth != "oauth_user"
+    )
 
     # bug-2 / sec-1: validate token-store availability and JSON shape BEFORE
     # ``storage.update_mcp_server`` so a missing key doesn't leave partial
-    # column changes persisted.
-    auth_type_now = updates.get("auth_type", existing.get("auth_type", "static"))
+    # column changes persisted. ``target_auth`` (above) is the effective
+    # post-update auth type — one derivation feeds both the column scrub and
+    # these validators so they can't disagree on the row's type.
+    auth_type_now = target_auth
     err_resp = _require_token_store_for_oauth_secret(request, body, auth_type=auth_type_now)
     if err_resp is not None:
         return err_resp
@@ -10366,18 +10707,43 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     if err_resp is not None:
         return err_resp
 
+    # #551: an oauth_obo row (whether newly flipped or edited) needs an
+    # encryption key + an audience — validated against the merged post-update
+    # audience. The entra-scope reject fires ONLY when this request actually
+    # CHANGES scopes ("oauth_scopes" in updates — the no-op normalization
+    # above already dropped a re-sent equal value), never on the carried-over
+    # existing value: otherwise a pre-existing scoped row under the entra
+    # profile becomes un-editable — the admin form always re-submits the
+    # pre-filled field, so every unrelated save would 400.
+    audience_now = updates.get("oauth_audience", existing.get("oauth_audience"))
+    scopes_being_set = updates.get("oauth_scopes") if "oauth_scopes" in updates else None
+    # Run the DEPLOYMENT-level OIDC checks only when this write is a NEW obo
+    # enablement (a flip INTO obo); a same-type edit of an existing obo server
+    # keeps only the per-server validity checks, so an operator can still
+    # disable / edit an obo server after OIDC was operator-disabled.
+    err_resp = _enforce_oauth_obo_requirements(
+        request,
+        auth_type_now,
+        audience=audience_now,
+        scopes=scopes_being_set,
+        check_oidc_deployment=is_flip,
+    )
+    if err_resp is not None:
+        return err_resp
+
     if updates:
         storage.update_mcp_server(server_id, **updates)
 
     audit_uid, ip = _audit_context(request)
 
-    # Purge per-user tokens + pending OAuth states keyed on the OLD
-    # name on rename, on ``oauth_user → static/none`` transition, or
-    # on URL change for an oauth_user row. All three cases would
-    # otherwise leave tokens orphaned-and-rebindable because the OAuth
-    # tables key on the mutable ``server_name`` and tokens are bound
-    # to the URL active at consent time.
-    if name_changing or transitioning_away_from_oauth_user or url_changing:
+    # Purge per-user tokens + pending OAuth states keyed on the OLD name on
+    # rename, on any pool-backed auth_type transition, on URL change, or on an
+    # audience / obo-scope change for a pool-backed row. All cases would
+    # otherwise leave tokens orphaned-and-rebindable or bound to a superseded
+    # URL/audience/scope set (the OAuth tables key on the mutable
+    # ``server_name`` and tokens are bound to the URL + audience + scopes
+    # active at mint/consent time).
+    if name_changing or auth_type_purge or url_changing or audience_changing or scopes_changing:
         purge_target = existing.get("name", "")
         if purge_target:
             try:
@@ -10389,11 +10755,11 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
                     exc_info=True,
                 )
 
-    # sec-2: when the row is leaving ``oauth_user``, also clear the encrypted
-    # client secret column.  Operators expect "disable OAuth" to revoke
-    # credentials; leaving stale ciphertext that resurfaces if the row is
-    # flipped back is surprising and a footgun.
-    if transitioning_away_from_oauth_user:
+    # sec-2: when the row is leaving ``oauth_user`` (to static/none or to
+    # oauth_obo), also clear the encrypted client secret column.  Operators
+    # expect "disable OAuth" to revoke credentials; leaving stale ciphertext
+    # that resurfaces if the row is flipped back is surprising and a footgun.
+    if leaving_oauth_user:
         token_store = getattr(request.app.state, "mcp_token_store", None)
         if token_store is not None:
             token_store.set_oauth_client_secret(server_id, None)
@@ -10452,7 +10818,13 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     )
 
     server = storage.get_mcp_server(server_id)
-    return JSONResponse(_mcp_server_to_detail(_mask_mcp_secrets(server or {})))
+    # Auto-reload nodes so the edit (incl. a pool auth_type flip) reaches them
+    # and active sessions re-prime — scheduled after the response so the write
+    # isn't blocked on cluster fan-out.
+    return JSONResponse(
+        _mcp_server_to_detail(_mask_mcp_secrets(server or {})),
+        background=_schedule_mcp_reload(request),
+    )
 
 
 async def admin_delete_mcp_server(request: Request) -> JSONResponse:
@@ -10504,11 +10876,20 @@ async def admin_delete_mcp_server(request: Request) -> JSONResponse:
         ip,
     )
 
-    return JSONResponse({"status": "ok"})
+    # Auto-reload nodes so they drop the removed server — scheduled after the
+    # response so the delete isn't blocked on cluster fan-out.
+    return JSONResponse({"status": "ok"}, background=_schedule_mcp_reload(request))
 
 
 async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
-    """Tell all nodes to re-read the mcp_servers DB table and reconcile."""
+    """Tell all nodes to re-read the mcp_servers DB table and reconcile.
+
+    Drain-style: awaited inline only by the operator-triggered ``POST /reload``,
+    which reports the per-node results and must fail loudly if the fan-out infra
+    is absent. Admin *writes* (create/update/delete/registry-install) never await
+    this — they schedule it best-effort via ``_schedule_mcp_reload`` so a write's
+    response isn't blocked on (nor failed by) cluster reachability.
+    """
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
     client: httpx.AsyncClient = request.app.state.proxy_client
@@ -10527,6 +10908,9 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
                     headers=headers,
                     timeout=30,
                 )
+                # A non-2xx reply is a failed reload, not a reached node (httpx
+                # does not raise on status); surface it as an error so _run warns.
+                resp.raise_for_status()
                 return node_id, resp.json()
             except Exception as exc:
                 log.debug("Failed to notify node %s for MCP reload", node_id, exc_info=True)
@@ -10534,6 +10918,49 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
 
     results = await asyncio.gather(*[_notify(n) for n in nodes])
     return {nid: data for nid, data in results if data is not None}
+
+
+def _schedule_mcp_reload(request: Request) -> BackgroundTask:
+    """Best-effort node-reload fan-out to run AFTER an admin MCP write's 200.
+
+    Returned as a ``BackgroundTask`` — the "trigger, not drain" contract also
+    used by ``_cascade_cancel_to_children``: the admin write's response is never
+    blocked on the per-node fan-out (each node POST can hit a 30s timeout under
+    the fan-out semaphore), so a fan-out failure can't fail a write that already
+    committed.
+
+    There is no periodic node→DB reconcile — a node that misses this reload
+    keeps serving a stale MCP catalog until the next ``POST /reload`` (or a node
+    restart). So ``_run`` does NOT swallow failures: any unreached node (or a
+    systemic fan-out fault) is logged at WARNING (visible at the default INFO
+    level), and the per-node status view surfaces the divergence. Only
+    ``POST /reload`` awaits the fan-out inline, where draining and reporting
+    per-node results to the operator is the point.
+    """
+
+    async def _run() -> None:
+        try:
+            results = await _notify_nodes_mcp_reload(request)
+        except Exception:
+            log.warning(
+                "auto mcp-reload fan-out failed after admin write; nodes may serve a "
+                "stale MCP catalog until the next POST /reload",
+                exc_info=True,
+            )
+            return
+        unreached = sorted(
+            nid for nid, data in results.items() if isinstance(data, dict) and "error" in data
+        )
+        if unreached:
+            log.warning(
+                "auto mcp-reload did not reach %d of %d node(s) after admin write "
+                "(stale MCP catalog until next reload): %s",
+                len(unreached),
+                len(results),
+                ", ".join(unreached),
+            )
+
+    return BackgroundTask(_run)
 
 
 async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> dict[str, Any]:
@@ -10562,6 +10989,9 @@ async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> 
                     headers=headers,
                     timeout=30,
                 )
+                # A non-2xx reply is a failed action, not a reached node (httpx
+                # does not raise on status); surface it as an error to the operator.
+                resp.raise_for_status()
                 return node_id, resp.json()
             except Exception as exc:
                 log.debug(
@@ -10700,9 +11130,19 @@ async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
     existing = storage.get_mcp_server_by_name(name)
     if existing is None:
         return JSONResponse({"error": "No such server"}, status_code=404)
-    if existing.get("auth_type") != "oauth_user":
+    # Both pool-backed types populate mcp_user_tokens, but the semantics differ
+    # and must be honest (issue #551): for oauth_user, deleting the rows is a
+    # durable REVOCATION — users lose access until they re-consent. For
+    # oauth_obo, the per-server rows are a mint CACHE; the shared per-user
+    # credential survives (it is issuer-scoped, not per-server, and IdP-governed),
+    # so the next dispatch simply re-mints. Bulk-revoke on an obo server is
+    # therefore a cache FLUSH (force re-mint, e.g. after narrowing the audience),
+    # NOT a consent revocation — surfaced via a distinct audit event + response
+    # ``effect`` so an operator is never told access was cut when it re-mints.
+    is_obo = existing.get("auth_type") == "oauth_obo"
+    if not is_user_scoped_auth(existing.get("auth_type")):
         return JSONResponse(
-            {"error": "bulk-revoke is only valid for auth_type=oauth_user servers"},
+            {"error": "bulk-revoke is only valid for oauth_user or oauth_obo servers"},
             status_code=400,
         )
 
@@ -10719,7 +11159,7 @@ async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
     record_audit(
         storage,
         audit_uid,
-        "mcp_server.oauth.bulk_revoked",
+        "mcp_server.oauth.obo_cache_flushed" if is_obo else "mcp_server.oauth.bulk_revoked",
         "mcp_server",
         target_id,
         {
@@ -10727,6 +11167,7 @@ async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
             "rows_deleted": deleted,
             "consented_users_before": consented_before,
             "upstream_revoke_outcome": "bulk_admin_no_upstream",
+            "effect": "cache_flush_remints" if is_obo else "revoked_until_reconsent",
         },
         ip,
     )
@@ -10736,6 +11177,9 @@ async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
             "status": "ok",
             "rows_deleted": deleted,
             "consented_users_before": consented_before,
+            # Honest semantics: obo re-mints on next use (revoke at the IdP or
+            # unlink the identity to cut a user off); oauth_user needs re-consent.
+            "effect": "cache_flush_remints" if is_obo else "revoked_until_reconsent",
         }
     )
 

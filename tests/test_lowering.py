@@ -18,6 +18,7 @@ from turnstone.core.lowering import (
     CANCELLED_TOOL_RESULT,
     _find_orphaned_tool_calls,
     repair_wire_messages,
+    restore_provider_tool_ids,
     sanitize_tool_call_arguments,
     tool_args_preview,
     wire_valid_arguments,
@@ -340,3 +341,90 @@ def test_pipeline_every_emitted_arguments_is_a_json_object() -> None:
     for m in out:
         for tc in m.get("tool_calls", []):
             assert isinstance(json.loads(tc["function"]["arguments"]), dict)
+
+
+# --------------------------------------------------------------------------- #
+# restore_provider_tool_ids — the agent-wire id map (minted → provider-original).
+#
+# Sub-agent tool ids are minted "{parent}::r{run}s{step}::{provider_id}" for
+# session-unique correlation (registry / DOM / recall).  On the wire the pass
+# maps them BACK to the provider's own ids from the per-run mint map, so the
+# provider-native tool_use block (replayed verbatim, id never rewritten), the
+# top-level tool_calls mirror, and the tool_result all agree on every request.
+# --------------------------------------------------------------------------- #
+def test_restore_ids_identity_on_empty_map() -> None:
+    msgs = [_assistant_calls(_call("task-1::r1s1::call_0", "{}")), _tool("task-1::r1s1::call_0")]
+    assert restore_provider_tool_ids(msgs, {}) is msgs
+
+
+def test_restore_ids_identity_when_nothing_matches() -> None:
+    msgs = [_assistant_calls(_call("call_1", "{}")), _tool("call_1")]
+    assert restore_provider_tool_ids(msgs, {"task-1::r1s1::call_0": "call_0"}) is msgs
+
+
+def test_restore_ids_maps_call_and_result_to_provider_original() -> None:
+    minted = "task-1::r1s1::toolu_01AB"
+    msgs = [_assistant_calls(_call(minted, "{}")), _tool(minted)]
+    out = restore_provider_tool_ids(msgs, {minted: "toolu_01AB"})
+    assert out[0]["tool_calls"][0]["id"] == "toolu_01AB"
+    assert out[1]["tool_call_id"] == "toolu_01AB"  # pairing restored on both sides
+    # Copy-on-write: the input messages (the canonical-adjacent dicts) are unmutated.
+    assert msgs[0]["tool_calls"][0]["id"] == minted
+    assert msgs[1]["tool_call_id"] == minted
+
+
+def test_restore_ids_recovers_originals_containing_the_mint_delimiter() -> None:
+    # Recovery is by MAP, not by string-splitting the mint suffix: a provider
+    # id that itself contains "::" round-trips exactly.
+    original = "srv::call::0"
+    minted = f"task-1::r1s1::{original}"
+    msgs = [_assistant_calls(_call(minted, "{}")), _tool(minted)]
+    out = restore_provider_tool_ids(msgs, {minted: original})
+    assert out[0]["tool_calls"][0]["id"] == original
+    assert out[1]["tool_call_id"] == original
+
+
+def test_restore_ids_duplicate_originals_across_turns() -> None:
+    # A local server reissuing "call_0" every turn: two distinct minted ids
+    # both restore to "call_0" — the proven prior wire shape, each round
+    # pairing with its adjacent result.
+    m1, m2 = "task-1::r1s1::call_0", "task-1::r1s2::call_0"
+    msgs = [
+        _assistant_calls(_call(m1, "{}")),
+        _tool(m1),
+        _assistant_calls(_call(m2, "{}")),
+        _tool(m2),
+    ]
+    out = restore_provider_tool_ids(msgs, {m1: "call_0", m2: "call_0"})
+    assert out[0]["tool_calls"][0]["id"] == "call_0"
+    assert out[1]["tool_call_id"] == "call_0"
+    assert out[2]["tool_calls"][0]["id"] == "call_0"
+    assert out[3]["tool_call_id"] == "call_0"
+
+
+def test_restore_ids_leaves_unmapped_siblings_untouched() -> None:
+    minted = "task-1::r1s2::call_1"
+    msgs = [
+        _assistant_calls(_call("call_ok", "{}"), _call(minted, "{}")),
+        _tool("call_ok"),
+        _tool(minted),
+    ]
+    out = restore_provider_tool_ids(msgs, {minted: "call_1"})
+    assert out[0]["tool_calls"][0]["id"] == "call_ok"
+    assert out[1]["tool_call_id"] == "call_ok"
+    assert out[0]["tool_calls"][1]["id"] == "call_1"
+    assert out[2]["tool_call_id"] == "call_1"
+
+
+def test_restore_ids_skips_empty_and_non_string() -> None:
+    # Empty ids belong to repair_wire_messages' back-fill; non-strings are
+    # someone else's malformation — neither is this pass's to invent.
+    msgs = [
+        _assistant_calls(
+            {"id": "", "type": "function", "function": {"name": "b", "arguments": "{}"}}
+        ),
+        {"role": "tool", "tool_call_id": None, "content": "x"},
+    ]
+    out = restore_provider_tool_ids(msgs, {"task-1::r1s1::x": "x"})
+    assert out[0]["tool_calls"][0]["id"] == ""
+    assert out[1]["tool_call_id"] is None

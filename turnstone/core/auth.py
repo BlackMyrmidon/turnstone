@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from turnstone.core.oidc import OIDCConfig
 
 from turnstone.core.log import get_logger
+from turnstone.core.mcp_client import try_prime_user_pools
 from turnstone.core.oidc import (
     OIDC_STATE_TTL_SECONDS,
     OIDCError,
@@ -44,6 +45,7 @@ from turnstone.core.oidc import (
     exchange_code,
     fetch_jwks,
     generate_pkce_verifier,
+    maybe_rediscover_oidc,
     provision_oidc_user,
     validate_id_token,
 )
@@ -1898,6 +1900,14 @@ async def handle_oidc_authorize(request: Request, audience: str) -> Response:
     from starlette.responses import JSONResponse, RedirectResponse
 
     oidc_config = getattr(request.app.state, "oidc_config", None)
+    if oidc_config is not None and not oidc_config.enabled:
+        # Self-heal a transient boot-time discovery outage: the LOGIN path is a
+        # rediscovery trigger too, not just the obo mint path. Without this, a
+        # single-node install (or one where every node booted during the outage)
+        # would keep login dark until an operator restart — the exact symptom
+        # maybe_rediscover_oidc exists to fix. No-op unless discovery_retryable.
+        await maybe_rediscover_oidc(request.app.state)
+        oidc_config = getattr(request.app.state, "oidc_config", None)
     if not oidc_config or not oidc_config.enabled:
         return JSONResponse({"error": "OIDC not configured"}, status_code=404)
 
@@ -1988,6 +1998,12 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
     from starlette.responses import JSONResponse, RedirectResponse
 
     oidc_config = getattr(request.app.state, "oidc_config", None)
+    if oidc_config is not None and not oidc_config.enabled:
+        # Self-heal a transient boot-time discovery outage on the login path too
+        # (see handle_oidc_authorize). A user mid-flow whose authorize landed on
+        # a recovered node can still complete the callback here.
+        await maybe_rediscover_oidc(request.app.state)
+        oidc_config = getattr(request.app.state, "oidc_config", None)
     if not oidc_config or not oidc_config.enabled:
         return JSONResponse({"error": "OIDC not configured"}, status_code=404)
 
@@ -2108,6 +2124,52 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
         log.exception("OIDC callback error")
         _record_oidc_failure()
         return RedirectResponse("/?oidc_error=Authentication+failed", status_code=302)
+
+    # Capture the IdP refresh token as the user's single OBO credential
+    # (issue #551).  Best-effort: capture failure must not block login —
+    # the mint path surfaces a missing credential on the reconnect rail.
+    if oidc_config.capture_user_credential:
+        idp_refresh_token = tokens.get("refresh_token")
+        token_store = getattr(request.app.state, "mcp_token_store", None)
+        if not isinstance(idp_refresh_token, str) or not idp_refresh_token:
+            log.info(
+                "oidc.capture: no refresh_token in token response (user=%s) — "
+                "check the IdP allows offline_access for this client",
+                user["user_id"],
+            )
+        elif token_store is None:
+            log.warning(
+                "oidc.capture: enabled but no token encryption key configured — "
+                "credential NOT captured (user=%s)",
+                user["user_id"],
+            )
+        else:
+            try:
+                await asyncio.to_thread(
+                    token_store.upsert_oidc_credential,
+                    user["user_id"],
+                    oidc_config.issuer,
+                    refresh_token=idp_refresh_token,
+                )
+            except Exception:
+                log.exception("oidc.capture: failed to persist credential")
+            else:
+                # Re-login is the OBO restore moment (#836): a dropped
+                # obo catalog (credential unlinked / mint rejected) has
+                # no consent flow to heal through, so warm this user's
+                # pools now — live sessions pick the tools back up via
+                # their listeners. Gated on a LIVE session: routine SSO
+                # re-logins by users with nothing open must not fan out
+                # mints and transport connects at deployment scale.
+                # Fire-and-forget; a failure changes nothing about login
+                # (the credential is already persisted; the JWT is not
+                # yet issued) — the helper owns the swallow.
+                try_prime_user_pools(
+                    getattr(request.app.state, "mcp_client", None),
+                    user["user_id"],
+                    require_live_listener=True,
+                    context="oidc-capture",
+                )
 
     # Load permissions and issue Turnstone JWT
     perms = await asyncio.to_thread(_load_user_permissions, storage, user["user_id"])

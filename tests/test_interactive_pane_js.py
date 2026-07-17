@@ -13,6 +13,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parent.parent
 _INTERACTIVE = _ROOT / "turnstone/shared_static/interactive.js"
 _COMPOSER = _ROOT / "turnstone/shared_static/composer.js"
@@ -398,17 +400,21 @@ def test_pane_gates_send_on_cross_user_busy() -> None:
     # ...and drives the composer's hard block, re-run on every busy edge.
     assert "this.composer.setSendBlocked(" in body
     stripped = _strip_comments(body)
-    setbusy = stripped.index("setBusy(b) {")
-    assert "this._reconcileSendBlock();" in stripped[setbusy : setbusy + 600]
+    setbusy = stripped.index("setBusy(b, source) {")
+    assert "this._reconcileSendBlock();" in stripped[setbusy : setbusy + 800]
 
 
 def test_pane_handles_cross_user_409() -> None:
     """The reactive fallback: a 409 (button not yet disabled) surfaces a clean
-    message, not the generic 'Connection error' catch."""
+    message, not the generic 'Connection error' catch.  The pane converts
+    the 409 body at the fetch stage; the status ARM itself lives in the
+    shared settle helper (composer_queue.settleSendResponse) with the rest
+    of the response matrix."""
     body = _INTERACTIVE.read_text(encoding="utf-8")
     assert "r.status === 409" in body
     assert 'status: "cross_user_interjection"' in body
-    assert 'data.status === "cross_user_interjection"' in body
+    helper = (_ROOT / "turnstone/shared_static/composer_queue.js").read_text(encoding="utf-8")
+    assert 'status === "cross_user_interjection"' in helper
 
 
 def test_sync_approval_state_prunes_orphan_cycles() -> None:
@@ -636,3 +642,212 @@ def test_connectsse_defers_open_when_tab_hidden() -> None:
     )
     assert head.index("this.wsId = wsId;") < head.index("if (document.hidden) {")
     assert head.index('addEventListener("visibilitychange"') < head.index("if (document.hidden) {")
+
+
+def test_send_post_abort_machinery_is_gone() -> None:
+    """The parked-POST era's client abort machinery must stay deleted in
+    BOTH panes: sends during a command window are answered "queued"
+    immediately (server-side defer-and-drain), so there is no long-lived
+    POST for a compaction-aware bound (``sendAbortMs``) to protect, and
+    dismissal is bind() → server-confirmed DELETE — never a POST abort
+    (``_sendAbort``), which fired on the interjection path too and
+    dispatched "dismissed" messages anyway.  Reintroducing either hook
+    means re-parking the POST; that design deterministically dropped
+    messages from every timeout-bounded caller (coordinator client and
+    console proxy at 30s, SDKs, stock proxies)."""
+    interactive = _INTERACTIVE.read_text(encoding="utf-8")
+    coordinator = (_ROOT / "turnstone/console/static/coordinator/coordinator.js").read_text(
+        encoding="utf-8"
+    )
+    conversation = (_ROOT / "turnstone/shared_static/conversation.js").read_text(encoding="utf-8")
+    composer_queue = (_ROOT / "turnstone/shared_static/composer_queue.js").read_text(
+        encoding="utf-8"
+    )
+    for name, src in (
+        ("interactive.js", interactive),
+        ("coordinator.js", coordinator),
+        ("conversation.js", conversation),
+        ("composer_queue.js", composer_queue),
+    ):
+        assert "sendAbortMs" not in src, f"{name}: the compaction-aware abort bound is dead"
+        assert "_sendAbort" not in src, f"{name}: dismiss must be bind() → DELETE, not a POST abort"
+    # The flat wedged-node bound stands in both panes: every /send answers
+    # within RTT now (dispatched / queued / deferred-with-msg_id).
+    assert "sendCtrl.abort(), 15000" in interactive
+    assert "sendCtrl.abort(), 15000" in coordinator
+    # The deferred-attachment count rides bind()'s documented options seam
+    # (controller dataset) — the per-pane element expando is dead.
+    for name, src in (
+        ("interactive.js", interactive),
+        ("coordinator.js", coordinator),
+        ("composer_queue.js", composer_queue),
+    ):
+        assert "_deferredAttachments" not in src, (
+            f"{name}: deferred state must ride bind(el, msgId, opts), not an expando"
+        )
+
+
+def test_deferred_send_settle_protocol_pins() -> None:
+    """The deferred-chip settle protocol (round 7, C4): a deferred send's
+    queued chip keeps its retraction affordance exactly until the message
+    truly leaves the parked list.  Pins the controller's contract and both
+    panes' wiring — losing any of these silently re-promotes parked
+    messages to "sent" while the server still honors DELETE (loss
+    disguised as delivery on a node restart)."""
+    interactive = _INTERACTIVE.read_text(encoding="utf-8")
+    coordinator = (_ROOT / "turnstone/console/static/coordinator/coordinator.js").read_text(
+        encoding="utf-8"
+    )
+    composer_queue = (_ROOT / "turnstone/shared_static/composer_queue.js").read_text(
+        encoding="utf-8"
+    )
+    # Controller: bind() stores the options on its own dataset state...
+    assert "function bind(el, msgId, opts)" in composer_queue
+    assert 'el.dataset.deferred = "1"' in composer_queue
+    assert "el.dataset.attachedCount = String(opts.attachedCount)" in composer_queue
+    # ...the idle sweep skips deferred AND unbound chips (the "idle ⇒
+    # drained" invariant is untrue for both)...
+    assert "if (el.dataset.deferred) return;" in composer_queue
+    assert "if (!el.dataset.msgId) return;" in composer_queue
+    # ...and settleDeferred branches on the fold-in arm: clear the flag
+    # only (DELETE still genuinely removes a folded message until the seam
+    # drains), promote only on the fresh-spawn arm.
+    assert "function settleDeferred(msgId, folded)" in composer_queue
+    assert "delete target.dataset.deferred;" in composer_queue
+    assert "settleDeferred: settleDeferred" in composer_queue
+    # A barrier-deferred entry can dispatch within milliseconds of its ack,
+    # so the SSE settle can beat the POST response's bind(): the controller
+    # parks chip-absent settles and bind() reconciles them — without this a
+    # raced chip stays flagged deferred and the idle sweep skips it forever.
+    # Expiry is TTL-based: a size cap evicted exactly this tab's raced
+    # settle when a window closed with a burst of deferred sends (ours
+    # parks FIRST, the foreign settles behind it overflow the cap).
+    assert "_preBindSettles" in composer_queue
+    assert "_preBindSettles.has(msgId)" in composer_queue
+    assert "PRE_BIND_SETTLE_TTL_MS" in composer_queue
+    assert "_preBindSettles.size" not in composer_queue, "size-cap eviction must stay dead"
+    # The full send-response settle matrix lives ONCE, in the shared
+    # helper — retro-convert (a parked, still-retractable message must not
+    # render as a sent bubble), the deferred busy-undo, and the queue_full
+    # idle-pane cleanup (bubble removed + busy restored: the refusal can
+    # now fire with no worker and no drain alive, so no state event would
+    # ever unstick the composer).
+    assert "export function settleSendResponse(queue, data, ctx)" in composer_queue
+    assert "!queuedEl && data.deferred" in composer_queue
+    assert "deferred: !!data.deferred" in composer_queue
+    assert "attachedCount: (data.attached_ids || []).length" in composer_queue
+    assert "ctx.busyIsOptimistic()" in composer_queue
+    assert composer_queue.count("ctx.optimisticEl.remove()") >= 2, (
+        "both the retro-convert and queue_full arms must clear the optimistic bubble"
+    )
+    # The missed-edge settle: a non-deferred chip binding onto an
+    # already-idle pane missed its only sweep — the post-bind promote
+    # (keyed on POST-bind chip state, honoring the aria-busy
+    # dismiss-in-flight discipline) is what settles it.
+    assert "!ctx.paneIsBusy()" in composer_queue
+    assert 'queuedEl.hasAttribute("aria-busy")' in composer_queue
+    # Both panes route their parsed /send response through the helper and
+    # consume the pane-tier settle event; the busy stamp is centralized in
+    # each pane's setBusy (source defaults to "server" — only the send
+    # flow's optimistic flip may ever be undone).
+    for name, src in (("interactive.js", interactive), ("coordinator.js", coordinator)):
+        assert "settleSendResponse(" in src, f"{name}: settle matrix must be the shared helper"
+        assert "busyIsOptimistic" in src, name
+        assert "paneIsBusy" in src, f"{name}: the missed-edge settle needs the live flag"
+        assert 'setBusy(true, "optimistic")' in src, f"{name}: optimistic flip must stamp"
+        assert "parsePriority(" in src, f"{name}: shared !!! parse"
+        assert 'case "message_dispatched"' in src, f"{name}: settle event not consumed"
+        assert "settleDeferred(" in src, name
+    # /command's degraded outcomes are ALL surfaced: busy, running (the
+    # backstop answer), error (503 — the worker never spawned), the
+    # status-less non-2xx arm (404 / proxy 502), and the transport catch —
+    # silence at any of them reads as success.
+    assert 'body.status === "running"' in interactive
+    assert 'body.status === "error"' in interactive
+    assert "Command failed (HTTP " in interactive
+    assert '"Command failed: " + err.message' in interactive
+
+
+def test_settle_send_response_missed_edge_behavior(tmp_path) -> None:
+    """Execute the shared settle helper under node and pin the
+    missed-edge matrix behaviorally (not just textually): a non-deferred
+    chip binding onto an idle pane promotes; a busy pane, a deferred
+    chip, and a dismiss-in-flight chip do not."""
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node binary not available on PATH")
+    helper = _ROOT / "turnstone/shared_static/composer_queue.js"
+    script = tmp_path / "settle_harness.mjs"
+    script.write_text(
+        f'const {{ settleSendResponse }} = await import("file://{helper}");\n'
+        + """
+function makeEl(over) {
+  const el = {
+    isConnected: true,
+    classList: { contains: (c) => c === "msg-queued" },
+    dataset: {},
+    hasAttribute: () => false,
+  };
+  return Object.assign(el, over || {});
+}
+function run(queuedEl, paneBusy, data) {
+  const calls = [];
+  const queue = {
+    bind: (el, id, opts) => {
+      calls.push("bind");
+      // Mirror the real bind: stamp the deferred flag from opts.
+      if (opts && opts.deferred) el.dataset.deferred = "1";
+    },
+    promote: () => calls.push("promote"),
+    remove: () => calls.push("remove"),
+    addQueuedMessage: () => makeEl(),
+  };
+  settleSendResponse(queue, data, {
+    queuedEl,
+    optimisticEl: null,
+    isBusy: true,
+    displayText: "t",
+    priority: "notice",
+    setBusy: () => {},
+    busyIsOptimistic: () => false,
+    paneIsBusy: () => paneBusy,
+    renderError: () => {},
+    consumeAttachments: () => {},
+  });
+  return calls;
+}
+const queued = { status: "queued", msg_id: "m1" };
+let c = run(makeEl(), false, queued);
+if (!(c.includes("bind") && c.includes("promote")))
+  throw new Error("missed-edge chip must promote: " + c);
+c = run(makeEl(), true, queued);
+if (c.includes("promote")) throw new Error("busy pane must not promote: " + c);
+c = run(makeEl(), false, { status: "queued", msg_id: "m1", deferred: true });
+if (c.includes("promote"))
+  throw new Error("deferred chip is message_dispatched's: " + c);
+c = run(makeEl({ hasAttribute: (a) => a === "aria-busy" }), false, queued);
+if (c.includes("promote"))
+  throw new Error("dismiss-in-flight chip must be left to its DELETE verdict: " + c);
+// Null / non-object 2xx body (a misbehaving proxy answering `200 null`): the
+// helper normalizes it to {} so neither call site guards — it must fall through
+// to the unknown/"ok" arm and SETTLE the optimistic chip (promote), never throw
+// and strand a delivered message as a connection error.  (The no-op
+// consumeAttachments stub cannot prevent this: data.attached_ids is evaluated to
+// build the :639 call args, so against unfixed code this line throws and crashes
+// the harness.)
+c = run(makeEl(), false, null);
+if (!c.includes("promote"))
+  throw new Error("null body must settle via unknown-ok, not throw: " + c);
+console.log("settle matrix OK");
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        ["node", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0, f"settle harness failed:\n{proc.stderr}\n{proc.stdout}"

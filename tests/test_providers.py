@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
+from tests._session_helpers import fake_anthropic_stream, fake_chat_stream
 from turnstone.core.lowering import repair_wire_messages
 from turnstone.core.providers._openai import OpenAIProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
@@ -16,6 +18,7 @@ from turnstone.core.providers._openai_common import (
     apply_cache_retention,
     apply_temperature_and_effort,
     apply_tool_search,
+    extract_usage,
     format_citations,
     lookup_openai_capabilities,
     sanitize_messages,
@@ -27,6 +30,7 @@ from turnstone.core.providers._protocol import (
     StreamChunk,
     ToolCallDelta,
     UsageInfo,
+    drain_stream,
 )
 
 # ---------------------------------------------------------------------------
@@ -44,7 +48,12 @@ def _openai_stream_chunk(
     usage: MagicMock | None = None,
     empty_choices: bool = False,
 ) -> MagicMock:
-    """Build a mock OpenAI streaming chunk."""
+    """Build a mock OpenAI streaming chunk.
+
+    Shape twin of ``tests/_session_helpers.fake_chat_stream`` (which
+    builds whole scripted streams on SimpleNamespace); consolidate onto
+    one fake when either next changes shape.
+    """
     chunk = MagicMock()
     if empty_choices:
         chunk.choices = []
@@ -565,6 +574,9 @@ class TestOpenAIProvider:
                 messages=[{"role": "user", "content": "hi"}],
             )
         )
+        # No synthesized finish chunk: the lax-server shim is disarmed by
+        # default (``finish_reason_optional=False``), so a clean finish-less
+        # end stays visibly finish-less for the drain gate to catch.
         assert len(results) == 2
         assert results[0].content_delta == "Hello"
         assert results[1].content_delta == " world"
@@ -608,6 +620,8 @@ class TestOpenAIProvider:
                 messages=[{"role": "user", "content": "read a file"}],
             )
         )
+        # No synthesized finish chunk: the lax-server shim is disarmed by
+        # default (``finish_reason_optional=False``).
         assert len(results) == 3
         assert results[0].tool_call_deltas[0].id == "call_1"
         assert results[0].tool_call_deltas[0].name == "read_file"
@@ -700,51 +714,35 @@ class TestOpenAIProvider:
         assert results[1].is_first is False
         assert results[2].is_first is False
 
-    def test_completion_basic(self) -> None:
-        response = MagicMock()
-        response.choices = [MagicMock()]
-        response.choices[0].message.content = "Hello world"
-        response.choices[0].message.tool_calls = None
-        response.choices[0].finish_reason = "stop"
-        response.usage.prompt_tokens = 10
-        response.usage.completion_tokens = 5
-        response.usage.total_tokens = 15
-
+    def test_drained_stream_basic(self) -> None:
         client = MagicMock()
-        client.chat.completions.create.return_value = response
+        client.chat.completions.create.return_value = fake_chat_stream(content="Hello world")
 
-        result = self.provider.create_completion(
-            client=client,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": "hi"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+            )
         )
         assert isinstance(result, CompletionResult)
         assert result.content == "Hello world"
         assert result.tool_calls is None
         assert result.finish_reason == "stop"
 
-    def test_completion_with_tools(self) -> None:
-        tc = MagicMock()
-        tc.id = "call_abc"
-        tc.function.name = "read_file"
-        tc.function.arguments = '{"path": "foo.py"}'
-
-        response = MagicMock()
-        response.choices = [MagicMock()]
-        response.choices[0].message.content = None
-        response.choices[0].message.tool_calls = [tc]
-        response.choices[0].finish_reason = "tool_calls"
-        response.usage.prompt_tokens = 8
-        response.usage.completion_tokens = 12
-        response.usage.total_tokens = 20
-
+    def test_drained_stream_with_tools(self) -> None:
         client = MagicMock()
-        client.chat.completions.create.return_value = response
+        client.chat.completions.create.return_value = fake_chat_stream(
+            tool_calls=[{"id": "call_abc", "name": "read_file", "arguments": '{"path": "foo.py"}'}],
+            finish_reason="tool_calls",
+        )
 
-        result = self.provider.create_completion(
-            client=client,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": "read"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "read"}],
+            )
         )
         assert result.content == ""
         assert result.tool_calls is not None
@@ -755,23 +753,293 @@ class TestOpenAIProvider:
         assert result.tool_calls[0]["function"]["arguments"] == '{"path": "foo.py"}'
         assert result.finish_reason == "tool_calls"
 
-    def test_completion_usage(self) -> None:
-        response = MagicMock()
-        response.choices = [MagicMock()]
-        response.choices[0].message.content = "ok"
-        response.choices[0].message.tool_calls = None
-        response.choices[0].finish_reason = "stop"
-        response.usage.prompt_tokens = 100
-        response.usage.completion_tokens = 50
-        response.usage.total_tokens = 150
-
+    def _drain_chunks(self, chunks: list[Any], capabilities: ModelCapabilities | None = None):
         client = MagicMock()
-        client.chat.completions.create.return_value = response
+        client.chat.completions.create.return_value = chunks
+        return drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="m",
+                messages=[{"role": "user", "content": "x"}],
+                capabilities=capabilities,
+            )
+        )
 
-        result = self.provider.create_completion(
-            client=client,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": "hi"}],
+    def test_streaming_remaps_index_degenerate_parallel_calls(self) -> None:
+        # Historical compat servers (older vLLM, some llama.cpp builds)
+        # stream every parallel call at index 0 as whole deltas.  The
+        # iterator opens a new slot when a delta's id contradicts its
+        # index's current call, so BOTH consumers (drain_stream and the
+        # chat loop's accumulator) see distinct calls; id-less argument
+        # fragments keep following their index's current slot.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(
+                            index=0, tc_id="a", name="read", arguments='{"p": 1}'
+                        )
+                    ]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(
+                            index=0, tc_id="b", name="write", arguments='{"p": 2}'
+                        )
+                    ]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert [tc["id"] for tc in result.tool_calls] == ["a", "b"]
+        assert result.tool_calls[0]["function"]["arguments"] == '{"p": 1}'
+        assert result.tool_calls[1]["function"]["arguments"] == '{"p": 2}'
+
+    def test_streaming_splits_idless_degenerate_parallel_calls(self) -> None:
+        # The same degenerate servers may omit ids entirely: a delta that
+        # ANNOUNCES a name for a slot that already accumulated arguments is
+        # a second whole call, not a fragment — without the split, two
+        # id-less calls fuse into one with concatenated garbage arguments.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="read", arguments='{"a": 1}')]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(index=0, name="write", arguments='{"b": 2}')
+                    ]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert [tc["function"]["name"] for tc in result.tool_calls] == ["read", "write"]
+        assert result.tool_calls[0]["function"]["arguments"] == '{"a": 1}'
+        assert result.tool_calls[1]["function"]["arguments"] == '{"b": 2}'
+
+    def test_repeated_id_and_name_header_fragments_stay_one_call(self) -> None:
+        # Some compat servers repeat the full id+name header on EVERY
+        # argument fragment.  Id equality proves same call — the
+        # reannounce split applies only to ID-LESS deltas, so this shape
+        # merges into one call with valid arguments (round-5 regression:
+        # the ungated heuristic split it into duplicate half-JSON calls).
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(
+                            index=0, tc_id="call_A", name="read_file", arguments='{"path": '
+                        )
+                    ]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(
+                            index=0, tc_id="call_A", name="read_file", arguments='"/tmp/x"}'
+                        )
+                    ]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"path": "/tmp/x"}'
+
+    def test_finishless_stream_raises_by_default(self) -> None:
+        # On a default lane a clean finish-less end is indistinguishable
+        # from a generation that died behind a clean-closing proxy/ASGI
+        # layer — the drain refuses to bless possibly-truncated text and
+        # raises (retryable) instead of storing half an answer.
+        from turnstone.core.providers import IncompleteStreamError
+
+        with pytest.raises(IncompleteStreamError):
+            self._drain_chunks([_openai_stream_chunk(content="half an ans")])
+
+    def test_finishless_stream_completes_with_declared_tolerance(self) -> None:
+        # ``finish_reason_optional`` (operator-declared: this server never
+        # sends finish reasons) re-arms the deleted non-streaming
+        # `or "stop"` default for clean ends that delivered output.
+        result = self._drain_chunks(
+            [_openai_stream_chunk(content="complete answer")],
+            capabilities=ModelCapabilities(finish_reason_optional=True),
+        )
+        assert result.content == "complete answer"
+        assert result.finish_reason == "stop"
+
+    def test_finishless_reasoning_only_stream_completes_with_tolerance(self) -> None:
+        # Reasoning counts as delivered output: a thinking model that spent
+        # its budget before emitting content is a completed generation on a
+        # lax server (the retired non-streaming path returned it with empty
+        # content and the reasoning captured), not a doomed retry loop.
+        result = self._drain_chunks(
+            [_openai_stream_chunk(reasoning_content="thought hard")],
+            capabilities=ModelCapabilities(finish_reason_optional=True),
+        )
+        assert result.content == ""
+        assert result.reasoning == "thought hard"
+        assert result.finish_reason == "stop"
+
+    def test_finishless_stream_with_no_output_still_raises(self) -> None:
+        # The shim is output-gated even when ARMED: an empty clean-close
+        # stream (dead generation, zero-chunk fakes) still hits the
+        # drain's complete-or-error gate.
+        from turnstone.core.providers import IncompleteStreamError
+
+        with pytest.raises(IncompleteStreamError):
+            self._drain_chunks([], capabilities=ModelCapabilities(finish_reason_optional=True))
+
+    def test_fragmented_single_call_does_not_split(self) -> None:
+        # The normal well-behaved shape — name announced once, arguments
+        # streamed in fragments — must stay ONE call.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, tc_id="a", name="read")]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, arguments='{"p": ')]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, arguments='"x"}')]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"p": "x"}'
+
+    def test_idless_zero_arg_parallel_calls_split(self) -> None:
+        # Two id-less whole-delta announcements with NO arguments are two
+        # zero-argument parallel calls (the empty-args twin of the
+        # whole-delta shape) — fusing them would silently drop an action.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="refresh_state")]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="refresh_state")]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert [tc["function"]["name"] for tc in result.tool_calls] == [
+            "refresh_state",
+            "refresh_state",
+        ]
+
+    def test_idless_redundant_name_fragments_merge(self) -> None:
+        # An id-less server that repeats the name header on every argument
+        # fragment: mid-JSON the re-announce is a header, not a new call —
+        # the slotter consults argument completeness, so the fragments
+        # reassemble instead of splitting into malformed half-JSON calls.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="read", arguments='{"p": ')]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="read", arguments='"x"}')]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"p": "x"}'
+
+    def test_idless_name_mismatch_always_splits(self) -> None:
+        # A different name can never be the same call, whatever the
+        # argument state — catches a zero-arg call followed by an arg-ful
+        # sibling at the same wire index.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="refresh_state")]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(index=0, name="read", arguments='{"p": "x"}')
+                    ]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert [tc["function"]["name"] for tc in result.tool_calls] == ["refresh_state", "read"]
+        assert result.tool_calls[1]["function"]["arguments"] == '{"p": "x"}'
+
+    def test_id_first_fragmented_call_stays_one_call(self) -> None:
+        # id → name → args across three fragments (the later two id-less):
+        # a slot with a KNOWN id never splits on id-less continuations —
+        # the call's first name fragment is not a re-announcement (round-7
+        # regression: it split into an unnamed id-bearing call plus a
+        # nameless-id twin).
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(tool_calls=[_openai_tool_call_delta(index=0, tc_id="call_1")]),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="get_weather")]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, arguments='{"city": "x"}')]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["id"] == "call_1"
+        assert result.tool_calls[0]["function"]["name"] == "get_weather"
+        assert result.tool_calls[0]["function"]["arguments"] == '{"city": "x"}'
+
+    def test_idless_bare_name_footer_after_complete_args_merges(self) -> None:
+        # A bare same-name delta after the argument JSON closed is a
+        # redundant footer, not a second zero-argument call — splitting
+        # would run the side-effecting tool twice.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(index=0, name="write_file", arguments='{"x": 1}')
+                    ]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="write_file")]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"x": 1}'
+
+    def test_idless_name_first_then_args_with_repeated_name_merges(self) -> None:
+        # Name announced first (no arguments), then arguments arrive
+        # carrying the SAME name again: one call whose arguments are
+        # starting, not a zero-arg call plus an arg-ful twin.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(tool_calls=[_openai_tool_call_delta(index=0, name="read")]),
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(index=0, name="read", arguments='{"p": "x"}')
+                    ]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"p": "x"}'
+
+    def test_drained_stream_usage(self) -> None:
+        client = MagicMock()
+        client.chat.completions.create.return_value = fake_chat_stream(
+            content="ok", prompt_tokens=100, completion_tokens=50
+        )
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+            )
         )
         assert result.usage is not None
         assert result.usage.prompt_tokens == 100
@@ -1086,31 +1354,18 @@ class TestAnthropicProvider:
         assert _normalize_finish_reason("other_reason") == "other_reason"
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
-    def test_completion_basic(self, mock_ensure: MagicMock) -> None:
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "Hello world"
-
-        response = MagicMock()
-        response.content = [text_block]
-        response.stop_reason = "end_turn"
-        response.usage = MagicMock()
-        response.usage.input_tokens = 10
-        response.usage.output_tokens = 5
-        response.usage.cache_creation_input_tokens = 0
-        response.usage.cache_read_input_tokens = 0
-
+    def test_drained_stream_basic(self, mock_ensure: MagicMock) -> None:
         client = MagicMock()
-        stream_ctx = MagicMock()
-        stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
-        stream_ctx.__exit__ = MagicMock(return_value=False)
-        stream_ctx.get_final_message.return_value = response
-        client.messages.stream.return_value = stream_ctx
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [SimpleNamespace(type="text", text="Hello world")]
+        )
 
-        result = self.provider.create_completion(
-            client=client,
-            model="claude-sonnet-4-20250514",
-            messages=[{"role": "user", "content": "hi"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
         )
         assert isinstance(result, CompletionResult)
         assert result.content == "Hello world"
@@ -1118,37 +1373,145 @@ class TestAnthropicProvider:
         assert result.finish_reason == "stop"
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
-    def test_completion_with_tool_use(self, mock_ensure: MagicMock) -> None:
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "Let me read that."
-
-        tool_block = MagicMock()
-        tool_block.type = "tool_use"
-        tool_block.id = "toolu_abc"
-        tool_block.name = "read_file"
-        tool_block.input = {"path": "foo.py"}
-
-        response = MagicMock()
-        response.content = [text_block, tool_block]
-        response.stop_reason = "tool_use"
-        response.usage = MagicMock()
-        response.usage.input_tokens = 15
-        response.usage.output_tokens = 20
-        response.usage.cache_creation_input_tokens = 0
-        response.usage.cache_read_input_tokens = 0
+    def test_terminal_signal_less_stream_raises_by_default(self, mock_ensure: MagicMock) -> None:
+        # No message_delta stop_reason and no message_stop: on a
+        # signal-disciplined server (the real API always sends both) this
+        # is a generation that died mid-response — the drain refuses to
+        # bless possibly-truncated content.
+        from turnstone.core.providers import IncompleteStreamError
 
         client = MagicMock()
-        stream_ctx = MagicMock()
-        stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
-        stream_ctx.__exit__ = MagicMock(return_value=False)
-        stream_ctx.get_final_message.return_value = response
-        client.messages.stream.return_value = stream_ctx
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [SimpleNamespace(type="text", text="full answer")], stop_reason=None
+        )
+        with pytest.raises(IncompleteStreamError):
+            drain_stream(
+                self.provider.create_streaming(
+                    client=client,
+                    model="claude-sonnet-4-20250514",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+            )
 
-        result = self.provider.create_completion(
-            client=client,
-            model="claude-sonnet-4-20250514",
-            messages=[{"role": "user", "content": "read foo.py"}],
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_terminal_signal_less_stream_completes_with_declared_tolerance(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        # ``finish_reason_optional`` (operator-declared: this gateway never
+        # sends terminal signals) restores the retired non-streaming
+        # path's absent-stop_reason tolerance — the raw blocks ride the
+        # shimmed finish chunk.
+        client = MagicMock()
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [SimpleNamespace(type="text", text="full answer")], stop_reason=None
+        )
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+                capabilities=ModelCapabilities(finish_reason_optional=True),
+            )
+        )
+        assert result.content == "full answer"
+        assert result.finish_reason == "stop"
+        assert result.provider_blocks
+
+    @staticmethod
+    def _whole_block_stream(events: list[Any]) -> MagicMock:
+        # A lax gateway emitting pre-populated content_block_start events
+        # (whole-block emission, no deltas) — fake_anthropic_stream
+        # deliberately strips start blocks to the real API's empty shape,
+        # so these are built raw.
+        mgr = MagicMock()
+        mgr.__enter__ = MagicMock(return_value=events)
+        mgr.__exit__ = MagicMock(return_value=False)
+        return mgr
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_whole_block_start_text_reaches_content(self, mock_ensure: MagicMock) -> None:
+        # Text delivered inside content_block_start with no text_delta
+        # events: the retired non-streaming path (SDK get_final_message)
+        # returned it, so the drained lane must too — not a clean-looking
+        # empty result.
+        client = MagicMock()
+        client.messages.stream.return_value = self._whole_block_stream(
+            [
+                SimpleNamespace(
+                    type="content_block_start",
+                    index=0,
+                    content_block=SimpleNamespace(type="text", text="whole answer"),
+                ),
+                SimpleNamespace(type="content_block_stop", index=0),
+                SimpleNamespace(type="message_stop"),
+            ]
+        )
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.content == "whole answer"
+        assert result.finish_reason == "stop"
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_whole_block_start_tool_use_reaches_arguments(self, mock_ensure: MagicMock) -> None:
+        # A tool_use block whose input arrives pre-populated in the start
+        # event (no input_json_delta events) must still produce a call
+        # with arguments — a fused-empty call is an action that silently
+        # never executes.
+        client = MagicMock()
+        client.messages.stream.return_value = self._whole_block_stream(
+            [
+                SimpleNamespace(
+                    type="content_block_start",
+                    index=0,
+                    content_block=SimpleNamespace(
+                        type="tool_use", id="toolu_1", name="read_file", input={"path": "x"}
+                    ),
+                ),
+                SimpleNamespace(type="content_block_stop", index=0),
+                SimpleNamespace(
+                    type="message_delta",
+                    usage=None,
+                    delta=SimpleNamespace(stop_reason="tool_use"),
+                ),
+            ]
+        )
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["id"] == "toolu_1"
+        assert result.tool_calls[0]["function"]["name"] == "read_file"
+        assert json.loads(result.tool_calls[0]["function"]["arguments"]) == {"path": "x"}
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_drained_stream_with_tool_use(self, mock_ensure: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [
+                SimpleNamespace(type="text", text="Let me read that."),
+                SimpleNamespace(
+                    type="tool_use", id="toolu_abc", name="read_file", input={"path": "foo.py"}
+                ),
+            ],
+            stop_reason="tool_use",
+        )
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "read foo.py"}],
+            )
         )
         assert result.content == "Let me read that."
         assert result.finish_reason == "tool_calls"
@@ -1161,31 +1524,111 @@ class TestAnthropicProvider:
         assert json.loads(tc["function"]["arguments"]) == {"path": "foo.py"}
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
-    def test_completion_usage(self, mock_ensure: MagicMock) -> None:
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "ok"
-
-        response = MagicMock()
-        response.content = [text_block]
-        response.stop_reason = "end_turn"
-        response.usage = MagicMock()
-        response.usage.input_tokens = 100
-        response.usage.output_tokens = 50
-        response.usage.cache_creation_input_tokens = 0
-        response.usage.cache_read_input_tokens = 0
-
+    def test_drained_stream_separates_text_blocks(self, mock_ensure: MagicMock) -> None:
+        # The retired non-streaming lane joined text blocks with "\n"; the
+        # iterator now emits the separator at each subsequent text block
+        # start, so drained content keeps the block boundary (web-search
+        # responses interleave text / server-tool / text).
         client = MagicMock()
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [
+                SimpleNamespace(type="text", text="Before the search."),
+                SimpleNamespace(type="text", text="After the results."),
+            ]
+        )
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.content == "Before the search.\nAfter the results."
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_streaming_captures_text_block_citations(self, mock_ensure: MagicMock) -> None:
+        # citations_delta events must land on the raw block: Anthropic
+        # requires citations to replay unmodified alongside their
+        # web_search_tool_result blocks on later turns, and the retired
+        # non-streaming lane preserved them via model_dump.
+        start = _anthropic_event("content_block_start", block_type="text", index=0)
+        # A real dict from model_dump so the raw block accepts the
+        # citations append (a MagicMock auto-dict would swallow it).
+        start.content_block.model_dump.return_value = {"type": "text", "text": ""}
+        cite = _anthropic_event("content_block_delta", delta_type="citations_delta", index=0)
+        cite.delta.citation = {"type": "web_search_result_location", "url": "https://x.test"}
+        text = _anthropic_event(
+            "content_block_delta", delta_type="text_delta", text="cited claim", index=0
+        )
+        finish = _anthropic_event("message_delta", stop_reason="end_turn", usage_output_tokens=1)
+
         stream_ctx = MagicMock()
-        stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
+        stream_ctx.__enter__ = MagicMock(return_value=iter([start, cite, text, finish]))
         stream_ctx.__exit__ = MagicMock(return_value=False)
-        stream_ctx.get_final_message.return_value = response
+        client = MagicMock()
         client.messages.stream.return_value = stream_ctx
 
-        result = self.provider.create_completion(
-            client=client,
-            model="claude-sonnet-4-20250514",
-            messages=[{"role": "user", "content": "hi"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.provider_blocks, "expected the text block in provider_blocks"
+        citations = result.provider_blocks[0].get("citations")
+        assert citations == [{"type": "web_search_result_location", "url": "https://x.test"}]
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_message_stop_supplies_missing_stop_reason(self, mock_ensure: MagicMock) -> None:
+        # Compat tolerance: a /v1/messages shim that streams content and
+        # message_stop but never a message_delta stop_reason.  message_stop
+        # is a genuine terminal marker, so the drained stream completes
+        # (blocks intact) instead of failing a generation that arrived.
+        events = [
+            _anthropic_event("content_block_start", block_type="text", index=0),
+            _anthropic_event(
+                "content_block_delta", delta_type="text_delta", text="intact", index=0
+            ),
+            _anthropic_event("content_block_stop", index=0),
+            _anthropic_event("message_stop"),
+        ]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.content == "intact"
+        assert result.finish_reason == "stop"
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_drained_stream_usage(self, mock_ensure: MagicMock) -> None:
+        client = MagicMock()
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [SimpleNamespace(type="text", text="ok")],
+            usage=SimpleNamespace(
+                input_tokens=100,
+                output_tokens=50,
+                cache_creation_input_tokens=0,
+                cache_read_input_tokens=0,
+            ),
+        )
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
         )
         assert result.usage is not None
         assert result.usage.prompt_tokens == 100
@@ -1902,51 +2345,200 @@ class TestGoogleProviderFidelity:
         assert len(cleaned) == 2
         assert cleaned[0]["content"] == "hello"
 
-    def test_non_streaming_captures_provider_blocks(self) -> None:
+    def test_prepare_messages_swap_cannot_resurrect_malformed_arguments(self) -> None:
+        # The raw fidelity dicts carry the model's ORIGINAL arguments string;
+        # the sanitized top-level mirror is what the swap replaces.  A raw
+        # dict whose arguments are malformed must be legalized during the
+        # swap (thought_signature and id untouched) — otherwise every replay
+        # resurrects the malformed string the upstream sanitize pass fixed.
         from turnstone.core.providers._google import GoogleProvider
 
         prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    # Mirror already legalized upstream.
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                    {
+                        "id": "c2",
+                        "type": "function",
+                        "function": {"name": "g", "arguments": '{"ok": 1}'},
+                    },
+                ],
+                "_provider_content": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        # Raw, unterminated — the model's original output.
+                        "function": {"name": "f", "arguments": '{"path": "/tmp'},
+                        "thought_signature": "sig123",
+                    },
+                    {
+                        "id": "c2",
+                        "type": "function",
+                        "function": {"name": "g", "arguments": '{"ok": 1}'},
+                        "thought_signature": "sig456",
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "tool", "tool_call_id": "c2", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        tcs = cleaned[0]["tool_calls"]
+        assert tcs[0]["function"]["arguments"] == "{}"  # legalized
+        assert tcs[0]["thought_signature"] == "sig123"  # fidelity preserved
+        assert tcs[0]["id"] == "c1"
+        # The valid sibling passes through byte-identical.
+        assert tcs[1]["function"]["arguments"] == '{"ok": 1}'
+        assert tcs[1]["thought_signature"] == "sig456"
 
-        # Build a mock response with thought_signature in __pydantic_extra__
-        mock_tc = MagicMock()
-        mock_tc.id = "c1"
-        mock_tc.function.name = "write_file"
-        mock_tc.function.arguments = '{"path":"test.txt"}'
-        mock_tc.model_dump.return_value = {
-            "id": "c1",
-            "type": "function",
-            "function": {"name": "write_file", "arguments": '{"path":"test.txt"}'},
-            "thought_signature": "sig_abc",
-        }
+    def test_prepare_messages_swap_serializes_dict_arguments(self) -> None:
+        # The internal-shape case the shared legalize helper handles: a raw
+        # fidelity dict whose arguments landed as an unserialized dict is
+        # json.dumps'd — content preserved, not collapsed to "{}".
+        from turnstone.core.providers._google import GoogleProvider
 
-        mock_msg = MagicMock()
-        mock_msg.tool_calls = [mock_tc]
-        mock_msg.content = ""
-        mock_msg.annotations = None
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ],
+                "_provider_content": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": {"path": "/tmp/x"}},
+                        "thought_signature": "sig1",
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        tc = cleaned[0]["tool_calls"][0]
+        assert json.loads(tc["function"]["arguments"]) == {"path": "/tmp/x"}
+        assert tc["thought_signature"] == "sig1"
 
-        mock_choice = MagicMock()
-        mock_choice.message = mock_msg
-        mock_choice.finish_reason = "tool_calls"
+    def test_prepare_messages_blank_id_raw_row_keeps_sanitized_mirror(self) -> None:
+        # A historical fidelity row whose raw dict carries a blank id (saved
+        # before the capture-time blank-id gate existed): swapping it in
+        # would resurrect the blank id on every replay, so the swap is
+        # skipped and the sanitized mirror — with its back-filled id — stays.
+        from turnstone.core.providers._google import GoogleProvider
 
-        mock_response = MagicMock()
-        mock_response.choices = [mock_choice]
-        mock_response.usage = None
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_backfilled",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    },
+                ],
+                "_provider_content": [
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                        "thought_signature": "sig",
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_backfilled", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        tc = cleaned[0]["tool_calls"][0]
+        assert tc["id"] == "call_backfilled"  # mirror kept, raw lane not swapped
+        assert "thought_signature" not in tc
 
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = mock_response
+    def test_prepare_messages_ignores_non_dict_provider_content_elements(self) -> None:
+        # A corrupted persisted lane with a non-dict element must not crash
+        # the request build.
+        from turnstone.core.providers._google import GoogleProvider
 
-        result = prov.create_completion(
-            client=mock_client,
-            model="gemini-2.5-pro",
-            messages=[{"role": "user", "content": "test"}],
-        )
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "x",
+                "_provider_content": ["garbage-string"],
+            },
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        assert cleaned[0]["content"] == "x"
+        assert "_provider_content" not in cleaned[0]
 
-        # Normalised tool_calls should NOT have thought_signature
-        assert result.tool_calls is not None
-        assert "thought_signature" not in result.tool_calls[0]
-        # provider_blocks should have the raw dict WITH thought_signature
-        assert len(result.provider_blocks) == 1
-        assert result.provider_blocks[0]["thought_signature"] == "sig_abc"
+    def test_prepare_messages_partial_lane_keeps_sanitized_mirror(self) -> None:
+        # A partially-corrupted lane (one valid raw dict + one garbage
+        # element) must not swap a SHORTER list over the mirror — that would
+        # drop a mirrored call whose tool result remains in history and
+        # orphan it.  The sanitized mirror stays.
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_A",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_B",
+                        "type": "function",
+                        "function": {"name": "g", "arguments": "{}"},
+                    },
+                ],
+                "_provider_content": [
+                    {
+                        "id": "call_A",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                        "thought_signature": "sig",
+                    },
+                    "garbage-string",
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_A", "content": "ok"},
+            {"role": "tool", "tool_call_id": "call_B", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        ids = [tc["id"] for tc in cleaned[0]["tool_calls"]]
+        assert ids == ["call_A", "call_B"]  # mirror kept — no orphaned call_B
+
+    def test_prepare_messages_swap_passes_non_dict_function_through(self) -> None:
+        # A degenerate fidelity block with function=None must pass through
+        # untouched (the prior behaviour), not raise.
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "x",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ],
+                "_provider_content": [
+                    {"id": "c1", "type": "function", "function": None},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        assert cleaned[0]["tool_calls"][0]["function"] is None
 
     def test_prepare_messages_base_class_unchanged(self) -> None:
         """Base class _prepare_messages just calls sanitize_messages."""
@@ -2022,18 +2614,59 @@ class TestGoogleProviderFidelity:
         assert fc.provider_blocks[0]["id"] == "call_abc"
         assert fc.provider_blocks[0]["function"]["name"] == "write_file"
 
-    def test_base_extract_tool_calls_returns_empty_provider_blocks(self) -> None:
-        """Base class _extract_tool_calls returns empty provider_blocks."""
+    def test_tap_slots_degenerate_calls_like_the_mirror(self) -> None:
+        # The raw fidelity tap and the base iterator slot the SAME delta
+        # sequence identically: two wire-index-0 calls with distinct ids
+        # yield TWO raw dicts, each keeping its own thought_signature — a
+        # fused single dict would fail _prepare_messages' length gate and
+        # silently drop the signature lane from the replay.
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+
+        def _tc(tc_id: str, name: str, args: str, sig: str) -> MagicMock:
+            tcd = _openai_tool_call_delta(index=0, tc_id=tc_id, name=name, arguments=args)
+            tcd.__pydantic_extra__ = {"thought_signature": sig}
+            return tcd
+
+        chunks = [
+            _openai_stream_chunk(tool_calls=[_tc("c1", "read", '{"a": 1}', "sig_a")]),
+            _openai_stream_chunk(tool_calls=[_tc("c2", "write", '{"b": 2}', "sig_b")]),
+            _openai_stream_chunk(finish_reason="tool_calls"),
+        ]
+        client = MagicMock()
+        client.chat.completions.create.return_value = chunks
+
+        result = drain_stream(
+            prov.create_streaming(
+                client=client, model="gemini-2.5-pro", messages=[{"role": "user", "content": "x"}]
+            )
+        )
+        assert len(result.tool_calls) == 2
+        assert len(result.provider_blocks) == 2
+        assert [b["thought_signature"] for b in result.provider_blocks] == ["sig_a", "sig_b"]
+        assert [b["id"] for b in result.provider_blocks] == ["c1", "c2"]
+
+    def test_base_chat_lane_emits_no_provider_blocks(self) -> None:
+        """The base chat lane carries NO provider_blocks for tool calls —
+        only the Google subclass's tap captures raw dicts.  Pinned on the
+        drained stream (the one transport) so a base-lane regression that
+        started manufacturing blocks would surface here."""
         from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 
         prov = OpenAIChatCompletionsProvider()
-        mock_tc = MagicMock()
-        mock_tc.id = "c1"
-        mock_tc.function.name = "test"
-        mock_tc.function.arguments = "{}"
-        tool_calls, provider_blocks = prov._extract_tool_calls([mock_tc])
-        assert len(tool_calls) == 1
-        assert provider_blocks == []
+        client = MagicMock()
+        client.chat.completions.create.return_value = fake_chat_stream(
+            tool_calls=[{"id": "c1", "name": "test", "arguments": "{}"}],
+            finish_reason="tool_calls",
+        )
+        result = drain_stream(
+            prov.create_streaming(
+                client=client, model="m", messages=[{"role": "user", "content": "x"}]
+            )
+        )
+        assert result.tool_calls is not None and len(result.tool_calls) == 1
+        assert result.provider_blocks == []
 
 
 # ===========================================================================
@@ -2109,58 +2742,51 @@ class TestOpenAIParameterGating:
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
         assert "reasoning_effort" not in kwargs
 
-    def test_gpt5_no_temperature_has_reasoning_effort(self) -> None:
-        """GPT-5 base: no temperature, reasoning_effort sent."""
-        caps = lookup_openai_capabilities("gpt-5")
+    def test_always_reasoning_row_no_temperature_effort_sent(self) -> None:
+        """Always-reasoning rows (gpt-5.4-pro): no temperature ever, the
+        knob's effort value reaches the wire."""
+        caps = lookup_openai_capabilities("gpt-5.4-pro")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="high")
         assert "temperature" not in kwargs
         assert kwargs["reasoning_effort"] == "high"
 
-    def test_gpt51_temperature_when_effort_none(self) -> None:
-        """GPT-5.1: temperature only when reasoning_effort='none'; the
+    def test_gpt54_temperature_when_effort_none(self) -> None:
+        """GPT-5.4: temperature only when reasoning_effort='none'; the
         declared "none" level is forwarded explicitly (knob = off)."""
-        caps = lookup_openai_capabilities("gpt-5.1")
+        caps = lookup_openai_capabilities("gpt-5.4")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
         assert kwargs["temperature"] == 0.7
         assert kwargs["reasoning_effort"] == "none"
 
-    def test_gpt51_no_temperature_when_reasoning_active(self) -> None:
-        """GPT-5.1: no temperature when reasoning is active."""
-        caps = lookup_openai_capabilities("gpt-5.1")
+    def test_gpt54_no_temperature_when_reasoning_active(self) -> None:
+        """GPT-5.4: no temperature when reasoning is active."""
+        caps = lookup_openai_capabilities("gpt-5.4")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="high")
         assert "temperature" not in kwargs
         assert kwargs["reasoning_effort"] == "high"
 
-    def test_o_series_no_temperature_but_effort_forwarded(self) -> None:
-        """O-series: no temperature; low/medium/high ARE valid effort
-        values (all o-series except o1-mini) and the knob reaches them."""
-        caps = lookup_openai_capabilities("o3")
-        kwargs: dict[str, Any] = {}
-        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
-        assert "temperature" not in kwargs
-        assert kwargs["reasoning_effort"] == "medium"
-
-    def test_o1_mini_has_no_effort_control(self) -> None:
-        """o1-mini is the one o-series model without reasoning_effort."""
-        caps = lookup_openai_capabilities("o1-mini")
+    def test_no_effort_vocabulary_row_drops_the_knob(self) -> None:
+        """A commercial row with an EMPTY effort vocabulary (the search-api
+        model) drops the session knob — nothing valid to send."""
+        caps = lookup_openai_capabilities("gpt-5-search-api")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
         assert "reasoning_effort" not in kwargs
 
-    def test_gpt5_pro_unsupported_effort_falls_back(self) -> None:
-        """GPT-5 pro only supports 'high'; unsupported values fall back to default."""
-        caps = lookup_openai_capabilities("gpt-5-pro")
+    def test_pro_row_off_list_effort_snaps_onto_floor(self) -> None:
+        """gpt-5.4-pro declares medium/high/xhigh; an off-list low value
+        rounds UP onto the declared floor."""
+        caps = lookup_openai_capabilities("gpt-5.4-pro")
         kwargs: dict[str, Any] = {}
-        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="low")
         assert "temperature" not in kwargs
-        assert kwargs["reasoning_effort"] == "high"  # fell back to default
+        assert kwargs["reasoning_effort"] == "medium"
 
-    def test_gpt5_pro_supported_effort_passes_through(self) -> None:
-        """GPT-5 pro accepts 'high' directly."""
-        caps = lookup_openai_capabilities("gpt-5-pro")
+    def test_pro_row_supported_effort_passes_through(self) -> None:
+        caps = lookup_openai_capabilities("gpt-5.4-pro")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="high")
         assert kwargs["reasoning_effort"] == "high"
@@ -2236,15 +2862,14 @@ class TestOpenAIParameterGating:
         assert "max" in lookup_openai_capabilities("gpt-5.6-sol").reasoning_effort_values
         assert "max" in lookup_openai_capabilities("gpt-5.6-2026-07-09").reasoning_effort_values
 
-    def test_gpt56_terra_luna_max_snaps_to_xhigh_ceiling(self) -> None:
-        """GPT-5.6 Terra and Luna have no "max" (Sol-only); the knob's "max"
-        snaps DOWN to the declared "xhigh" ceiling rather than being dropped."""
+    def test_gpt56_terra_luna_support_max_effort(self) -> None:
+        """Every GPT-5.6 tier accepts the documented "max" effort."""
         for tier in ("gpt-5.6-terra", "gpt-5.6-luna"):
             caps = lookup_openai_capabilities(tier)
-            assert "max" not in caps.reasoning_effort_values, tier
+            assert "max" in caps.reasoning_effort_values, tier
             kwargs: dict[str, Any] = {}
             apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="max")
-            assert kwargs["reasoning_effort"] == "xhigh", tier
+            assert kwargs["reasoning_effort"] == "max", tier
 
 
 class TestAnthropicOrphanedToolUse:
@@ -2661,9 +3286,13 @@ class TestAnthropicWebSearch:
         chunks = list(self.provider._iter_anthropic_stream(events))
         text_chunks = [c for c in chunks if c.content_delta]
         info_chunks = [c for c in chunks if c.info_delta]
-        assert len(text_chunks) == 2
-        assert text_chunks[0].content_delta == "Let me search."
-        assert text_chunks[1].content_delta == "Based on the results..."
+        # Three content chunks: the second text BLOCK opens with the "\n"
+        # separator (matching the retired non-streaming join), then its text.
+        assert [c.content_delta for c in text_chunks] == [
+            "Let me search.",
+            "\n",
+            "Based on the results...",
+        ]
         assert len(info_chunks) == 1
         assert "test query" in info_chunks[0].info_delta
 
@@ -2673,39 +3302,25 @@ class TestAnthropicWebSearch:
 
         assert _normalize_finish_reason("pause_turn") == "stop"
 
-    def test_completion_skips_server_blocks(self) -> None:
-        """create_completion should skip server_tool_use and web_search_tool_result."""
-        # Build mock response with mixed block types
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "Here are the results."
-
-        server_tu_block = MagicMock()
-        server_tu_block.type = "server_tool_use"
-
-        search_result_block = MagicMock()
-        search_result_block.type = "web_search_tool_result"
-
-        response = MagicMock()
-        response.content = [server_tu_block, search_result_block, text_block]
-        response.stop_reason = "end_turn"
-        response.usage.input_tokens = 100
-        response.usage.output_tokens = 50
-        response.usage.cache_creation_input_tokens = 0
-        response.usage.cache_read_input_tokens = 0
-
+    def test_drained_stream_skips_server_blocks(self) -> None:
+        """Server-side blocks surface as transient info (dropped by the
+        drain), never as content or client tool calls."""
         client = MagicMock()
-        stream_ctx = MagicMock()
-        stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
-        stream_ctx.__exit__ = MagicMock(return_value=False)
-        stream_ctx.get_final_message.return_value = response
-        client.messages.stream.return_value = stream_ctx
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [
+                SimpleNamespace(type="server_tool_use", id="srvtoolu_1", name="web_search"),
+                SimpleNamespace(type="web_search_tool_result"),
+                SimpleNamespace(type="text", text="Here are the results."),
+            ]
+        )
 
         with patch("turnstone.core.providers._anthropic._ensure_anthropic"):
-            result = self.provider.create_completion(
-                client=client,
-                model="claude-opus-4-6",
-                messages=[{"role": "user", "content": "search test"}],
+            result = drain_stream(
+                self.provider.create_streaming(
+                    client=client,
+                    model="claude-opus-4-6",
+                    messages=[{"role": "user", "content": "search test"}],
+                )
             )
         assert result.content == "Here are the results."
         assert result.tool_calls is None
@@ -3030,34 +3645,25 @@ class TestOpenAIWebSearch:
             t.get("function", {}).get("name") == "web_search" for t in call_kwargs.get("tools", [])
         )
 
-    def test_completion_with_annotations(self) -> None:
-        """Non-streaming completion with search model should format citations."""
+    def test_drained_stream_folds_citations_into_content(self) -> None:
+        """The trailing citation info chunk folds back into drained content —
+        the #831 parity rule for what non-streaming citation embedding did."""
         ann = MagicMock()
         ann.type = "url_citation"
         ann.url_citation = MagicMock(title="Test", url="https://test.com")
 
-        msg = MagicMock()
-        msg.content = "Found information."
-        msg.annotations = [ann]
-        msg.tool_calls = None
-
-        choice = MagicMock()
-        choice.message = msg
-        choice.finish_reason = "stop"
-
-        response = MagicMock()
-        response.choices = [choice]
-        response.usage.prompt_tokens = 50
-        response.usage.completion_tokens = 20
-        response.usage.total_tokens = 70
+        chunks = fake_chat_stream(content="Found information.")
+        chunks[0].choices[0].delta.annotations = [ann]
 
         client = MagicMock()
-        client.chat.completions.create.return_value = response
+        client.chat.completions.create.return_value = chunks
 
-        result = self.provider.create_completion(
-            client=client,
-            model="gpt-5-search-api",
-            messages=[{"role": "user", "content": "search test"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5-search-api",
+                messages=[{"role": "user", "content": "search test"}],
+            )
         )
         assert "Found information." in result.content
         assert "Sources:" in result.content
@@ -3173,6 +3779,80 @@ class TestAnthropicProviderBlocks:
         assistant_msg = converted[1]
         assert assistant_msg["role"] == "assistant"
         assert assistant_msg["content"] == [{"type": "text", "text": "Hi there"}]
+
+    def test_agent_native_lane_with_restore_map_is_wire_consistent(self) -> None:
+        """The sub-agent wire shape: an assistant Turn carrying the provider-
+        native lane, its minted tool id restored to the provider original by
+        the lowering map.  The native blocks replay verbatim (thinking +
+        signature untouched) and the native tool_use id, the top-level
+        mirror, and the tool_result all agree."""
+        from turnstone.core.lowering import restore_provider_tool_ids
+        from turnstone.core.trajectory import (
+            ProviderNative,
+            ToolCall,
+            Turn,
+            dicts_from_turns,
+        )
+
+        thinking = {"type": "thinking", "thinking": "look first", "signature": "sig_1"}
+        tool_use = {"type": "tool_use", "id": "toolu_01X", "name": "f", "input": {}}
+        minted = "task-1::r1s1::toolu_01X"
+        turns = [
+            Turn.user("go"),
+            Turn.assistant(
+                "using f",
+                tool_calls=(ToolCall(id=minted, name="f", arguments="{}"),),
+                native=ProviderNative(
+                    producer="anthropic",
+                    blocks=(thinking, {"type": "text", "text": "using f"}, tool_use),
+                ),
+            ),
+            Turn.tool(minted, "out"),
+        ]
+        wire = restore_provider_tool_ids(dicts_from_turns(turns), {minted: "toolu_01X"})
+        _, converted = self.provider._convert_messages(wire, replay_reasoning_to_model=True)
+        assistant = converted[1]
+        assert [b["type"] for b in assistant["content"]] == ["thinking", "text", "tool_use"]
+        assert assistant["content"][0]["signature"] == "sig_1"
+        assert assistant["content"][2]["id"] == "toolu_01X"
+        tool_results = [b for b in converted[2]["content"] if b.get("type") == "tool_result"]
+        assert tool_results and tool_results[0]["tool_use_id"] == "toolu_01X"
+
+    def test_agent_native_lane_without_restore_map_orphans_the_result(self) -> None:
+        """Documents why the id map is a PREREQUISITE of carrying the native
+        lane, not hygiene: without it the tool_result arrives with the minted
+        id, matches no native tool_use, and the converter drops it as an
+        orphan — leaving an unanswered tool_use on the wire (a provider
+        rejection)."""
+        from turnstone.core.trajectory import (
+            ProviderNative,
+            ToolCall,
+            Turn,
+            dicts_from_turns,
+        )
+
+        tool_use = {"type": "tool_use", "id": "toolu_01X", "name": "f", "input": {}}
+        minted = "task-1::r1s1::toolu_01X"
+        turns = [
+            Turn.user("go"),
+            Turn.assistant(
+                "",
+                tool_calls=(ToolCall(id=minted, name="f", arguments="{}"),),
+                native=ProviderNative(producer="anthropic", blocks=(tool_use,)),
+            ),
+            Turn.tool(minted, "out"),
+        ]
+        _, converted = self.provider._convert_messages(
+            dicts_from_turns(turns), replay_reasoning_to_model=True
+        )
+        all_results = [
+            b
+            for m in converted
+            if isinstance(m.get("content"), list)
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        ]
+        assert all_results == []
 
     def test_block_to_dict_with_model_dump(self) -> None:
         """_block_to_dict uses model_dump(exclude_none=True) when available."""
@@ -3495,6 +4175,31 @@ class TestModelCapabilitiesToolSearch:
         caps = ModelCapabilities()
         assert caps.supports_tool_search is False
 
+    def test_public_positional_prefix_remains_stable(self) -> None:
+        """New optional fields must not shift the exported constructor's existing slots."""
+        caps = ModelCapabilities(
+            100000,
+            10000,
+            False,
+            False,
+            False,
+            "max_tokens",
+            "manual",
+            "thinking",
+            "reasoning_effort",
+            True,
+            ("low",),
+            ("low",),
+            "low",
+            True,
+            True,
+            True,
+            True,
+        )
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+
 
 class TestMidConversationSystemCapability:
     """supports_mid_conversation_system — NextOpus (claude-opus-4-8) only."""
@@ -3545,7 +4250,7 @@ class TestVisionCapabilities:
         assert caps.supports_vision is False
 
     def test_openai_commercial_supports_vision(self) -> None:
-        for model in ("gpt-5", "gpt-5-mini", "gpt-5.4", "o3", "o4-mini"):
+        for model in ("gpt-5.4", "gpt-5.5", "gpt-5.6", "gpt-5.6-luna"):
             caps = lookup_openai_capabilities(model)
             assert caps.supports_vision is True, f"{model} should support vision"
 
@@ -3867,33 +4572,25 @@ class TestAnthropicPromptCaching:
         assert u.cache_creation_tokens == 0
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
-    def test_completion_cache_metrics(self, mock_ensure: MagicMock) -> None:
-        """Non-streaming completion extracts cache metrics."""
-        response = MagicMock()
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "Hello"
-        response.content = [text_block]
-        response.stop_reason = "end_turn"
-
-        usage = MagicMock()
-        usage.input_tokens = 200
-        usage.output_tokens = 30
-        usage.cache_creation_input_tokens = 150
-        usage.cache_read_input_tokens = 50
-        response.usage = usage
-
+    def test_drained_stream_cache_metrics(self, mock_ensure: MagicMock) -> None:
+        """The drained transport carries cache metrics through the max-merge."""
         client = MagicMock()
-        stream_ctx = MagicMock()
-        stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
-        stream_ctx.__exit__ = MagicMock(return_value=False)
-        stream_ctx.get_final_message.return_value = response
-        client.messages.stream.return_value = stream_ctx
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [SimpleNamespace(type="text", text="Hello")],
+            usage=SimpleNamespace(
+                input_tokens=200,
+                output_tokens=30,
+                cache_creation_input_tokens=150,
+                cache_read_input_tokens=50,
+            ),
+        )
 
-        result = self.provider.create_completion(
-            client=client,
-            model="claude-sonnet-4-6",
-            messages=[{"role": "user", "content": "hi"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "hi"}],
+            )
         )
         u = result.usage
         assert u is not None
@@ -3943,8 +4640,26 @@ class TestOpenAIPromptCaching:
     def setup_method(self) -> None:
         self.provider = OpenAIProvider()
 
-    def test_cache_retention_set_for_gpt5(self) -> None:
-        """GPT-5.x models get prompt_cache_retention=24h."""
+    @pytest.mark.parametrize("model", ("gpt-5.5-local-lora", "gpt-5.6-local-lora"))
+    def test_chat_compat_streaming_omits_commercial_cache_params(self, model: str) -> None:
+        """A local model name must not activate commercial OpenAI cache controls."""
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(())
+
+        list(
+            self.provider.create_streaming(
+                client=client,
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+
+        sent = client.chat.completions.create.call_args.kwargs
+        assert "prompt_cache_retention" not in sent
+        assert "prompt_cache_options" not in sent
+
+    def test_cache_retention_set_for_pre_gpt56_models(self) -> None:
+        """Pre-5.6 GPT-5 models retain the legacy 24-hour cache policy."""
         for model in (
             "gpt-5",
             "gpt-5.1",
@@ -3953,16 +4668,21 @@ class TestOpenAIPromptCaching:
             "gpt-5.4-pro",
             "gpt-5.5",
             "gpt-5.5-pro",
-            "gpt-5.6",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
             "gpt-5-mini",
             "gpt-5-pro",
         ):
             kwargs: dict[str, Any] = {}
             apply_cache_retention(kwargs, model)
             assert kwargs.get("prompt_cache_retention") == "24h", f"Failed for {model}"
+            assert "prompt_cache_options" not in kwargs
+
+    def test_gpt56_uses_prompt_cache_options(self) -> None:
+        """GPT-5.6 uses the replacement cache API introduced in SDK 2.45."""
+        for model in ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            kwargs: dict[str, Any] = {}
+            apply_cache_retention(kwargs, model)
+            assert kwargs.get("prompt_cache_options") == {"ttl": "30m"}, model
+            assert "prompt_cache_retention" not in kwargs
 
     def test_cache_retention_not_set_for_non_gpt5(self) -> None:
         """Non-GPT-5 models do not get cache retention."""
@@ -3970,6 +4690,38 @@ class TestOpenAIPromptCaching:
             kwargs: dict[str, Any] = {}
             apply_cache_retention(kwargs, model)
             assert "prompt_cache_retention" not in kwargs, f"Unexpected retention for {model}"
+            assert "prompt_cache_options" not in kwargs, f"Unexpected options for {model}"
+
+    def test_cache_write_tokens_from_responses_usage(self) -> None:
+        """GPT-5.6 cache writes flow into normalized usage accounting."""
+        usage = MagicMock()
+        usage.prompt_tokens = None
+        usage.input_tokens = 100
+        usage.completion_tokens = None
+        usage.output_tokens = 20
+        usage.total_tokens = 120
+        usage.prompt_tokens_details = None
+        usage.input_tokens_details = MagicMock(cached_tokens=30, cache_write_tokens=70)
+
+        normalized = extract_usage(usage)
+
+        assert normalized is not None
+        assert normalized.cache_read_tokens == 30
+        assert normalized.cache_creation_tokens == 70
+
+    def test_cache_write_tokens_from_chat_usage(self) -> None:
+        """The Chat Completions usage shape reports the same cache-write metric."""
+        usage = MagicMock()
+        usage.prompt_tokens = 100
+        usage.completion_tokens = 20
+        usage.total_tokens = 120
+        usage.prompt_tokens_details = MagicMock(cached_tokens=30, cache_write_tokens=70)
+
+        normalized = extract_usage(usage)
+
+        assert normalized is not None
+        assert normalized.cache_read_tokens == 30
+        assert normalized.cache_creation_tokens == 70
 
     def test_streaming_cached_tokens_from_usage(self) -> None:
         """Streaming usage extracts cached_tokens from prompt_tokens_details."""
@@ -4002,34 +4754,19 @@ class TestOpenAIPromptCaching:
         assert u.cache_read_tokens == 80
         assert u.cache_creation_tokens == 0
 
-    def test_completion_cached_tokens(self) -> None:
-        """Non-streaming completion extracts cached_tokens."""
-        response = MagicMock()
-        msg = MagicMock()
-        msg.content = "Hello"
-        msg.tool_calls = None
-        msg.annotations = None
-        choice = MagicMock()
-        choice.message = msg
-        choice.finish_reason = "stop"
-        response.choices = [choice]
-
-        usage = MagicMock()
-        usage.prompt_tokens = 200
-        usage.completion_tokens = 30
-        usage.total_tokens = 230
-        ptd = MagicMock()
-        ptd.cached_tokens = 150
-        usage.prompt_tokens_details = ptd
-        response.usage = usage
-
+    def test_drained_stream_cached_tokens(self) -> None:
+        """Cached-token details on the trailing usage chunk survive the drain."""
+        chunks = fake_chat_stream(content="hi", prompt_tokens=200, completion_tokens=30)
+        chunks[-1].usage.prompt_tokens_details = SimpleNamespace(cached_tokens=150)
         client = MagicMock()
-        client.chat.completions.create.return_value = response
+        client.chat.completions.create.return_value = chunks
 
-        result = self.provider.create_completion(
-            client=client,
-            model="gpt-5.1",
-            messages=[{"role": "user", "content": "hi"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5.1",
+                messages=[{"role": "user", "content": "hi"}],
+            )
         )
         u = result.usage
         assert u is not None
@@ -4129,6 +4866,71 @@ class TestOpenAIResponsesProvider:
         caps = self.provider.get_capabilities("gpt-5.4")
         assert caps.context_window == 1050000
         assert caps.supports_tool_search is True
+
+
+class TestOpenAIChatReasoningCapture:
+    """The drained stream surfaces the Chat-Completions lane's non-canonical
+    reasoning (vLLM ``--reasoning-parser``, llama.cpp ``reasoning_format``)
+    as ``CompletionResult.reasoning`` — the shared ``_reasoning_text``
+    extractor owns the attribute pair and precedence, so delta and message
+    shapes cannot drift."""
+
+    @staticmethod
+    def _client(*, reasoning: Any = None, reasoning_content: Any = None) -> MagicMock:
+        chunks = fake_chat_stream(
+            content="ok", reasoning=reasoning, reasoning_content=reasoning_content
+        )
+        client = MagicMock()
+        client.chat.completions.create.return_value = chunks
+        return client
+
+    def _complete(self, client: MagicMock):
+        provider = OpenAIChatCompletionsProvider()
+        return drain_stream(
+            provider.create_streaming(
+                client=client, model="m", messages=[{"role": "user", "content": "hi"}]
+            )
+        )
+
+    def test_reasoning_content_captured(self) -> None:
+        result = self._complete(self._client(reasoning_content="thought text"))
+        assert result.reasoning == "thought text"
+
+    def test_reasoning_attribute_takes_precedence(self) -> None:
+        result = self._complete(self._client(reasoning="direct", reasoning_content="parsed"))
+        assert result.reasoning == "direct"
+
+    def test_absent_reasoning_is_empty(self) -> None:
+        result = self._complete(self._client())
+        assert result.reasoning == ""
+
+    def test_non_string_reasoning_collapses_to_empty(self) -> None:
+        # A server surfacing a structured reasoning object (not text) must not
+        # leak a non-str into the result.
+        result = self._complete(self._client(reasoning={"odd": True}))
+        assert result.reasoning == ""
+
+    def test_structured_reasoning_does_not_shadow_reasoning_content(self) -> None:
+        # A truthy non-string in ``reasoning`` must not shadow valid text in
+        # ``reasoning_content`` — the first non-empty STRING wins.
+        result = self._complete(
+            self._client(reasoning={"content": "structured"}, reasoning_content="parsed text")
+        )
+        assert result.reasoning == "parsed text"
+
+    def test_streaming_delta_shares_the_same_guard(self) -> None:
+        # The streaming twin: a structured object in ``reasoning`` must not
+        # leak into reasoning_delta (it would TypeError the session's
+        # ``"".join`` accumulator) nor shadow the parsed string.
+        provider = OpenAIChatCompletionsProvider()
+        chunk = _openai_stream_chunk(
+            reasoning={"content": "structured"},  # type: ignore[arg-type] — the hostile input under test
+            reasoning_content="parsed text",
+            finish_reason="stop",
+        )
+        chunks = list(provider._iter_stream(iter([chunk])))
+        assert any(c.reasoning_delta == "parsed text" for c in chunks)
+        assert all(isinstance(c.reasoning_delta, str) for c in chunks)
 
 
 class TestResponsesMessageConversion:
@@ -4393,8 +5195,7 @@ class TestResponsesParamBuilding:
         assert kwargs["reasoning"] == {"effort": "high", "mode": "pro"}
 
     def test_pro_mode_rejected_when_unsupported(self) -> None:
-        """A pro reasoning_mode on Terra/Luna (supports_pro_mode False) is
-        dropped — effort still rides, mode does not."""
+        """A pro mode on a model without reasoning-mode support is dropped."""
         caps = ModelCapabilities(
             supports_pro_mode=False,
             reasoning_mode="pro",
@@ -4409,6 +5210,16 @@ class TestResponsesParamBuilding:
         caps = ModelCapabilities(supports_pro_mode=True, reasoning_mode="pro")
         kwargs = self._build(caps, reasoning_effort="medium")
         assert kwargs["reasoning"] == {"mode": "pro"}
+
+    def test_standard_reasoning_mode_is_accepted(self) -> None:
+        """The SDK's explicit standard mode is valid even though omission is equivalent."""
+        caps = ModelCapabilities(
+            supports_pro_mode=True,
+            reasoning_mode="standard",
+            reasoning_effort_values=("low", "medium", "high"),
+        )
+        kwargs = self._build(caps, reasoning_effort="high")
+        assert kwargs["reasoning"] == {"effort": "high", "mode": "standard"}
 
     def test_verbosity_unknown_value_dropped(self) -> None:
         """A verbosity outside {low,medium,high} is dropped, not sent — an
@@ -4426,9 +5237,23 @@ class TestResponsesParamBuilding:
         kwargs = self._build(caps, reasoning_effort="high")
         assert kwargs["reasoning"] == {"effort": "high"}
 
-    def test_gpt56_terra_max_snaps_to_xhigh_on_responses_wire(self) -> None:
-        """Terra's knob "max" snaps to the xhigh ceiling on the ACTUAL
-        Responses wire path (_build_kwargs), not only the shared resolver."""
+    def test_verbosity_non_string_value_dropped(self) -> None:
+        """Malformed operator JSON must not crash request construction."""
+        kwargs = self._build(ModelCapabilities(supports_verbosity=True, verbosity=["low"]))
+        assert "text" not in kwargs
+
+    def test_pro_mode_non_string_value_dropped(self) -> None:
+        """Malformed operator JSON must not crash request construction."""
+        caps = ModelCapabilities(
+            supports_pro_mode=True,
+            reasoning_mode=["pro"],
+            reasoning_effort_values=("low", "medium", "high"),
+        )
+        kwargs = self._build(caps, reasoning_effort="high")
+        assert kwargs["reasoning"] == {"effort": "high"}
+
+    def test_gpt56_terra_max_reaches_responses_wire(self) -> None:
+        """Terra sends the documented max effort on the actual Responses path."""
         kwargs = self.provider._build_kwargs(
             model="gpt-5.6-terra",
             messages=[{"role": "user", "content": "Hi"}],
@@ -4438,19 +5263,14 @@ class TestResponsesParamBuilding:
             reasoning_effort="max",
             deferred_names=None,
         )
-        assert kwargs["reasoning"] == {"effort": "xhigh"}
+        assert kwargs["reasoning"] == {"effort": "max"}
 
     def test_gpt56_verbosity_and_pro_flags(self) -> None:
-        """The static rows carry the right capability flags: verbosity on all
-        three tiers, pro mode on Sol/alias only."""
-        sol = lookup_openai_capabilities("gpt-5.6-sol")
-        assert sol.supports_verbosity is True
-        assert sol.supports_pro_mode is True
-        assert lookup_openai_capabilities("gpt-5.6").supports_pro_mode is True
-        for tier in ("gpt-5.6-terra", "gpt-5.6-luna"):
+        """Every GPT-5.6 tier supports verbosity and pro reasoning mode."""
+        for tier in ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
             caps = lookup_openai_capabilities(tier)
             assert caps.supports_verbosity is True
-            assert caps.supports_pro_mode is False
+            assert caps.supports_pro_mode is True
 
     def _kwargs_with(self, tools: list[dict[str, Any]], caps: ModelCapabilities) -> dict[str, Any]:
         return self.provider._build_kwargs(
@@ -4502,6 +5322,34 @@ class TestResponsesParamBuilding:
             deferred_names=None,
         )
         assert kwargs["prompt_cache_retention"] == "24h"
+
+    def test_compat_responses_omits_commercial_cache_params(self) -> None:
+        provider = type(self.provider)(compat=True)
+        for model in ("gpt-5.5-local-lora", "gpt-5.6-local-lora"):
+            kwargs = provider._build_kwargs(
+                model=model,
+                messages=[{"role": "user", "content": "Hi"}],
+                tools=None,
+                max_tokens=4096,
+                temperature=0.5,
+                reasoning_effort="medium",
+                deferred_names=None,
+            )
+            assert "prompt_cache_retention" not in kwargs, model
+            assert "prompt_cache_options" not in kwargs, model
+
+    def test_cache_options_for_gpt56(self) -> None:
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="medium",
+            deferred_names=None,
+        )
+        assert kwargs["prompt_cache_options"] == {"ttl": "30m"}
+        assert "prompt_cache_retention" not in kwargs
 
     def test_instructions_from_system_messages(self) -> None:
         kwargs = self.provider._build_kwargs(
@@ -4725,95 +5573,551 @@ class TestResponsesStreaming:
         assert "complete" in info[1].info_delta
 
 
-class TestResponsesCompletion:
-    """Tests for non-streaming Responses API completion."""
+class TestResponsesDrainedStream:
+    """The drained Responses stream reproduces what ``_parse_response`` used
+    to extract from a whole ``Response`` object — content, tool calls,
+    provider_blocks, status→finish mapping (``response.incomplete`` is the
+    real truncation terminal), and usage."""
 
     def setup_method(self) -> None:
-        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+        from turnstone.core.providers import OpenAIResponsesProvider
 
         self.provider = OpenAIResponsesProvider()
 
-    def _make_response(
-        self,
-        text: str = "Hello",
-        tool_calls: list[dict[str, Any]] | None = None,
+    @staticmethod
+    def _make_events(
+        text: str = "",
+        tool_calls: list[dict[str, str]] | None = None,
         status: str = "completed",
-    ) -> MagicMock:
-        resp = MagicMock()
-        resp.status = status
-        resp.usage = MagicMock()
-        resp.usage.input_tokens = 10
-        resp.usage.output_tokens = 5
-        resp.usage.total_tokens = 15
-        resp.usage.input_tokens_details = MagicMock(cached_tokens=0)
-        # Remove Chat Completions attributes
-        del resp.usage.prompt_tokens
-        del resp.usage.completion_tokens
-        del resp.usage.prompt_tokens_details
-
-        output: list[Any] = []
+    ) -> list[Any]:
+        events: list[Any] = []
         if text:
-            msg = MagicMock()
-            msg.type = "message"
-            text_part = MagicMock()
-            text_part.type = "output_text"
-            text_part.text = text
-            text_part.annotations = []
-            msg.content = [text_part]
-            msg.model_dump.return_value = {
+            events.append(SimpleNamespace(type="response.output_text.delta", delta=text))
+            msg_item = SimpleNamespace(type="message", content=[])
+            msg_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
                 "type": "message",
                 "content": [{"type": "output_text", "text": text}],
             }
-            output.append(msg)
-        if tool_calls:
-            for tc in tool_calls:
-                item = MagicMock()
-                item.type = "function_call"
-                item.call_id = tc["id"]
-                item.name = tc["name"]
-                item.arguments = tc["arguments"]
-                item.model_dump.return_value = {
-                    "type": "function_call",
-                    "call_id": tc["id"],
-                    "name": tc["name"],
-                    "arguments": tc["arguments"],
-                }
-                output.append(item)
-        resp.output = output
-        return resp
+            events.append(SimpleNamespace(type="response.output_item.done", item=msg_item))
+        for tc in tool_calls or []:
+            item = SimpleNamespace(
+                type="function_call",
+                call_id=tc["id"],
+                id=f"item_{tc['id']}",
+                name=tc["name"],
+            )
+            item.model_dump = lambda tc=tc, **_kw: {  # type: ignore[method-assign]
+                "type": "function_call",
+                "call_id": tc["id"],
+                "name": tc["name"],
+                "arguments": tc["arguments"],
+            }
+            events.append(SimpleNamespace(type="response.output_item.added", item=item))
+            events.append(
+                SimpleNamespace(
+                    type="response.function_call_arguments.delta",
+                    item_id=f"item_{tc['id']}",
+                    delta=tc["arguments"],
+                )
+            )
+            events.append(SimpleNamespace(type="response.output_item.done", item=item))
+        terminal_type = "response.completed" if status == "completed" else "response.incomplete"
+        usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        events.append(
+            SimpleNamespace(
+                type=terminal_type,
+                response=SimpleNamespace(status=status, usage=usage),
+            )
+        )
+        return events
+
+    def _drain(self, events: list[Any], capabilities: ModelCapabilities | None = None):
+        client = MagicMock()
+        client.responses.create.return_value = events
+        return drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5.1",
+                messages=[{"role": "user", "content": "hi"}],
+                capabilities=capabilities,
+            )
+        )
 
     def test_basic_text_completion(self) -> None:
-        resp = self._make_response(text="Hello world")
-        result = self.provider._parse_response(resp)
+        result = self._drain(self._make_events(text="Hello world"))
         assert result.content == "Hello world"
         assert result.tool_calls is None
         assert result.finish_reason == "stop"
 
     def test_completion_with_tool_calls(self) -> None:
-        resp = self._make_response(
-            text="",
-            tool_calls=[{"id": "call_1", "name": "read_file", "arguments": '{"path": "/tmp"}'}],
+        result = self._drain(
+            self._make_events(
+                tool_calls=[{"id": "call_1", "name": "read_file", "arguments": '{"path": "/tmp"}'}]
+            )
         )
-        result = self.provider._parse_response(resp)
         assert result.tool_calls is not None
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0]["id"] == "call_1"
         assert result.tool_calls[0]["function"]["name"] == "read_file"
 
     def test_provider_blocks_captured(self) -> None:
-        resp = self._make_response(text="Hello")
-        result = self.provider._parse_response(resp)
+        result = self._drain(self._make_events(text="Hello"))
         assert len(result.provider_blocks) > 0
         assert result.provider_blocks[0]["type"] == "message"
 
     def test_incomplete_status_maps_to_length(self) -> None:
-        resp = self._make_response(text="Partial", status="incomplete")
-        result = self.provider._parse_response(resp)
+        # ``response.incomplete`` terminal event: finish maps to length and
+        # the final usage/blocks still attach (the un-widened handler used
+        # to drop all three on truncated runs).
+        result = self._drain(self._make_events(text="Partial", status="incomplete"))
         assert result.finish_reason == "length"
+        assert result.usage is not None
+        assert result.provider_blocks
+
+    def test_terminal_event_less_stream_raises_by_default(self) -> None:
+        # No response.completed/incomplete ever arrived: on an
+        # event-disciplined server this is a generation that died
+        # mid-response — the drain refuses to bless possibly-truncated
+        # content.
+        from turnstone.core.providers import IncompleteStreamError
+
+        events = self._make_events(text="Hello")[:-1]  # drop the terminal event
+        with pytest.raises(IncompleteStreamError):
+            self._drain(events)
+
+    def test_terminal_event_less_stream_completes_with_declared_tolerance(self) -> None:
+        # ``finish_reason_optional`` (operator-declared: this server never
+        # sends terminal events) completes the clean output-bearing end —
+        # the .done-collected blocks ride the shimmed finish chunk.
+        events = self._make_events(text="Hello")[:-1]
+        result = self._drain(events, capabilities=ModelCapabilities(finish_reason_optional=True))
+        assert result.content == "Hello"
+        assert result.finish_reason == "stop"
+        assert result.provider_blocks
+
+    def test_post_terminal_error_event_keeps_completed_result(self) -> None:
+        # A trailing in-band error frame after response.completed is
+        # teardown noise — raising would discard a generation already in
+        # hand (the in-band twin of drain_stream's post-finish
+        # transport-blip tolerance).
+        events = self._make_events(text="Hello")
+        events.append(SimpleNamespace(type="error", code="server_error", message="boom"))
+        result = self._drain(events)
+        assert result.content == "Hello"
+        assert result.finish_reason == "stop"
+
+    def test_post_terminal_failed_event_keeps_completed_result(self) -> None:
+        events = self._make_events(text="Hello")
+        events.append(
+            SimpleNamespace(
+                type="response.failed",
+                response=SimpleNamespace(
+                    error=SimpleNamespace(code="server_error", message="boom")
+                ),
+            )
+        )
+        result = self._drain(events)
+        assert result.content == "Hello"
+        assert result.finish_reason == "stop"
+
+    def test_orphan_argument_deltas_route_to_last_announced_call(self) -> None:
+        # A lax server whose argument deltas reference an item_id that was
+        # never announced: they belong to the call most recently opened,
+        # not hardwired slot 0.
+        item_a = SimpleNamespace(type="function_call", call_id="call_a", id="item_a", name="alpha")
+        item_a.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "function_call",
+            "call_id": "call_a",
+            "name": "alpha",
+        }
+        item_b = SimpleNamespace(type="function_call", call_id="call_b", id="item_b", name="beta")
+        item_b.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "function_call",
+            "call_id": "call_b",
+            "name": "beta",
+        }
+        events = [
+            SimpleNamespace(type="response.output_item.added", item=item_a),
+            SimpleNamespace(type="response.output_item.added", item=item_b),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="bogus",
+                delta='{"x": 1}',
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.tool_calls is not None
+        by_name = {tc["function"]["name"]: tc["function"]["arguments"] for tc in result.tool_calls}
+        assert by_name["beta"] == '{"x": 1}'
+        assert by_name["alpha"] == ""
+
+    def test_orphan_deltas_do_not_collide_with_terminal_harvest(self) -> None:
+        # Reproduced round-9 regression: argument deltas streamed without
+        # any output_item.added announcement accumulate at slot 0, and the
+        # terminal harvest (gated on "no tool calls streamed") re-emitted
+        # the same call onto the same slot — concatenating the arguments
+        # into '{"x": 1}{"x": 1}'.  Orphan deltas ARE a streamed tool-call
+        # signal, so the harvest must stand down.
+        terminal_item = SimpleNamespace(type="function_call")
+        terminal_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "do_thing",
+            "arguments": '{"x": 1}',
+        }
+        events = [
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="never_announced",
+                delta='{"x": 1}',
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None, output=[terminal_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"x": 1}'
+
+    def test_orphan_only_tool_stream_completes_with_declared_tolerance(self) -> None:
+        # Orphan argument deltas must count as delivered output for the
+        # finish shim exactly as they count as a streamed signal for the
+        # terminal harvest: a lax server that never announces items AND
+        # never sends a terminal event still delivered its tool call —
+        # with the tolerance declared, that is a completion, not an
+        # IncompleteStreamError.
+        events = [
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="never_announced",
+                delta='{"x": 1}',
+            ),
+        ]
+        result = self._drain(events, capabilities=ModelCapabilities(finish_reason_optional=True))
+        assert result.finish_reason == "stop"
+        assert result.tool_calls is not None
+        assert result.tool_calls[0]["function"]["arguments"] == '{"x": 1}'
+
+    def test_duplicate_item_ids_keep_distinct_slots(self) -> None:
+        # Slot numbering must survive duplicate/empty item ids: len(dict)
+        # numbering collided the third call onto the second's slot once an
+        # overwrite kept the dict size flat.
+        def _item(call_id: str, item_id: str, name: str) -> SimpleNamespace:
+            item = SimpleNamespace(type="function_call", call_id=call_id, id=item_id, name=name)
+            item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+            }
+            return item
+
+        events = [
+            SimpleNamespace(type="response.output_item.added", item=_item("call_a", "", "alpha")),
+            SimpleNamespace(type="response.output_item.added", item=_item("call_b", "", "beta")),
+            SimpleNamespace(
+                type="response.output_item.added", item=_item("call_c", "item_c", "gamma")
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.tool_calls is not None
+        assert [tc["function"]["name"] for tc in result.tool_calls] == ["alpha", "beta", "gamma"]
+
+    def test_terminal_only_text_reaches_content(self) -> None:
+        # A buffering gateway that emits NO output_text.delta /
+        # output_item.done events and delivers the whole output only in
+        # the terminal payload: the retired non-streaming path read
+        # content off this same payload, so the drain must too — not
+        # return a clean-looking empty success.
+        terminal_item = SimpleNamespace(type="message", content=[])
+        terminal_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "message",
+            "content": [{"type": "output_text", "text": "Full answer"}],
+        }
+        events = [
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None, output=[terminal_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.content == "Full answer"
+        assert result.finish_reason == "stop"
+
+    def test_terminal_only_tool_calls_reach_result(self) -> None:
+        # Same under-streaming shape for tool calls: a function_call item
+        # present only in the terminal payload must reach
+        # CompletionResult.tool_calls, or the action is silently never
+        # executed.
+        terminal_item = SimpleNamespace(type="function_call")
+        terminal_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "function_call",
+            "call_id": "call_9",
+            "name": "read_file",
+            "arguments": '{"path": "/tmp/x"}',
+        }
+        events = [
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None, output=[terminal_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["id"] == "call_9"
+        assert result.tool_calls[0]["function"]["name"] == "read_file"
+        assert result.tool_calls[0]["function"]["arguments"] == '{"path": "/tmp/x"}'
+
+    def test_status_less_completed_payload_maps_to_stop(self) -> None:
+        # A slim compat payload that omits ``status`` on response.completed:
+        # the event type itself says the run completed — labeling it
+        # "length" would fire truncation policies on complete output.
+        events = self._make_events(text="Hello")[:-1]
+        events.append(
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(usage=None),  # no status attribute
+            )
+        )
+        result = self._drain(events)
+        assert result.content == "Hello"
+        assert result.finish_reason == "stop"
+
+    def test_completed_terminal_keeps_done_items_without_rebuild(self) -> None:
+        # Happy path: every item got its ``output_item.done`` and the
+        # terminal payload carries the same number of items — the rebuild
+        # (a full re-serialization of every output item plus a second
+        # annotations walk) is skipped and the ``.done``-collected blocks
+        # are kept as-is.
+        done_item = SimpleNamespace(type="message", content=[])
+        done_item.model_dump = lambda **_kw: {"type": "message", "origin": "done"}  # type: ignore[method-assign]
+        terminal_item = SimpleNamespace(type="message", content=[])
+        terminal_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "message",
+            "origin": "terminal",
+        }
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="Hi"),
+            SimpleNamespace(type="response.output_item.done", item=done_item),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None, output=[terminal_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.provider_blocks == [{"type": "message", "origin": "done"}]
+
+    def test_completed_terminal_rebuilds_when_done_events_missing(self) -> None:
+        # A lax server that drops ``output_item.done`` events: the terminal
+        # output holds more items than were collected, so the blocks are
+        # rebuilt from the terminal payload (count mismatch — the same
+        # repair path as truncation's never-done'd trailing item).
+        terminal_item = SimpleNamespace(type="message", content=[])
+        terminal_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "message",
+            "origin": "terminal",
+        }
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="Hi"),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None, output=[terminal_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.provider_blocks == [{"type": "message", "origin": "terminal"}]
 
     def test_usage_extraction(self) -> None:
-        resp = self._make_response(text="Hi")
-        result = self.provider._parse_response(resp)
+        result = self._drain(self._make_events(text="Hi"))
         assert result.usage is not None
         assert result.usage.prompt_tokens == 10
         assert result.usage.completion_tokens == 5
+
+    def test_refusal_renders_in_content(self) -> None:
+        # The response.refusal.done handler (CHANGELOG "refusals render in
+        # content") — a refused turn must not drain to empty content.
+        events = [
+            SimpleNamespace(type="response.refusal.done", refusal="cannot help with that"),
+            *self._make_events(),
+        ]
+        result = self._drain(events)
+        assert result.content == "[Refused: cannot help with that]"
+
+    def test_truncation_rebuilds_blocks_from_terminal_response_output(self) -> None:
+        # The item being generated at max_output_tokens truncation never
+        # receives output_item.done; only the terminal response.output has
+        # it.  Storing the .done-collected list alone would keep a
+        # reasoning item without its required following item — the next
+        # turn's replay 400s.  The terminal event's own output wins.
+        def _item(d: dict) -> SimpleNamespace:
+            item = SimpleNamespace(**{k: v for k, v in d.items() if k != "model_dump"})
+            item.model_dump = lambda d=d, **_kw: d  # type: ignore[method-assign]
+            return item
+
+        reasoning_item = _item({"type": "reasoning", "id": "rs_1", "summary": []})
+        partial_msg = _item({"type": "message", "content": [], "status": "incomplete"})
+        usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        events = [
+            # Only the reasoning item completed before truncation.
+            SimpleNamespace(type="response.output_item.done", item=reasoning_item),
+            SimpleNamespace(
+                type="response.incomplete",
+                response=SimpleNamespace(
+                    status="incomplete",
+                    usage=usage,
+                    output=[reasoning_item, partial_msg],
+                ),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.finish_reason == "length"
+        assert [b["type"] for b in result.provider_blocks] == ["reasoning", "message"]
+
+    def test_error_event_surfaces_real_api_message(self) -> None:
+        # The SDK YIELDS in-band `error` SSE events (ResponseErrorEvent)
+        # rather than raising; without a branch the stream exhausts
+        # finish-less and the real API message hides behind a misleading
+        # IncompleteStreamError.  Deterministic codes stop retries.
+        events = [SimpleNamespace(type="error", code="invalid_request", message="bad tool schema")]
+        with pytest.raises(RuntimeError, match="bad tool schema"):
+            self._drain(events)
+
+    def test_terminal_without_payload_keeps_collected_blocks(self) -> None:
+        # The collected output_item.done blocks came from the stream, not
+        # the missing terminal payload — a payload-less terminal must not
+        # drop them (reasoning items lost = replay degradation).
+        item = SimpleNamespace(type="reasoning", summary=[])
+        item.model_dump = lambda **_kw: {"type": "reasoning", "summary": []}  # type: ignore[method-assign]
+        events = [
+            SimpleNamespace(type="response.output_item.done", item=item),
+            SimpleNamespace(type="response.completed", response=None),
+        ]
+        result = self._drain(events)
+        assert result.finish_reason == "stop"
+        assert result.provider_blocks == [{"type": "reasoning", "summary": []}]
+
+    def test_truncation_rebuild_recovers_annotations(self) -> None:
+        # The message item open at truncation never got output_item.done,
+        # so its annotations were never collected — the terminal rebuild
+        # walks them so truncated web-search turns keep their Sources.
+        ann = MagicMock()
+        ann.type = "url_citation"
+        ann.url_citation = MagicMock(title="Cite", url="https://cite.test")
+        part = SimpleNamespace(type="output_text", text="truncated bod", annotations=[ann])
+        msg_item = SimpleNamespace(type="message", content=[part], status="incomplete")
+        msg_item.model_dump = lambda **_kw: {"type": "message", "content": []}  # type: ignore[method-assign]
+        usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="truncated bod"),
+            SimpleNamespace(
+                type="response.incomplete",
+                response=SimpleNamespace(status="incomplete", usage=usage, output=[msg_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.finish_reason == "length"
+        assert "Sources:" in result.content
+        assert "[Cite](https://cite.test)" in result.content
+
+    def test_transient_error_event_is_retryable(self) -> None:
+        from turnstone.core.providers._openai_responses import ResponsesStreamFailedError
+
+        events = [SimpleNamespace(type="error", code="server_error", message="overloaded")]
+        with pytest.raises(ResponsesStreamFailedError, match="overloaded"):
+            self._drain(events)
+
+    def test_terminal_event_without_payload_still_finishes(self) -> None:
+        # A lax compat server may emit the terminal event with no response
+        # payload — it is still a terminal signal, so the drained stream
+        # completes (without usage/blocks) instead of raising
+        # IncompleteStreamError over a generation that fully arrived.
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="all here"),
+            SimpleNamespace(type="response.completed", response=None),
+        ]
+        result = self._drain(events)
+        assert result.content == "all here"
+        assert result.finish_reason == "stop"
+        assert result.usage is None
+
+    def test_transient_failed_event_raises_typed_retryable_error(self) -> None:
+        # A TRANSIENT in-band response.failed (server_error / rate limit)
+        # raises the typed error the provider advertises as retryable —
+        # retry loops re-run it like the wire errors it stands in for.
+        from turnstone.core.providers._openai_responses import ResponsesStreamFailedError
+
+        events = [
+            SimpleNamespace(
+                type="response.failed",
+                response=SimpleNamespace(
+                    status="failed",
+                    error=SimpleNamespace(message="model overloaded", code="server_error"),
+                ),
+            )
+        ]
+        with pytest.raises(ResponsesStreamFailedError, match="model overloaded"):
+            self._drain(events)
+        assert "ResponsesStreamFailedError" in self.provider.retryable_error_names
+
+    def test_deterministic_failed_event_is_not_retryable(self) -> None:
+        # Deterministic in-band rejections (invalid prompt, image fetch,
+        # policy) re-fail identically on every attempt — they surface as
+        # plain RuntimeError so retry loops stop on attempt zero instead
+        # of running the whole backoff ladder against a doomed request.
+        from turnstone.core.providers._openai_responses import ResponsesStreamFailedError
+
+        events = [
+            SimpleNamespace(
+                type="response.failed",
+                response=SimpleNamespace(
+                    status="failed",
+                    error=SimpleNamespace(message="prompt was rejected", code="invalid_prompt"),
+                ),
+            )
+        ]
+        with pytest.raises(RuntimeError, match="invalid_prompt") as excinfo:
+            self._drain(events)
+        assert not isinstance(excinfo.value, ResponsesStreamFailedError)
+        assert type(excinfo.value).__name__ not in self.provider.retryable_error_names
+
+
+class TestTransportRetryability:
+    """Every provider must advertise the shared transport error as
+    retryable — the drain raises IncompleteStreamError for ALL lanes, so a
+    provider omitting it silently loses retry-on-dead-stream (the
+    complete-or-error contract's second half)."""
+
+    @pytest.mark.parametrize(
+        "provider_name",
+        ["openai", "openai-compatible", "anthropic", "anthropic-compatible", "google", "xai"],
+    )
+    def test_incomplete_stream_error_is_retryable(self, provider_name: str) -> None:
+        from turnstone.core.providers import create_provider
+
+        provider = create_provider(provider_name)
+        assert "IncompleteStreamError" in provider.retryable_error_names

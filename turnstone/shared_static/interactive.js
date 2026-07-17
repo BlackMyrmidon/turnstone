@@ -23,6 +23,9 @@
 import {
   stripAnsi,
   buildWatchResultCard,
+  buildCompactionCard,
+  applyCompactionEvent,
+  resetCompactionHolder,
   buildSystemNudgeMarker,
   buildConvBatchShell,
   buildConvRow,
@@ -44,7 +47,11 @@ import {
   createAttachmentController,
   kindIcon,
 } from "./composer_attachments.js";
-import { createQueueController } from "./composer_queue.js";
+import {
+  createQueueController,
+  parsePriority,
+  settleSendResponse,
+} from "./composer_queue.js";
 import { StatusBar } from "./status_bar.js";
 import { streamingRender, streamingRenderFinalize } from "./renderer.js";
 import { setMarkdown, operatorSourceLabel } from "./utils.js";
@@ -215,6 +222,9 @@ class Pane {
     this.currentReasoningEl = null;
     this.contentBuffer = "";
     this.busy = false;
+    // Provenance of the current busy=true (see setBusy): "server" |
+    // "optimistic" | null when idle.
+    this.busySource = null;
     this.isThinking = false;
     // Acting user (turn initiator) of the in-flight turn, from state_change
     // events; drives the shared-workstream cross-user send gate. Carries the
@@ -261,6 +271,16 @@ class Pane {
     this._scrollPinPending = false;
     this._scrollPinForce = false;
     this._thinkingEl = null;
+    // Compaction lifecycle holder for the shared reducer
+    // (conversation.applyCompactionEvent); `card` is the in-progress card
+    // between start and end, nulled wherever the transcript DOM is wiped.
+    this._compaction = { card: null, cid: null };
+    // Rendered-event-id dedup for system turns and compaction markers
+    // (/history repaint vs live/replayed event — whichever renders first
+    // wins).  replayHistory assigns a FRESH Set on every transcript wipe
+    // so pre-wipe ids can't suppress re-painted rows; this is the
+    // first-load init.
+    this._renderedSystemEventIds = new Set();
     this._retryHolderEl = null;
     this._toolRowIndex = new Map();
     this._streamElIndex = new Map();
@@ -372,8 +392,15 @@ class Pane {
   // reset). queue.onIdleEdge runs only on the actual edge — it carries
   // the heavier work (querySelectorAll-driven promote sweep + cancel-
   // timer cleanup wired via the queue's onIdle hook).
-  setBusy(b) {
+  setBusy(b, source) {
     const next = !!b;
+    // Who asserted busy: "server" (default — state events, thinking_start,
+    // every existing/future writer) or "optimistic" (ONLY the send flow's
+    // pre-POST flip). The deferred/queue_full settle arms may clear busy
+    // solely when it is still this send's own optimistic flip — a server-
+    // stamped busy is a real turn and must never be clobbered. Centralized
+    // HERE so an unstamped future writer fails safe as "server".
+    this.busySource = next ? source || "server" : null;
     this.composer.setBusy(next);
     this.messagesEl.dataset.busy = next ? "true" : "false";
     const edge = next !== this.busy;
@@ -458,6 +485,7 @@ class Pane {
     // Instance ref, not a container query: removeThinkingIndicator runs on
     // EVERY content/reasoning delta, and a class-selector miss walks the
     // whole transcript subtree — O(N) per streamed token at 5000 messages.
+    if (this._compaction.card) return; // the compaction card owns the affordance
     if (this._thinkingEl) return;
     const el = document.createElement("div");
     el.className = "thinking-indicator";
@@ -492,6 +520,15 @@ class Pane {
     // carries structured `meta` (watch_name / command / poll counters) → the
     // richer `.msg.watch-result` card instead of the plain operator bubble.
     this.removeEmptyState();
+    // The /history projection of a persisted compaction marker (an in-place
+    // source="compaction" system row) — render the same result card the live
+    // `compaction` end event paints, so a reload reproduces the transcript.
+    if (source === "compaction") {
+      const card = buildCompactionCard(meta, content || "");
+      this.messagesEl.appendChild(card);
+      this.scrollToBottom(true);
+      return card;
+    }
     if (source === "watch_triggered" && meta && typeof meta === "object") {
       const card = buildWatchResultCard(meta, content || "");
       this.messagesEl.appendChild(card);
@@ -529,6 +566,37 @@ class Pane {
     body.appendChild(labelEl);
     body.appendChild(textEl);
     el.appendChild(body);
+    this.messagesEl.appendChild(el);
+    this.scrollToBottom(true);
+    return el;
+  }
+
+  handleCompactionEvent(evt) {
+    // Shared reducer (conversation.applyCompactionEvent) — one lifecycle
+    // state machine for this pane and the coordinator viewer.  The dedup
+    // set is the same one the system_turn path uses: the persisted marker
+    // row is stamped with the ok-end event's id, so whichever of /history
+    // repaint or live/replayed event renders first wins.  reason="error"
+    // ends render through the paired `error` event (red row), not here.
+    this.removeEmptyState();
+    applyCompactionEvent(this._compaction, evt, {
+      container: this.messagesEl,
+      renderedIds: this._renderedSystemEventIds,
+      onNotice: (msg) => this.addInfoMessage(msg),
+      scroll: (force) => this.scrollToBottom(force),
+    });
+  }
+
+  addCommandEcho(text) {
+    // A slash command is control-plane input, not a conversational turn —
+    // echo it as a distinct command chip (styled like a prompt line), not a
+    // user bubble.  It is deliberately NOT persisted: commands don't join
+    // the trajectory, so a bubble that vanished on reload was a lie.
+    this.removeEmptyState();
+    const el = document.createElement("div");
+    el.className = "msg command-echo";
+    el.setAttribute("aria-label", "command");
+    el.textContent = text;
     this.messagesEl.appendChild(el);
     this.scrollToBottom(true);
     return el;
@@ -586,6 +654,9 @@ class Pane {
     this._addUserMsgActions(el, text);
     this.messagesEl.appendChild(el);
     this.scrollToBottom(true);
+    // Returned so the send flow can retro-convert the optimistic bubble
+    // into a queued chip when the server answers queued+deferred.
+    return el;
   }
 
   // --- Approval-cycle bookkeeping -----------------------------------------
@@ -653,7 +724,7 @@ class Pane {
     if (!el) {
       let target = this._toolRow(callId);
       if (!target) {
-        // A namespaced sub-agent child id ("<parent>::<id>") whose row hasn't
+        // A minted sub-agent child id ("<parent>::r{run}s{step}::<id>") whose row hasn't
         // nested yet must NOT graft its stream onto the last top-level batch —
         // that mislabels a sub-tool's output as a main-harness tool's.  Its row
         // arrives via the orphan flush; skip the chunk until then.
@@ -1643,6 +1714,13 @@ class Pane {
           clearTimeout(this._forceTimeout);
           this._forceTimeout = null;
         }
+        // A live in-progress compaction card at stream_end means a FORCE
+        // stop abandoned the compaction worker (the lifecycle wrapper
+        // otherwise always retires the card with an end event before any
+        // stream_end can follow) — remove it now instead of leaving a
+        // frozen bar until the abandoned worker notices at its next
+        // checkpoint.
+        resetCompactionHolder(this._compaction);
         // Reset the segment state BEFORE the finalize render, and guard the
         // render with a plain-text fallback (mirrors coordinator.js).  With
         // the old order a finalize throw skipped these clears, so every
@@ -1859,11 +1937,7 @@ class Pane {
         // the resume-cursor fix this shouldn't recur, but the guard keeps the
         // /history+replay seam idempotent for system turns regardless.
         const sysEid = evt._event_id != null ? String(evt._event_id) : null;
-        if (
-          sysEid &&
-          this._renderedSystemEventIds &&
-          this._renderedSystemEventIds.has(sysEid)
-        ) {
+        if (sysEid && this._renderedSystemEventIds.has(sysEid)) {
           break;
         }
         this.addSystemContext(
@@ -1871,17 +1945,29 @@ class Pane {
           evt.source || "",
           evt.meta || null,
         );
-        if (sysEid) {
-          if (!this._renderedSystemEventIds)
-            this._renderedSystemEventIds = new Set();
-          this._renderedSystemEventIds.add(sysEid);
-        }
+        if (sysEid) this._renderedSystemEventIds.add(sysEid);
         break;
       }
+
+      case "compaction":
+        // Context-compaction lifecycle: start paints the in-progress card,
+        // progress drives its bar, end swaps it for the result card (or a
+        // failure notice).  See handleCompactionEvent.
+        this.handleCompactionEvent(evt);
+        break;
 
       case "message_queued":
         // Confirmation from server that a queued message was accepted.
         // The UI already showed the message optimistically in addQueuedMessage.
+        break;
+
+      case "message_dispatched":
+        // A deferred send left the parked list: fresh spawn (promote the
+        // chip — the ×'s window is over) or interjection fold-in
+        // (folded: true — only the deferred flag clears; the chip resumes
+        // the normal queued lifecycle). No-op when this tab holds no
+        // matching chip.
+        this.queue.settleDeferred(evt.msg_id, !!evt.folded);
         break;
 
       case "busy_error":
@@ -1969,6 +2055,14 @@ class Pane {
             this._pendingEditSend = null;
             this.setBusy(true);
             this.addUserMessage(editText);
+            // Known settle gap (deliberately deferred, pre-branch path):
+            // this POST consumes only the .catch — a queued/deferred/
+            // queue_full body is silently dropped, so a /compact window
+            // opened from another tab in exactly this instant leaves the
+            // resent message parked with no chip and busy stranded
+            // "server". Narrow (rewind just ran; the slot was ours) and
+            // original-strata; route through settleSendResponse when
+            // this flow is next touched.
             authFetch(
               this._base +
                 "/v1/api/workstreams/" +
@@ -2657,6 +2751,9 @@ class Pane {
     this.currentAssistantBodyEl = null;
     this.currentReasoningEl = null;
     this.contentBuffer = "";
+    // In-progress compaction card: the transcript wipe orphaned it; live
+    // events re-create it defensively (see handleCompactionEvent).
+    resetCompactionHolder(this._compaction);
     // Approval cycles + announce shells point into the wiped subtree too;
     // the replayed history / detail snapshot re-registers live ones.
     this.approvalCycles = new Map();
@@ -3491,7 +3588,7 @@ class Pane {
     }
     let target = this._toolRow(callId);
     if (!target) {
-      // A namespaced sub-agent child id ("<parent>::<id>") whose row hasn't
+      // A minted sub-agent child id ("<parent>::r{run}s{step}::<id>") whose row hasn't
       // nested yet must NOT graft its output onto the last top-level batch row
       // — that mislabels a sub-tool's result as a main-harness tool's.  Its row
       // arrives via the orphan flush; skip until then.
@@ -3606,7 +3703,11 @@ class Pane {
     if (!text) return;
 
     if (text.startsWith("/")) {
-      if (this.busy) return; // commands not allowed while busy
+      if (this.busy) {
+        // Was a silent return — say why nothing happened.
+        this.addInfoMessage("Session is busy — commands can't run mid-turn.");
+        return;
+      }
       // /rewind and /retry were lifted to path-keyed endpoints (#549);
       // reroute hand-typed ones so they don't 400 against /command.
       const parts = text.split(/\s+/);
@@ -3633,30 +3734,81 @@ class Pane {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command: text, ws_id: this.wsId }),
-      });
-      this.addUserMessage(text);
+      })
+        .then((r) =>
+          // Thread {ok, status} alongside the parsed body — the loud
+          // arms below ride NON-2xx codes (busy = 409, error = 503), so
+          // an /send-style throw-on-!ok pre-gate would wrongly reroute
+          // them into the transport catch.
+          r.json().then(
+            (b) => ({ ok: r.ok, status: r.status, body: b || {} }),
+            () => ({ ok: r.ok, status: r.status, body: {} }),
+          ),
+        )
+        .then(({ ok, status, body }) => {
+          // /compact dispatched onto an already-busy worker reports
+          // {status: "busy"} — surface it (the optimistic busy guard
+          // above can lose that race).
+          if (body.status === "busy") {
+            this.addInfoMessage(
+              body.error || "Session is busy — try again shortly.",
+            );
+          } else if (body.status === "running") {
+            // The command outlived the endpoint's completion backstop
+            // (kept under the console proxy's client bound precisely so
+            // this answer can traverse a proxied pane). The worker is
+            // still going; its output and pane refreshes arrive over SSE.
+            this.addInfoMessage(
+              "Command is still running — results will appear here when it finishes.",
+            );
+          } else if (body.status === "error") {
+            // 503: the command worker could not be started (thread
+            // exhaustion) — the command did NOT run. Loud, like the busy
+            // arm: silence here reads as success.
+            this.addErrorMessage(
+              body.error || "Command failed to start — retry shortly.",
+            );
+          } else if (!ok) {
+            // Status-less non-2xx (404 unknown workstream, proxy 502
+            // HTML): the same silence-reads-as-success rule as the arms
+            // above. Rendered directly — not thrown into the catch,
+            // which would double-prefix the message.
+            this.addErrorMessage(
+              body.error || "Command failed (HTTP " + status + ")",
+            );
+          }
+        })
+        .catch((err) => {
+          // Transport failure (network drop, abort): the command-echo
+          // chip is already rendered — say the command did not run.
+          this.addErrorMessage("Command failed: " + err.message);
+        });
+      // Echo as a command chip, not addUserMessage — a slash command is
+      // control-plane input, not a conversational user turn.
+      this.addCommandEcho(text);
       this.composer.clear();
       return;
     }
 
     const isBusy = this.busy;
     let queuedEl = null;
+    let optimisticEl = null;
     const snap = this.attachments.snapshot();
 
+    // Display-only strip of the !!! prefix (the server re-parses it
+    // authoritatively); shared parse so the settle helper's retro-convert
+    // renders the same chip either pane would have built pre-POST.
+    const { displayText, priority } = parsePriority(text);
+
     if (isBusy) {
-      // Server re-parses the !!! prefix to set queue priority — the
-      // optimistic bubble strips it for display.
-      let displayText = text;
-      let priority = "notice";
-      if (text.startsWith("!!!")) {
-        displayText = text.slice(3).trimStart();
-        priority = "important";
-      }
       this.removeEmptyState();
       queuedEl = this.queue.addQueuedMessage(displayText, priority);
     } else {
-      this.setBusy(true);
-      this.addUserMessage(text, snap.attachments);
+      // "optimistic": no server state event asserted this — the settle
+      // arms may undo it if the send turns out deferred/refused (see
+      // setBusy's busySource contract).
+      this.setBusy(true, "optimistic");
+      optimisticEl = this.addUserMessage(text, snap.attachments);
     }
     this.composer.clear();
 
@@ -3677,6 +3829,11 @@ class Pane {
     let sendTimer = null;
     if (sendCtrl) {
       sendInit.signal = sendCtrl.signal;
+      // Flat wedged-node bound: every /send answers within RTT now —
+      // dispatched, queued, or deferred-with-msg_id during a command
+      // window (the server parks nothing against this POST), so a
+      // response slower than this means a wedged node, not a long
+      // command.  Dismissal is bind() → DELETE, never a POST abort.
       sendTimer = setTimeout(() => sendCtrl.abort(), 15000);
     }
     let sendReq = authFetch(
@@ -3725,62 +3882,23 @@ class Pane {
         return r.json();
       })
       .then((data) => {
-        if (data.status === "queued" && data.msg_id) {
-          // queuedEl-present path: bind() handles the three known races
-          // (pre-bind dismiss, promote sweep raced ahead, normal accept).
-          // queuedEl-absent path: client thought it was idle but the
-          // server saw a live worker (SSE state_change hadn't arrived
-          // yet). Flip busy so subsequent sends queue correctly; the
-          // optimistic user bubble is already in the log and the server
-          // still delivers the message on worker drain — accept the
-          // small UX gap (no in-UI dismiss for THIS message).
-          if (queuedEl) this.queue.bind(queuedEl, data.msg_id);
-          else this.setBusy(true);
-          this.attachments.consume(
-            data.attached_ids,
-            data.dropped_attachment_ids,
-          );
-        } else if (data.status === "busy") {
-          if (queuedEl) this.queue.remove(queuedEl);
-          this.addErrorMessage("Server is busy. Please wait.");
-          if (!isBusy) this.setBusy(false);
-        } else if (data.status === "queue_full") {
-          if (queuedEl) this.queue.remove(queuedEl);
-          this.addErrorMessage("Message queue full. Please wait.");
-        } else if (data.status === "attachments_busy") {
-          // Attachments can't ride a queued user turn — server held the
-          // chips' reservations long enough to bounce the request and
-          // released them. Surface to the user; chips stay in the
-          // composer so they can retry once the assistant finishes.
-          if (queuedEl) this.queue.remove(queuedEl);
-          this.addErrorMessage(
-            "Attachments can't be sent while the assistant is working. " +
-              "Send a text-only message now, or wait and resend with attachments.",
-          );
-        } else if (data.status === "cross_user_interjection") {
-          // Another participant's turn is in flight; the server refused the
-          // interjection so it can't run under their credentials or be
-          // misattributed. The send gate normally disables the button first;
-          // this handles the race where the click beat the state_change.
-          if (queuedEl) this.queue.remove(queuedEl);
-          this.addErrorMessage(
-            data.error ||
-              "Another participant's turn is in progress. Wait for it to " +
-                "finish, then send your message.",
-          );
-          if (!isBusy) this.setBusy(false);
-        } else {
-          // Unknown / "ok" status (e.g. the stale-busy race: the client
-          // optimistically queued but the server ran the send on a fresh
-          // worker). Settle the optimistic bubble as a normal sent message
-          // so a pre-bind × can't strand it in the dismissing state;
-          // promote() notifies "already sent" if it was dismissed.
-          if (queuedEl) this.queue.promote(queuedEl);
-          this.attachments.consume(
-            data.attached_ids,
-            data.dropped_attachment_ids,
-          );
-        }
+        // The full status dispatch (queued/retro-convert, busy,
+        // queue_full, attachments_busy, cross_user, unknown-ok) lives in
+        // the shared helper — ONE settle matrix for both panes; see
+        // settleSendResponse's contract for the arm semantics.
+        settleSendResponse(this.queue, data, {
+          queuedEl,
+          optimisticEl,
+          isBusy,
+          displayText,
+          priority,
+          setBusy: (b) => this.setBusy(b),
+          busyIsOptimistic: () => this.busy && this.busySource === "optimistic",
+          paneIsBusy: () => this.busy,
+          renderError: (msg) => this.addErrorMessage(msg),
+          consumeAttachments: (attached, droppedIds) =>
+            this.attachments.consume(attached, droppedIds),
+        });
       })
       .catch((err) => {
         if (queuedEl) this.queue.remove(queuedEl);
@@ -4453,7 +4571,27 @@ function buildMcpErrorEmbed(err, rawJson, onConsent) {
     body.appendChild(scopesLine);
   }
 
-  if (category === "actionable") {
+  // Render the Connect / Re-consent button only when the dispatcher actually
+  // supplied a per-server consent URL. An "actionable"-category code with no
+  // consent_url means there is no per-server consent flow for this server —
+  // sign-in passthrough (oauth_obo) mints from the user's Turnstone sign-in and
+  // is deliberately absent from the Settings connections list and rejected by
+  // /start — so a button here would dead-end ("no consent URL; open Settings"
+  // pointing at a panel with nothing to connect). In that case the honest
+  // remedy is the detail text (sign in again / ask your administrator), so we
+  // show the card without a broken affordance.
+  //
+  // This never wrongly hides a needed button for oauth_user: the backend
+  // invariant is that _build_consent_url returns a /v1/api/mcp/oauth/start URL
+  // for EVERY oauth_user row and None only for non-oauth_user auth types, so an
+  // oauth_user actionable error always carries a valid consent_url and always
+  // renders its button. The removed click-time "open Settings" fallback guarded
+  // a producer path that that invariant makes unreachable.
+  const consentUrl = err.consent_url;
+  const hasConsentAffordance =
+    typeof consentUrl === "string" &&
+    consentUrl.startsWith("/v1/api/mcp/oauth/start");
+  if (category === "actionable" && hasConsentAffordance) {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "mcp-error-action-btn";
@@ -4469,20 +4607,10 @@ function buildMcpErrorEmbed(err, rawJson, onConsent) {
         : "Connect to " + serverLabel,
     );
     btn.addEventListener("click", function () {
-      const consentUrl = err.consent_url;
-      if (!consentUrl || typeof consentUrl !== "string") {
-        // Defensive: should always be present per the dispatcher.  If a
-        // path forgets to include it the user can still connect via the
-        // Settings panel (gear icon).
-        showToast("No consent URL available; open Settings to connect.");
-        return;
-      }
-      // Defence-in-depth: reject anything that isn't path-relative to
-      // the dispatcher's known prefix. ``_build_consent_url`` always
-      // emits ``/v1/api/mcp/oauth/start?...`` — a non-prefix value
-      // would indicate a future producer drift or a compromised
-      // dispatcher, and ``window.open("javascript:...")`` would be
-      // catastrophic. Never rely on the producer-side guarantee alone.
+      // Defence-in-depth: the render gate already proved the prefix, but
+      // re-check at click time — a non-prefix value would indicate producer
+      // drift or a compromised dispatcher, and window.open("javascript:...")
+      // would be catastrophic. Never rely on the producer-side guarantee alone.
       if (!consentUrl.startsWith("/v1/api/mcp/oauth/start")) {
         showToast("Invalid consent URL");
         return;

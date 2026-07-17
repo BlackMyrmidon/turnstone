@@ -677,6 +677,82 @@ def test_audio_roles_gated_to_openai_sdk_providers() -> None:
     assert '_providerCarriesAudio((md && md.provider) || "openai")' in body
 
 
+def test_model_response_controls_are_capability_driven_and_sparse() -> None:
+    """The model shelf surfaces Responses-only scalar controls without
+    hard-coding GPT-5.6 IDs or pinning inherited capability-table values."""
+    html = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+
+    assert 'id="model-response-controls"' in html
+    assert 'aria-labelledby="model-response-controls-title"' in html
+    assert 'id="model-output-verbosity"' in html
+    assert 'for="model-output-verbosity"' in html
+    assert 'id="model-reasoning-mode"' in html
+    assert 'for="model-reasoning-mode"' in html
+    for value in ("low", "medium", "high"):
+        assert f'<option value="{value}">' in html
+    for value in ("standard", "pro"):
+        assert f'<option value="{value}">' in html
+    assert 'data-cap="supports_verbosity"' in html
+    assert 'data-cap="supports_pro_mode"' in html
+
+    assert '"supports_verbosity"' in admin
+    assert '"supports_pro_mode"' in admin
+    surface = _slice_function_body(admin, "_modelUsesResponsesSurface")
+    assert surface is not None
+    assert 'provider === "openai"' in surface
+    assert 'provider === "openai-compatible"' in surface
+    assert 'value === "responses"' in surface
+    visibility = _slice_function_body(admin, "_updateModelResponseControls")
+    assert visibility is not None
+    assert "_modelGetTile(spec.supportKey)" in visibility
+    assert 'supportKey: "supports_verbosity"' in admin
+    assert 'supportKey: "supports_pro_mode"' in admin
+    assert "gpt-5.6" not in visibility, "visibility must come from capabilities, not model IDs"
+
+    assert "function _captureModelResponseControls(" in admin
+    assert "function _mergeModelResponseControls(" in admin
+    assert "_captureModelResponseControls(capsObj)" in admin
+    assert "_mergeModelResponseControls(caps)" in admin
+    assert "let _modelResponseCaptured = {};" in admin
+    assert "let _modelResponseDirty = {};" in admin
+    assert "_modelResponseCaptured[spec.key] = value" in admin
+    assert "nextIdentity === _modelResponseInitialIdentity" in admin
+    identity = _slice_function_body(admin, "_modelIdentity")
+    assert identity is not None
+    assert 'provider === "openai-compatible"' in identity
+    assert ': ""' in identity
+    merge = _slice_function_body(admin, "_mergeModelResponseControls")
+    assert merge is not None
+    # The dirty flag (select touched) may only override Advanced JSON for
+    # the identity that made it dirty — a stale flag from a renamed row
+    # must not delete a hand-typed JSON key.
+    assert "if (_modelResponseDirty[spec.key] && sameIdentity) delete caps[spec.key]" in merge
+    # The captured-value fallback is load-bearing, not a gating bug: a value
+    # lifted out of the row JSON on edit-open must stay visible and re-save
+    # for the same identity even when the baseline table says unsupported.
+    # The baseline arrives async (or never, on the compat lane); yielding to
+    # it would silently drop the pinned value on an unrelated edit-save.
+    # Wire safety lives server-side (emission gates on merged supports_*).
+    for body in (visibility, merge):
+        assert "_modelGetTile(spec.supportKey) || capturedFallback" in body
+        assert "sameIdentity" in body
+        assert "!(spec.supportKey in _modelCapsExplicit)" in body
+
+    create = _slice_function_body(admin, "showCreateModelModal")
+    assert create is not None
+    assert "_modelCapsSeq++" in create, "a fresh shelf must invalidate prior lookups"
+
+    assert "displayCaps.supports_verbosity !== false" in admin
+    assert "displayCaps.supports_pro_mode !== false" in admin
+
+    change = _slice_function_body(admin, "_onModelFieldChange")
+    assert change is not None
+    assert "_modelCapsSeq++" in change, "model changes must invalidate in-flight baselines"
+    assert "_modelCapsBaseline = {}" in change
+    assert 'apiSurfEl.addEventListener("change", _onModelFieldChange)' in admin
+
+
 def test_shared_utils_defines_set_markdown_helper() -> None:
     """The ``setMarkdown`` helper in ``shared/utils.js`` is the single
     audited entry point for rendering markdown content into a DOM
@@ -797,6 +873,30 @@ def test_phase8_xss_safe_render_in_build_mcp_error_embed() -> None:
         "server names and detail strings flow through here. An "
         "adversarial server name must render harmlessly via "
         "textContent."
+    )
+
+
+def test_mcp_error_button_gated_on_consent_url_not_code_alone() -> None:
+    """Review finding: the chat error card rendered a Connect / Re-consent
+    button from the error CODE alone, so an oauth_obo error (consent_url=None,
+    since sign-in passthrough has no per-server consent flow and /start rejects
+    obo rows) produced a button that dead-ended in a 'no consent URL' toast.
+    The button must render only when a valid per-server consent URL is present —
+    obo errors show the card's honest detail text without a broken affordance."""
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    start = body.index("function buildMcpErrorEmbed(")
+    rest = body[start:]
+    end_match = re.search(r"\n}\n", rest)
+    assert end_match is not None
+    fn = rest[: end_match.end()]
+    # The render gate combines the category with a consent-URL presence check.
+    assert "hasConsentAffordance" in fn, (
+        "buildMcpErrorEmbed must gate the action button on the presence of a "
+        "consent URL, not on the error category alone."
+    )
+    assert 'category === "actionable" && hasConsentAffordance' in fn, (
+        "the button-render condition must require BOTH an actionable category "
+        "and a real consent URL"
     )
 
 

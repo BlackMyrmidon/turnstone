@@ -7,6 +7,7 @@ model auto-detection, workstream management, and the main() REPL entry point.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import readline
@@ -300,7 +301,9 @@ class TerminalUI(SessionUI):
         total_tok = usage["prompt_tokens"] + usage["completion_tokens"]
         pct = total_tok / context_window * 100 if context_window > 0 else 0
         parts = [f"{total_tok:,} / {context_window:,} tokens ({pct:.0f}%)"]
-        if effort != "medium":
+        # Any resolved effort shows — "medium" is no longer a code default
+        # to hide, it only appears when someone explicitly chose it.
+        if effort:
             parts.append(f"reasoning: {effort}")
         sys.stdout.write(f"\n  {DIM}[{' · '.join(parts)}]{RESET}\n")
         sys.stdout.flush()
@@ -324,6 +327,13 @@ class TerminalUI(SessionUI):
         label = "operator" + (f" · {source}" if source else "")
         sys.stdout.write(f"{YELLOW}[{label}]{RESET} {content}\n")
         sys.stdout.flush()
+
+    # No on_compaction override: TerminalUI subclasses SessionUI
+    # explicitly, and the inherited protocol default body IS the
+    # terminal's classic rendering (render_compaction_event_as_info via
+    # on_info — see SessionUI.on_compaction).  A byte-identical override
+    # here silently forked the policy site: a future change to the
+    # default stopped applying to the CLI.
 
     def on_state_change(self, state: str) -> None:
         pass  # base TerminalUI ignores state changes
@@ -920,6 +930,41 @@ def resolve_cli_persona_kwargs(
     return {}
 
 
+def _close_all_sessions(manager: SessionManager) -> None:
+    """Close EVERY loaded session at CLI exit — not just the active one.
+
+    ``ChatSession.close()`` removes MCP listeners AND reaps the workstream's
+    background shells (#817).  An active-only close would let a dev server
+    started in workstream 1 survive ``/new`` + ``/exit`` forever: its
+    detached process group outlives this process — the exact leaked-server
+    class #816 removed.
+
+    Two phases so total exit latency doesn't stack per workstream: the kill
+    signals land on EVERY session's shells first (microseconds each — after
+    which nothing can outlive us), then the per-session closes pay their
+    join budgets, which are near-zero once the kills have landed.  A Ctrl-C
+    during the close phase degrades gracefully instead of aborting the
+    sweep: the signals are already delivered, the remaining joins are
+    skipped, and the caller still runs MCP/registry shutdown.  Best-effort
+    per workstream either way — one bad teardown must not stop the rest.
+    """
+    loaded = [(ws.id, ws.session) for ws in manager.list_all() if ws.session is not None]
+    for _ws_id, session in loaded:
+        with contextlib.suppress(Exception):
+            session._background_shells.signal_all()
+    try:
+        for ws_id, session in loaded:
+            try:
+                session.close()
+            except Exception:
+                print(dim(f"  (workstream {ws_id[:8]} teardown error, continuing)"))
+    except KeyboardInterrupt:
+        # The kills above already landed; skipping the remaining joins
+        # leaks nothing — it only abandons wedged drain threads that die
+        # with this process anyway.
+        print(dim("  (interrupted — background shells already signalled)"))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Interactive CLI for OpenAI-compatible models with tool calling.",
@@ -962,8 +1007,11 @@ def main() -> None:
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.5,
-        help="Sampling temperature (default: 0.5)",
+        default=None,
+        help=(
+            "Sampling temperature (default: the model's configured value, "
+            "else the field is omitted and the serving default applies)"
+        ),
     )
     parser.add_argument(
         "--max-tokens",
@@ -979,9 +1027,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--reasoning-effort",
-        default="medium",
-        choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-        help="Reasoning effort level (default: medium)",
+        default="",
+        choices=["", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        help=(
+            "Reasoning effort level (default: the model's configured or "
+            "declared value, else the serving default)"
+        ),
     )
     parser.add_argument(
         "--provider",
@@ -1222,16 +1273,30 @@ def main() -> None:
     ) -> ChatSession:
         assert ui is not None, "session_factory requires a non-None UI"
         del project_id
+        from turnstone.core.model_turn import (
+            resolve_effort_setting,
+            resolve_temperature_setting,
+        )
+
         r_client, r_model, r_cfg = registry.resolve(model_alias)
+        # An explicit CLI flag is the user speaking; otherwise the knobs
+        # ride the shared assignment scheme (the CLI has no ConfigStore,
+        # so the rungs are the model config, then unset = wire omission).
+        eff_temperature = (
+            args.temperature
+            if args.temperature is not None
+            else resolve_temperature_setting(r_cfg, None)
+        )
+        eff_effort = args.reasoning_effort or resolve_effort_setting(r_cfg, None)
         return ChatSession(
             client=r_client,
             model=r_model,
             ui=ui,
             instructions=args.instructions,
-            temperature=args.temperature,
+            temperature=eff_temperature,
             max_tokens=args.max_tokens,
             tool_timeout=args.tool_timeout,
-            reasoning_effort=args.reasoning_effort,
+            reasoning_effort=eff_effort,
             context_window=r_cfg.context_window,
             compact_max_tokens=args.compact_max_tokens,
             auto_compact_pct=args.auto_compact_pct,
@@ -1389,9 +1454,7 @@ def main() -> None:
             except Exception as e:
                 print(f"\n{red(f'Error: {e}')}")
 
-    # Close active session (removes MCP listener) before shutting down MCP
-    if active and active.session:
-        active.session.close()
+    _close_all_sessions(manager)
     if mcp_client:
         mcp_client.shutdown()
     registry.shutdown()

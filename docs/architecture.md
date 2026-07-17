@@ -609,8 +609,7 @@ LLMProvider (protocol)
 
 | Method | Purpose |
 |--------|---------|
-| `create_streaming()` | Streaming request, yields normalized `StreamChunk` objects |
-| `create_completion()` | Non-streaming request, returns `CompletionResult` |
+| `create_streaming()` | The one transport: streaming request, yields normalized `StreamChunk` objects (single-shot callers accumulate via `drain_stream()` into a `CompletionResult`) |
 | `get_capabilities()` | Per-model flags (`ModelCapabilities`) |
 | `convert_tools()` | Translate OpenAI tool schemas to provider format |
 | `retryable_error_names` | Exception class names that trigger retry |
@@ -622,19 +621,19 @@ LLMProvider (protocol)
 |------|--------|
 | `StreamChunk` | `content_delta`, `reasoning_delta`, `tool_call_deltas`, `info_delta`, `usage`, `finish_reason`, `provider_blocks` |
 | `CompletionResult` | `content`, `tool_calls`, `finish_reason`, `usage`, `provider_blocks` |
-| `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort`, `supports_web_search`, `supports_tool_search`, `supports_vision`, `supports_reasoning_replay` |
+| `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort`, `supports_web_search`, `supports_tool_search`, `supports_vision`, `supports_reasoning_replay`, `supports_verbosity`, `verbosity`, `supports_pro_mode`, `reasoning_mode` |
 | `UsageInfo` | `prompt_tokens`, `completion_tokens`, `total_tokens`, `cache_creation_tokens`, `cache_read_tokens` |
 
 **OpenAIProvider** (`_openai.py`): passes messages through unchanged (they are
 already in OpenAI format), including multi-part content blocks (text + images)
-in tool results. Model capability lookup table covers GPT-5/5.1/5.2/5.3/5.4,
+in tool results. Model capability lookup covers GPT-5 through GPT-5.6,
 O-series, and search models (`gpt-5-search-api`) — all with `supports_vision`.
 For search models, injects `web_search_options` and removes the `web_search`
 function tool (the model always searches). Citations from `url_citation`
-annotations are formatted as footnotes. Extended prompt cache retention
-(`prompt_cache_retention: "24h"`) is enabled for GPT-5.x models at no
-additional cost. Cached token counts are extracted from
-`usage.prompt_tokens_details.cached_tokens`. Unknown models get permissive
+annotations are formatted as footnotes. Pre-5.6 GPT-5 models request extended
+prompt-cache retention (`prompt_cache_retention: "24h"`); GPT-5.6 uses
+`prompt_cache_options.ttl: "30m"`. Cache reads and writes are extracted from
+`cached_tokens` and `cache_write_tokens`. Unknown models get permissive
 defaults with `supports_vision=False` and use SearxNG for web search. The
 `openai-compatible` lane never consults this table at all — on either API
 surface (the responses pin is served by a compat-mode
@@ -642,8 +641,9 @@ surface (the responses pin is served by a compat-mode
 local server serves whatever the operator named it (vLLM
 `--served-model-name` is a free string), so a prefix collision with a cloud
 model id must not inherit that model's sampling/effort contract — every
-local model gets the plain defaults, and anything beyond them is declared on
-the model definition (capabilities JSON + `server_compat`), matching the
+local model gets the plain defaults, commercial prompt-cache controls are not
+injected by model-name prefix, and anything beyond those defaults is declared
+on the model definition (capabilities JSON + `server_compat`), matching the
 `anthropic-compatible` lane.
 
 **AnthropicProvider** (`_anthropic.py`): converts OpenAI-format messages to
@@ -662,7 +662,7 @@ display). Automatic prompt caching is enabled via top-level `cache_control:
 cacheable block and advances it as conversations grow (90% input cost
 reduction on cache hits, 1.25x write on first turn). Cache metrics
 (`cache_creation_input_tokens`, `cache_read_input_tokens`) are extracted from
-both streaming and non-streaming responses. The `anthropic` SDK is a core
+the stream's usage events. The `anthropic` SDK is a core
 dependency — the Anthropic provider is first-class alongside OpenAI.
 
 **GoogleProvider** (`_google.py`): extends `OpenAIChatCompletionsProvider` for
@@ -1149,20 +1149,30 @@ Named (aliased) workstreams are never age-pruned. Configure with
 
 ### API Retry
 
-`ChatSession._create_stream_with_retry()` (streaming path) and the agent
-`_api_call()` (non-streaming) both use the same retry pattern:
+Every model call streams (#831); retry lives at two stacked layers:
 
-- **Retries**: 4 total attempts (1 initial + 3 retries, `_MAX_RETRIES = 3`)
-- **Backoff**: exponential, base 1 second (`delay = 1s * 2^attempt`)
-- **Retryable errors**: `RateLimitError`, `APITimeoutError`,
-  `APIConnectionError`, `InternalServerError`, `ServiceUnavailableError`,
-  `APIError` (matched by class name to avoid importing backend-specific
-  exception hierarchies)
-- On retry: `ui.on_info()` notification
-- On final failure: exception propagates
-
-`_compact_messages()` also wraps its non-streaming API call in the same
-retry loop.
+- **Caller ladders** — `ChatSession._create_stream_with_retry()` (chat
+  loop) and the agent `_api_call()` (drained via `model_turn`) use the
+  same pattern: 4 total attempts (1 initial + 3 retries,
+  `_MAX_RETRIES = 3`), exponential backoff base 1 second
+  (`delay = 1s * 2^attempt`), `ui.on_info()` on retry, exception
+  propagates on final failure. `_compact_messages()` wraps its drained
+  call in the same loop.
+- **`model_turn`'s drain ladder** — inside every single-shot call,
+  mid-stream deaths (errors raised while draining, e.g.
+  `IncompleteStreamError`) are re-issued up to 2 more times with a
+  0.5s-base exponential backoff (±50% jitter); request-time failures
+  keep the SDK's own retry policy. The two ladders stack
+  multiplicatively on transient-shaped failures.
+- **Retryable errors** are matched by class name against each
+  provider's `retryable_error_names` (avoids importing
+  backend-specific exception hierarchies): `RateLimitError`,
+  `APITimeoutError`, `APIConnectionError`, `InternalServerError`,
+  `ServiceUnavailableError`, `APIError`, plus the drained-transport
+  errors `IncompleteStreamError` (stream ended with no terminal
+  signal — for servers that never send one, declare
+  `finish_reason_optional` in the model's capabilities JSON) and
+  `ResponsesStreamFailedError` (transient in-band Responses failure).
 
 ### Finish Reason Handling
 
@@ -1175,7 +1185,7 @@ retry loop.
   blocked.
 
 Agent sub-sessions (`_run_agent()`) check `finish_reason` on each
-non-streaming response and stop the agent early on `"length"` or
+drained turn and stop the agent early on `"length"` or
 `"content_filter"`.
 
 `_compact_messages()` checks `finish_reason` on the compaction response and

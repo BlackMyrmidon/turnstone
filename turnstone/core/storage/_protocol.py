@@ -13,6 +13,16 @@ if TYPE_CHECKING:
     from turnstone.core.workstream import WorkstreamKind
 
 
+#: MCP auth types whose connections and per-user token rows are keyed
+#: per-(user, server): ``oauth_user`` (per-server browser consent + refresh
+#: token) and ``oauth_obo`` (minted on demand from the user's single captured
+#: credential, issue #551). Defined here — the bottom of the import graph — so
+#: the backend SQL predicates (``any_user_scoped_mcp_servers``) and the
+#: application layer (via :mod:`turnstone.core.mcp_crypto`, which re-exports
+#: it) agree on ONE set that cannot drift.
+USER_SCOPED_AUTH_TYPES: frozenset[str] = frozenset({"oauth_user", "oauth_obo"})
+
+
 class StorageConflictError(Exception):
     """Raised by storage methods when a unique-constraint violation occurs.
 
@@ -36,6 +46,23 @@ class OIDCIdentity(TypedDict):
     # "" when the IdP did not supply them.
     oid: str
     tid: str
+
+
+class OIDCUserCredential(TypedDict):
+    """Row shape for the per-(user, issuer) captured IdP refresh token.
+
+    ``refresh_token_ct`` is a Fernet ciphertext blob (same envelope as
+    ``mcp_user_tokens``); the storage layer returns it verbatim and
+    ``MCPTokenStore`` handles encrypt/decrypt.  One row per user per
+    issuer — the single credential that ``auth_type='oauth_obo'`` MCP
+    servers redeem on demand (issue #551).
+    """
+
+    user_id: str
+    issuer: str
+    refresh_token_ct: bytes
+    created: str
+    last_refreshed: str
 
 
 class OIDCPendingState(TypedDict):
@@ -200,7 +227,12 @@ class StorageBackend(Protocol):
         ...
 
     def load_messages(
-        self, ws_id: str, *, limit: int | None = None, repair: bool = True
+        self,
+        ws_id: str,
+        *,
+        limit: int | None = None,
+        repair: bool = True,
+        include_compaction: bool = False,
     ) -> list[dict[str, Any]]:
         """Load messages for a workstream and reconstruct OpenAI message format.
 
@@ -224,6 +256,13 @@ class StorageBackend(Protocol):
         Attachments are resolved to inline content parts (the materialized
         bytes a display/export consumer needs); :meth:`load_message_turns` is
         the unresolved, by-reference counterpart for resume.
+
+        ``include_compaction`` (default False) surfaces persisted compaction
+        checkpoint markers as in-place ``role="system"`` display rows
+        (``_source="compaction"``, ``meta`` = watermark/token counts) instead
+        of dropping them — the ``/history`` display path passes True so the
+        UI can re-render its compaction card after a reload; export/search
+        keep the unannotated transcript.
         """
         ...
 
@@ -995,6 +1034,39 @@ class StorageBackend(Protocol):
 
     def delete_oidc_identity(self, issuer: str, subject: str) -> bool:
         """Remove an OIDC identity link. Returns True if existed."""
+        ...
+
+    # -- OIDC user credential (single-credential MCP minting, #551) -------------
+
+    def upsert_oidc_user_credential(
+        self, user_id: str, issuer: str, *, refresh_token_ct: bytes
+    ) -> None:
+        """Create or replace the user's captured IdP refresh token.
+
+        Replace-on-conflict: a fresh login must overwrite a stale or
+        revoked credential.  ``created`` is preserved on replace;
+        ``last_refreshed`` is reset to now either way.
+        """
+        ...
+
+    def get_oidc_user_credential(self, user_id: str, issuer: str) -> OIDCUserCredential | None:
+        """Return the captured credential row or None."""
+        ...
+
+    def update_oidc_user_credential_refresh(
+        self, user_id: str, issuer: str, *, refresh_token_ct: bytes
+    ) -> bool:
+        """Rotation write-back after a redemption returned a new refresh token.
+
+        Both verified grant legs rotate (Entra returns a new RT per
+        redemption; Keycloak rotates on the refresh grant), so the mint
+        path MUST persist the newest token every time.  Returns True when
+        a row was updated.
+        """
+        ...
+
+    def delete_oidc_user_credential(self, user_id: str, issuer: str) -> bool:
+        """Remove the captured credential (logout-all / admin revoke). Returns True if existed."""
         ...
 
     # -- OIDC pending state ----------------------------------------------------
@@ -2312,13 +2384,16 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def any_oauth_user_mcp_servers(self) -> bool:
-        """Install-level gate for OAuth-MCP features.
+    def any_user_scoped_mcp_servers(self) -> bool:
+        """Install-level gate for the pending-consent badge (issue #551).
 
-        Returns True iff at least one ``mcp_servers`` row has
-        ``auth_type='oauth_user'``.  Used to short-circuit the pending-
-        consent badge endpoint to ``{pending: 0}`` on local-auth installs
-        with no OAuth MCP servers, so those code paths exercise zero new
+        Returns True iff at least one ``mcp_servers`` row is pool-backed
+        (``auth_type`` in ``oauth_user`` / ``oauth_obo``) — both write
+        ``mcp_pending_consent`` rows on a non-interactive dispatch failure, so
+        an oauth_obo-only install must NOT short-circuit the badge to
+        ``{pending: 0}`` (that would hide the re-login affordance). Used to
+        short-circuit the pending-consent badge endpoint on local-auth installs
+        with no pool-backed MCP servers, so those code paths exercise zero new
         storage queries.
         """
         ...

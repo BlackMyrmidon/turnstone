@@ -22,6 +22,12 @@ from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 from turnstone.core.audit import record_audit
 from turnstone.core.log import get_logger
 
+# USER_SCOPED_AUTH_TYPES lives in storage._protocol — the bottom of the import
+# graph — so the backend SQL predicates (any_user_scoped_mcp_servers) share the
+# SAME object as the application layer; this module re-exports it (mcp_oauth
+# re-exports in turn).
+from turnstone.core.storage._protocol import USER_SCOPED_AUTH_TYPES as USER_SCOPED_AUTH_TYPES
+
 if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
@@ -31,10 +37,33 @@ log = get_logger(__name__)
 _KEY_BYTES = 32  # Fernet requires 32 bytes
 _KEY_FINGERPRINT_BYTES = 8  # short hex prefix for audit/error fields
 
+
+# MCP auth types whose connections and per-user rows are keyed per-(user, server):
+# oauth_user (per-server browser consent + refresh token) and oauth_obo (minted
+# on demand from the user's single captured credential, issue #551) — the
+# USER_SCOPED_AUTH_TYPES set imported above. Both types persist encrypted
+# per-user rows, so both force the token-encryption-key requirement at startup
+# (see initialize_mcp_crypto_state).
+def is_user_scoped_auth(auth_type: str | None) -> bool:
+    """True when *auth_type* uses per-(user, server) connections and tokens."""
+    return auth_type in USER_SCOPED_AUTH_TYPES
+
+
 # Operator-facing hint for malformed/missing keys.
 _KEY_GEN_HINT = (
     "regenerate with: python -c 'from cryptography.fernet import Fernet; "
     "print(Fernet.generate_key().decode())'"
+)
+
+# Operator-facing tail for the two startup key-requirement SystemExit logs
+# (user-scoped servers / credential capture) — one copy so the guidance
+# can't drift between them.
+_STARTUP_KEY_REQUIRED_HINT = (
+    "no [security] mcp_token_encryption_keys (rotation list) or "
+    "mcp_token_encryption_key (single) in config.toml. Generate a key with: "
+    "python -c 'from cryptography.fernet import Fernet; "
+    "print(Fernet.generate_key().decode())' "
+    "and add it to your config.toml."
 )
 
 
@@ -88,6 +117,21 @@ class MCPUserTokenPlain(TypedDict):
     audience: str
     created: str
     last_refreshed: str | None
+
+
+class OIDCCredentialPlain(TypedDict):
+    """Plaintext shape returned by ``MCPTokenStore.get_oidc_credential``.
+
+    Mirrors ``OIDCUserCredential`` (storage row shape) with the refresh
+    token decrypted — the per-(user, issuer) credential that
+    ``auth_type='oauth_obo'`` servers redeem on demand (issue #551).
+    """
+
+    user_id: str
+    issuer: str
+    refresh_token: str
+    created: str
+    last_refreshed: str
 
 
 class MCPUserTokenMetadata(TypedDict):
@@ -378,6 +422,70 @@ class MCPTokenStore:
         """Delete the user-token row. Returns True if existed."""
         return self._storage.delete_mcp_user_token(user_id, server_name)
 
+    # -- OIDC user credential (single-credential MCP minting, #551) -------------
+    #
+    # Same cipher envelope as the per-(user, server) tokens above; lives on
+    # this store so there is exactly one owner of the encryption keys.
+
+    def upsert_oidc_credential(self, user_id: str, issuer: str, *, refresh_token: str) -> None:
+        """Encrypt and create-or-replace the user's captured IdP refresh token."""
+        refresh_ct = self._cipher.encrypt(refresh_token.encode("utf-8"))
+        self._storage.upsert_oidc_user_credential(user_id, issuer, refresh_token_ct=refresh_ct)
+
+    def get_oidc_credential(self, user_id: str, issuer: str) -> OIDCCredentialPlain | None:
+        """Returns plaintext dict or None.
+
+        Raises ``MCPTokenDecryptError`` on key mismatch — caller MUST NOT
+        auto-delete the row (same contract as ``get_user_token``).
+        """
+        row = self._storage.get_oidc_user_credential(user_id, issuer)
+        if row is None:
+            return None
+        try:
+            refresh_pt = self._cipher.decrypt(row["refresh_token_ct"]).decode("utf-8")
+        except MCPTokenDecryptError as exc:
+            self._audit_decrypt_failure(f"oidc:{issuer}", exc.key_fingerprints_attempted)
+            raise
+        return OIDCCredentialPlain(
+            user_id=row["user_id"],
+            issuer=row["issuer"],
+            refresh_token=refresh_pt,
+            created=row["created"],
+            last_refreshed=row["last_refreshed"],
+        )
+
+    def update_oidc_credential_after_redeem(
+        self, user_id: str, issuer: str, *, refresh_token: str, expected_current: str
+    ) -> bool:
+        """Rotation write-back: persist the newest refresh token after a
+        redemption returned one (both verified grant legs rotate).
+        Returns True when the row was updated.
+
+        Value compare-and-swap on *expected_current* (the refresh token the mint
+        read before redeeming): the write only lands when the STORED credential
+        still decrypts to that value. This stops a rotation from clobbering a
+        credential a concurrent LOGIN capture just refreshed — the capture writes
+        the freshest token during the mint's in-flight redemption POST, so by the
+        time this write-back runs the stored value already differs from
+        ``expected_current`` and the stale rotated token is dropped instead of
+        overwriting the fresh login one. (The compare can't be done on ciphertext
+        — Fernet is non-deterministic — so it decrypts the current row. The mint
+        holds the per-issuer credential lock, so the only racer is the unlocked
+        capture, narrowing the residual window to this method's own read→write
+        gap; a capture landing there self-heals on the user's next login.)
+        """
+        current = self.get_oidc_credential(user_id, issuer)
+        if current is None or current["refresh_token"] != expected_current:
+            return False
+        refresh_ct = self._cipher.encrypt(refresh_token.encode("utf-8"))
+        return self._storage.update_oidc_user_credential_refresh(
+            user_id, issuer, refresh_token_ct=refresh_ct
+        )
+
+    def delete_oidc_credential(self, user_id: str, issuer: str) -> bool:
+        """Remove the captured credential (logout-all / admin revoke)."""
+        return self._storage.delete_oidc_user_credential(user_id, issuer)
+
     def list_user_token_metadata(self, user_id: str) -> list[MCPUserTokenMetadata]:
         """Return non-secret metadata for every token row owned by ``user_id``.
 
@@ -488,11 +596,14 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
     1. ``load_mcp_token_cipher_config()`` — wrapped in try/except. Raises
        :class:`SystemExit(1)` on :class:`MCPTokenKeyConfigError` after
        logging.
-    2. Counts ``mcp_servers`` rows with ``auth_type='oauth_user'``. If
+    2. Counts ``mcp_servers`` rows with a user-scoped ``auth_type``
+       (``oauth_user`` or ``oauth_obo``; see ``is_user_scoped_auth``). If
        any exist AND no key is configured, raises ``SystemExit(1)``.
+       Same enforcement when ``[oidc] capture_user_credential`` is
+       enabled (the captured IdP credential must be encrypted at rest).
     3. On success, sets ``app_state.mcp_token_cipher`` and
        ``app_state.mcp_token_store`` (both possibly ``None`` when no
-       key + no oauth_user rows).
+       key + no user-scoped rows).
 
     The helper is shared by ``turnstone/server.py:_lifespan`` and
     ``turnstone/console/server.py:_lifespan``.  A separate
@@ -508,19 +619,45 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
         raise SystemExit(1) from exc
 
     storage = get_storage()
-    oauth_user_count = sum(
-        1 for row in storage.list_mcp_servers() if row.get("auth_type") == "oauth_user"
+    # Both pool-backed types persist encrypted per-user rows (oauth_user:
+    # tokens + refresh; oauth_obo: minted-token cache), so both force the
+    # key requirement — USER_SCOPED_AUTH_TYPES is the single source of truth
+    # (defined above in this leaf module; mcp_oauth re-exports it).
+    user_scoped_count = sum(
+        1 for row in storage.list_mcp_servers() if is_user_scoped_auth(row.get("auth_type"))
     )
 
-    if oauth_user_count > 0 and cipher_cfg is None:
+    if user_scoped_count > 0 and cipher_cfg is None:
         log.error(
-            "mcp.oauth: %d server(s) configured with auth_type='oauth_user' but no "
-            "[security] mcp_token_encryption_keys (rotation list) or "
-            "mcp_token_encryption_key (single) in config.toml. Generate a key with: "
-            "python -c 'from cryptography.fernet import Fernet; "
-            "print(Fernet.generate_key().decode())' "
-            "and add it to your config.toml.",
-            oauth_user_count,
+            "mcp.oauth: %d server(s) configured with auth_type='oauth_user'/'oauth_obo' but %s",
+            user_scoped_count,
+            _STARTUP_KEY_REQUIRED_HINT,
+        )
+        raise SystemExit(1)
+
+    # Same enforcement for single-credential capture (issue #551): the
+    # captured IdP refresh token must never be persisted unencrypted. This is
+    # gated ONLY on the operator's ``capture_user_credential`` opt-in — NOT on
+    # ``oidc_config.enabled``. Enabled reflects whether OIDC *discovery*
+    # succeeded, which is transient: a node that boots while the IdP is briefly
+    # unreachable comes up enabled=False (discovery_retryable=True), and
+    # runtime rediscovery re-enables OIDC later — at which point the very first
+    # login's capture step would persist a refresh token. Gating the key
+    # requirement on ``enabled`` would silently skip the loud boot-time failure
+    # exactly when the IdP is down at boot, then quietly no-op capture forever
+    # once OIDC heals. The opt-in flag is a static config value (preserved
+    # across the discovery-failure ``dataclasses.replace``), so keying on it
+    # makes the requirement independent of discovery state. Runs after OIDC
+    # init (see docstring), so app_state.oidc_config is set.
+    oidc_config = getattr(app_state, "oidc_config", None)
+    if (
+        oidc_config is not None
+        and getattr(oidc_config, "capture_user_credential", False)
+        and cipher_cfg is None
+    ):
+        log.error(
+            "oidc.capture: [oidc] capture_user_credential is enabled but %s",
+            _STARTUP_KEY_REQUIRED_HINT,
         )
         raise SystemExit(1)
 

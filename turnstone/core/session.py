@@ -14,7 +14,6 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
-import dataclasses
 import difflib
 import functools
 import hashlib
@@ -48,11 +47,18 @@ from turnstone.core.attachments import (
     safe_attachment_label,
     unreadable_placeholder,
 )
+from turnstone.core.background_shells import (
+    _FILTER_MAX_LINE_CHARS,
+    BackgroundShell,
+    BackgroundShellRegistry,
+    FilterExecError,
+    FilterTimeoutError,
+    UnknownShellError,
+    drain_pipe_lines,
+    spawn_group_leader,
+)
 from turnstone.core.config import get_searxng_engines, get_searxng_url
 from turnstone.core.edit import find_occurrences, pick_nearest
-from turnstone.core.history_decoration import (
-    attach_vllm_chat_reasoning_field,
-)
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
     TIMEOUT_OUTCOME_CLAUSE,
@@ -64,6 +70,7 @@ from turnstone.core.lowering import (
     tool_args_preview,
     wire_valid_arguments,
 )
+from turnstone.core.mcp_client import try_prime_user_pools
 from turnstone.core.memory import (
     count_messages,
     count_structured_memories,
@@ -117,7 +124,28 @@ from turnstone.core.metacognition import (
     sanitize_payload,
     should_nudge,
 )
-from turnstone.core.nudge_queue import TOOL_DRAIN, USER_DRAIN, NudgeQueue
+from turnstone.core.model_turn import (
+    ModelTurnResult,
+    ensure_tool_call_ids,
+    finalize_provider_blocks,
+    maybe_attach_vllm_chat_reasoning,
+    model_turn,
+    provider_extra_params,
+    resolve_capabilities,
+    resolve_effort_setting,
+    resolve_lane,
+    resolve_replay_reasoning_to_model,
+    resolve_temperature_setting,
+)
+from turnstone.core.nudge_queue import (
+    QUIET_CHANNEL,
+    QUIET_DRAIN,
+    TOOL_DRAIN,
+    USER_DRAIN,
+    WAKE_PENDING,
+    Entry,
+    NudgeQueue,
+)
 from turnstone.core.personas import (
     PersonaSnapshot,
     resolve_persona_for_kind,
@@ -134,7 +162,7 @@ from turnstone.core.preview import (
     resolve_preview_kind,
     transcode_text,
 )
-from turnstone.core.providers import create_provider
+from turnstone.core.providers import accumulate_tool_call_delta, create_provider
 from turnstone.core.ratelimit import TokenBucket
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.settings_registry import DEFAULT_AUTO_COMPACT_PCT
@@ -146,7 +174,6 @@ from turnstone.core.storage._utils import (
     COMPACTION_SUMMARY_LABEL,
     attachment_to_content_part,
     normalize_search_terms,
-    strip_orphan_client_tool_blocks,
 )
 from turnstone.core.tool_advisory import (
     make_system_turn,
@@ -177,7 +204,11 @@ from turnstone.core.trajectory import (
 )
 from turnstone.core.watch import WATCH_REMINDER_OPTIONAL_KEYS
 from turnstone.core.web import check_ssrf, fetch_with_ssrf_guard, strip_html
-from turnstone.core.workstream import WorkstreamKind
+from turnstone.core.workstream import (
+    INTERJECTION_CAP_CHARS,
+    PENDING_SENDS_MAX,
+    WorkstreamKind,
+)
 from turnstone.prompts import (
     INTERACTIVE_CONSENT_CLIENT_TYPES,
     ClientType,
@@ -197,14 +228,14 @@ if TYPE_CHECKING:
     from turnstone.core.healthcheck import BackendHealthTracker, HealthTrackerRegistry
     from turnstone.core.judge import IntentJudge, JudgeConfig
     from turnstone.core.mcp_client import MCPClientManager
-    from turnstone.core.model_registry import ModelConfig, ModelRegistry
+    from turnstone.core.model_registry import ModelRegistry
     from turnstone.core.output_guard import OutputAssessment
     from turnstone.core.output_guard_judge import OutputGuardJudge, OutputJudgeVerdict
     from turnstone.core.providers import (
-        CompletionResult,
         LLMProvider,
         ModelCapabilities,
         StreamChunk,
+        UsageInfo,
     )
     from turnstone.core.rerank import RerankClient, Reranker
     from turnstone.core.web_search import WebSearchClient
@@ -281,23 +312,59 @@ class _CancelRef(list[Any]):
     immediately.  If cancellation was already requested before the stream
     was created (e.g. cancel during retry backoff), the stream is closed
     on arrival so the blocked iteration is unblocked.
+
+    ``my_generation`` scopes a ref to one generation (compaction's summary
+    calls pass theirs; the main loop's long-lived shared ref keeps the
+    default 0 = unconditional).  A superseded ref's late-arriving stream —
+    an abandoned compaction that passed its boundary check just before a
+    force-cancel and opened one final zombie call — must neither hijack
+    ``_cancel_stream`` from the successor generation's live stream nor
+    keep burning tokens, so the append skips the registration and closes
+    the stream on arrival.  The generation check and the register are two
+    lockless statements; the residual bytecode-width TOCTOU (successor
+    claims AND registers between them) is accepted — its harm is one
+    delayed Stop (closes a dead handle; the event arm still cancels at the
+    next chunk), not corruption — versus the model-call-width window this
+    closes.
     """
 
-    __slots__ = ("_session",)
+    __slots__ = ("_session", "_my_generation")
 
-    def __init__(self, session: ChatSession) -> None:
+    def __init__(self, session: ChatSession, my_generation: int = 0) -> None:
         super().__init__()
         self._session = session
+        self._my_generation = my_generation
+
+    def _superseded(self) -> bool:
+        gen = self._my_generation
+        return bool(gen and self._session._generation != gen)
 
     def append(self, stream: Any) -> None:
         super().append(stream)
-        self._session._cancel_stream = stream
+        superseded = self._superseded()
+        if not superseded:
+            self._session._cancel_stream = stream
         # If cancel was requested before the first chunk arrived (the worker
         # thread is blocked inside the provider generator waiting for the HTTP
-        # response), close the stream immediately to unblock it.
-        if self._session._cancel_event.is_set():
+        # response), close the stream immediately to unblock it.  Same for a
+        # superseded ref's zombie stream: nobody will consume it.
+        if superseded or self._session._cancel_event.is_set():
             with contextlib.suppress(Exception):
                 stream.close()
+
+    @property
+    def aborted(self) -> bool:
+        """Whether this ref's stream must not be resurrected.
+
+        ``model_turn`` consults ``cancel_ref.aborted`` before re-issuing a
+        request after a mid-drain transport failure (the deadline daemon's
+        :class:`~turnstone.core.deadline.StreamAbortRef` contract): a
+        stream that died because :meth:`ChatSession.cancel` closed it — or
+        because it belongs to a superseded generation — must not be
+        resurrected behind the user's Stop; the failure surfaces and the
+        caller's own cancel check turns it into ``GenerationCancelled``.
+        """
+        return self._session._cancel_event.is_set() or self._superseded()
 
 
 # Image extensions handled as vision content (SVG excluded — it's XML text)
@@ -388,6 +455,50 @@ _AGENT_STEP_COUNT_CAP: int = 100
 _active_read_files: contextvars.ContextVar[set[str] | None] = contextvars.ContextVar(
     "turnstone_active_read_files", default=None
 )
+
+# Owner scope for background shells (#817).  ``_exec_task`` sets it to the
+# task_agent's call_id for the sub-agent's duration: shells spawned inside
+# carry that owner tag, owner-scoped lookup keeps parallel agents (and the
+# parent) from touching each other's handles, and the agent's ``finally``
+# reaps its own.  ``None`` outside a sub-agent → main-session scope.
+_active_shell_owner: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "turnstone_active_shell_owner", default=None
+)
+
+
+# Tools exempt from consecutive-identical-call repeat detection: delta-cursor
+# readers whose repeated identical call is the documented polling pattern.
+_REPEAT_EXEMPT_TOOLS: frozenset[str] = frozenset({"bash_output"})
+
+
+# ONE source of truth for recognized boolean-arg strings — both coercers
+# below derive from these, so a new provider quirk added here reaches every
+# tool at once instead of drifting per-tool.
+_TRUTHY_STRINGS: frozenset[str] = frozenset({"true", "1", "yes", "on"})
+_FALSY_STRINGS: frozenset[str] = frozenset({"false", "0", "no", "off", ""})
+_KNOWN_BOOL_STRINGS: frozenset[str] = _TRUTHY_STRINGS | _FALSY_STRINGS
+
+
+def _is_truthy_flag(value: Any) -> bool:
+    """A model-sent boolean arg: bool ``True`` or the string forms providers
+    intermittently emit ("true"/"1"/"yes", any case).  Everything else —
+    including ``None`` and ``False`` strings — is ``False``.  Used for flags
+    where silently taking the wrong branch is worse than being lenient
+    (``run_in_background``: a string-typed true would otherwise run the
+    command in the FOREGROUND and then group-kill the server the model
+    believed it detached).  ONE dialect for the whole file —
+    ``_coord_bool_arg`` delegates here — so a provider quirk honored on one
+    tool is never silently ignored on another."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUTHY_STRINGS
+    if isinstance(value, (int, float)):
+        # Numeric booleans (run_in_background: 1) — same provider-drift
+        # class as the string forms.
+        return bool(value)
+    return False
+
 
 # Cap on the *content portion* (text after ``path:lineno:``) of an
 # emitted search result line. Defends the context budget against
@@ -758,14 +869,18 @@ _SPEC_ARGUMENTS_LITERAL_RE = re.compile(r"\$ARGUMENTS\b(?!\[)")
 # small ``max_tokens`` lets the reasoning pass swallow the entire budget so the
 # title text never lands (``finish_reason=length``, empty ``content`` → skip).
 # This hits auto-title and refresh alike (shared path) on any thinking model.
-# So give the think pass room (``_TITLE_MAX_TOKENS``), then recover the title
-# from ``content``: reuse :meth:`ChatSession._strip_reasoning` (the canonical
-# ``<think>``/``<reasoning>`` remover, for lanes that leave reasoning inline
-# rather than in ``reasoning_content``), take the first non-empty line (a model
-# that appends an explanation shouldn't fold prose into the title), then peel a
-# ``Title:`` label and wrapping markdown/quote decoration.  Internal punctuation
-# is preserved so ``.NET``, ``CI/CD``, ``v1.6.0`` survive.
-_TITLE_MAX_TOKENS = 2048
+# Code deliberately does NOT bound the thinking (no effort value survives the
+# assignment scheme unless the operator set one), so the budget must fit a
+# full thinking pass at the MODEL'S OWN default — the prompt's hard word cap
+# keeps the visible answer trivially cheap, and ``_TITLE_MAX_TOKENS`` carries
+# the rest.  Recover the title from ``content``: reuse
+# :meth:`ChatSession._strip_reasoning` (the canonical ``<think>``/
+# ``<reasoning>`` remover, for lanes that leave reasoning inline rather than
+# in ``reasoning_content``), take the first non-empty line (a model that
+# appends an explanation shouldn't fold prose into the title), then peel a
+# ``Title:`` label and wrapping markdown/quote decoration.  Internal
+# punctuation is preserved so ``.NET``, ``CI/CD``, ``v1.6.0`` survive.
+_TITLE_MAX_TOKENS = 8192
 # Match the manual-rename (alias) cap so generated and hand-set titles share
 # one length bound.
 _TITLE_MAX_CHARS = 80
@@ -951,21 +1066,6 @@ def _substitute_skill_args(
     return rendered
 
 
-# Block types that carry reasoning content across providers.  Used by
-# ``ChatSession._maybe_synth_reasoning_block`` to decide whether
-# captured ``reasoning_parts`` need a synthetic ``reasoning_text``
-# block: if any of these types already appear in ``provider_blocks``,
-# native lane handles persistence and synthesis is a no-op.
-# - ``thinking`` / ``redacted_thinking`` — Anthropic native
-# - ``reasoning`` — OpenAI Responses native
-# - ``reasoning_text`` — synthetic (path-3 capture; included so
-#   re-running this code path against an already-synthesized list is
-#   idempotent).
-_REASONING_BEARING_BLOCK_TYPES: frozenset[str] = frozenset(
-    {"thinking", "redacted_thinking", "reasoning", "reasoning_text"}
-)
-
-
 # ---------------------------------------------------------------------------
 # SessionUI protocol — the contract every frontend must implement
 # ---------------------------------------------------------------------------
@@ -1054,6 +1154,21 @@ def _is_ctx_overflow(exc: BaseException) -> bool:
     )
 
 
+def _coerce_event_id(value: Any) -> int | None:
+    """Narrow a duck-typed hook return / attribute to a usable event id.
+
+    ``bool`` is an ``int`` subclass, so a bare ``isinstance(value, int)``
+    lets a hook returning ``True`` stamp a boolean into a persisted
+    ``event_id`` — PostgreSQL then fails the INSERT after the state it
+    annotates already committed, and SQLite stores ``1`` and mis-keys
+    the /history-vs-replay dedupe.  Same guard as
+    ``parse_checkpoint_watermark`` (storage/_utils.py); every consumer
+    of a duck-typed event-id source must route through here rather than
+    re-deriving the isinstance chain per site.
+    """
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 class SessionUI(Protocol):
     def on_turn_start(self) -> None: ...
     def on_turn_committed(self) -> None: ...
@@ -1079,6 +1194,35 @@ class SessionUI(Protocol):
     def on_system_turn(
         self, content: str, source: str, meta: dict[str, Any] | None = None
     ) -> int | None: ...
+    def on_compaction(self, payload: dict[str, Any]) -> int | None:
+        """Called through the compaction lifecycle.
+
+        ``payload["phase"]`` is ``"start"`` (fields: ``trigger`` =
+        ``"manual"``/``"auto"``, and for auto ``where``/``pct``),
+        ``"progress"`` (``part``/``total``/``depth``, or ``retry_in``/
+        ``error`` for a retry wait), or ``"end"`` (``ok``, and either
+        ``before_tokens``/``after_tokens``/``summary`` or ``reason``/
+        ``message``).  Returns the UI event id when the transport
+        assigns one (see :meth:`on_system_turn`) so the persisted
+        compaction marker row can be stamped with the matching resume
+        cursor; ``None`` for UIs without an event stream.
+
+        The default body IS the pre-1.8 compat rendering — the classic
+        ``on_info`` lines via the shared renderer.  It must not be a bare
+        ``...`` stub: a Protocol member's body is inherited as a REAL
+        method by explicit subclasses, so a pre-1.8 ``class MyUI(SessionUI)``
+        that never implemented this hook would satisfy the getattr probe
+        in ``_compaction_event`` with a silent no-op and defeat the very
+        fallback built for it — every lifecycle event swallowed, history
+        swapping with zero announcement.  Event-stream UIs override and
+        return the assigned id; a subclass implementing neither hook
+        no-ops through ``on_info``'s own stub (the never-crash floor).
+        """
+        from turnstone.core.compaction_render import render_compaction_event_as_info
+
+        render_compaction_event_as_info(payload, self.on_info)
+        return None
+
     def on_state_change(self, state: str) -> None: ...
     def on_rename(self, name: str) -> None: ...
     def on_intent_verdict(self, verdict: dict[str, Any], judge_event: object | None = None) -> None:
@@ -1230,7 +1374,11 @@ def _tool_turn_meta(
 
 
 class ChatSession:
-    _QUEUE_MAX = 10
+    # The mid-turn interjection queue's cap — an ALIAS of the shared
+    # per-workstream backpressure bound (see workstream.PENDING_SENDS_MAX):
+    # the deferred-send list refuses at the same size, so busy-window and
+    # command-window sends can never silently diverge on saturation.
+    _QUEUE_MAX = PENDING_SENDS_MAX
 
     def __init__(
         self,
@@ -1238,10 +1386,10 @@ class ChatSession:
         model: str,
         ui: SessionUI,
         instructions: str | None,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int,
         tool_timeout: int,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
         context_window: int = 32768,
         compact_max_tokens: int = 32768,
         auto_compact_pct: float = DEFAULT_AUTO_COMPACT_PCT,
@@ -1469,6 +1617,13 @@ class ChatSession:
         self._apply_persona_snapshot(persona_snapshot)
         self._title_generated = False
         self._read_files: set[str] = set()
+        # Session-monotonic run counter for sub-agent id minting (see
+        # ``_run_agent``): the parent call id alone can repeat across runs (a
+        # local provider reuses per-response ids for the PARENT task_agent
+        # call too), so each run's minted child ids carry this tag.  Lock, not
+        # bare increment: runs start on the 4-wide task pool concurrently.
+        self._agent_run_seq = 0
+        self._agent_run_seq_lock = threading.Lock()
         # The canonical in-memory trajectory.  Wire prep (fold/repair) + the
         # provider translators still consume dicts, so ``_full_messages`` lowers
         # Turns→dicts at that boundary until those layers migrate.
@@ -1561,6 +1716,10 @@ class ChatSession:
         self._generation: int = 0  # monotonic counter; orphaned threads skip cleanup
         self._active_procs: set[subprocess.Popen[str]] = set()  # for force-kill
         self._procs_lock = threading.Lock()
+        # Detached shells from bash(run_in_background=true) (#817).  Deliberately
+        # NOT reaped by cancel(): stopping a generation must not kill a server
+        # the model detached on purpose.  close() reaps everything.
+        self._background_shells = BackgroundShellRegistry(on_exit=self._on_background_shell_exit)
         self._cancelled_partial_msg: dict[str, Any] | None = None
         self._pending_retry: str | None = None
         # True when a fatal exception's text has been persisted to
@@ -1619,15 +1778,27 @@ class ChatSession:
         #     listeners register so tool/resource/prompt refreshes flow
         #     through to this session.
         #   * interactive (no mcp) — INTERACTIVE_TOOLS.
+        # Unconditional — every session kind carries the counter, so its
+        # existence never encodes "MCP was wired at construction" (a
+        # late-bound client or a directly-invoked callback must not
+        # AttributeError inside the listener fan-out, where per-callback
+        # exceptions are swallowed).
+        self._mcp_tools_change_seq = 0
+        # Construction-scoped (a local, NOT instance state): the seq
+        # value at the authoritative merged read, compared once at the
+        # end of tool setup. Only ``_mcp_tools_change_seq`` lives on.
+        mcp_tools_seq_at_read = 0
         if kind == WorkstreamKind.COORDINATOR:
             self._tools = list(COORDINATOR_TOOLS)
             self._task_tools = []
         elif self._mcp_client:
             # ``self._mcp_client`` (not the raw kwarg) so an MCP-off persona
             # falls through to the no-MCP branch below.
-            mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
-            self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
-            self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
+            # Constants first — the attributes must exist for a listener
+            # callback firing mid-construction; the ONE authoritative
+            # merged read runs after the registrations below.
+            self._tools = list(INTERACTIVE_TOOLS)
+            self._task_tools = list(TASK_AGENT_TOOLS)
             # Register for tool-change notifications from MCP servers.
             # ``user_id`` is the listener identity component — pool-only
             # changes for OTHER users must not fire this callback.
@@ -1643,21 +1814,28 @@ class ChatSession:
             # for OTHER users do not wake this session.
             self._mcp_prompt_cb = self._on_mcp_prompts_changed
             self._mcp_client.add_prompt_listener(self._mcp_prompt_cb, user_id=self._mcp_user_id)
+            # Single authoritative read, AFTER the registrations: a
+            # catalog change firing earlier than this fans out to the
+            # listeners just registered, so nothing can slip between
+            # read and register with its only notification unheard. A
+            # change firing AFTER this read is converged by the seq
+            # re-check at the end of tool setup (once every
+            # _on_mcp_tools_changed dependency exists) — a callback
+            # running mid-construction may crash into not-yet-assigned
+            # attributes and be swallowed by the fan-out, losing its
+            # effect, and one that succeeds here would be clobbered by
+            # the tool-search construction below reading mixed state.
+            mcp_tools_seq_at_read = self._mcp_tools_change_seq
+            mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
+            self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
+            self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
             # Proactively warm this user's per-user OAuth (oauth_user) pools so
             # their tools are present without a manual reconnect (e.g. after a
             # reboot/upgrade, or right after consent). Fire-and-forget — the
             # listeners registered just above deliver the catalog to this
             # session once each prime completes. No-op for users with no
             # consented oauth_user servers.
-            if self._mcp_user_id and hasattr(self._mcp_client, "prime_user_pools"):
-                try:
-                    self._mcp_client.prime_user_pools(self._mcp_user_id)
-                except Exception:
-                    log.debug(
-                        "mcp prime_user_pools scheduling failed user=%s",
-                        self._mcp_user_id,
-                        exc_info=True,
-                    )
+            try_prime_user_pools(self._mcp_client, self._mcp_user_id, context="session-start")
         else:
             self._tools = INTERACTIVE_TOOLS
             self._task_tools = TASK_AGENT_TOOLS
@@ -1704,6 +1882,20 @@ class ChatSession:
                 max_results=tool_search_max_results,
                 reranker=self._bm25_reranker(),
             )
+        # Converge with any MCP catalog change that fired during
+        # construction: a listener callback landing between the
+        # authoritative read and here either crashed into
+        # not-yet-assigned attributes (swallowed by the fan-out) or was
+        # clobbered by the setup above. Every _on_mcp_tools_changed
+        # dependency now exists, so re-running the full callback is
+        # safe — it rebuilds the merged lists, rendered descriptions,
+        # and search index from the CURRENT maps.
+        if (
+            self._kind != WorkstreamKind.COORDINATOR
+            and self._mcp_client
+            and self._mcp_tools_change_seq != mcp_tools_seq_at_read
+        ):
+            self._on_mcp_tools_changed()
         # Skill: explicit name overrides is_default skills.  ``skill_arguments``
         # carries the spec's $ARGUMENTS payload — set at create/load time,
         # substituted into the skill body by ``_load_skills``.
@@ -1976,16 +2168,17 @@ class ChatSession:
         model: str,
         alias: str | None = None,
     ) -> ModelCapabilities:
-        """Get model capabilities, applying config.toml overrides if present."""
-        caps = provider.get_capabilities(model)
-        if self._registry and alias:
-            cfg: ModelConfig = self._registry.get_config(alias)
-            if cfg.capabilities:
-                fields = {f.name for f in dataclasses.fields(type(caps))}
-                overrides = {k: v for k, v in cfg.capabilities.items() if k in fields}
-                if overrides:
-                    caps = dataclasses.replace(caps, **overrides)
-        return caps
+        """Get model capabilities, applying config.toml overrides if present.
+
+        Delegates to :func:`turnstone.core.model_turn.resolve_capabilities` —
+        the one resolution path every lane shares (#827) — but fetches the
+        config ITSELF, uncaught: a registry failure on the session's own
+        alias must raise loudly (pre-#827 semantics), never silently cache
+        degraded static-table caps for the session lifetime.  The defensive
+        never-crash fetch is a judge-constructor property, not a session one.
+        """
+        cfg = self._registry.get_config(alias) if (self._registry and alias) else None
+        return resolve_capabilities(provider, model, alias or "", self._registry, cfg=cfg)
 
     def _get_capabilities(self, provider: Any = None, model: str = "") -> ModelCapabilities:
         """Get capabilities for a model. Cached for the primary session model."""
@@ -1998,119 +2191,31 @@ class ChatSession:
             return self._cached_capabilities
         return self._resolve_capabilities(p, m, "")
 
-    def _resolve_server_type(self, alias: str | None = None) -> str:
-        """Read ``server_compat.server_type`` for an alias from the registry.
-
-        Used by :meth:`_maybe_synth_reasoning_block` to tag synthetic
-        path-3 reasoning blocks with their origin server (vllm,
-        llama.cpp, sglang, etc.) — informational metadata for UI
-        rehydration.  Returns ``""`` on any lookup miss.
-
-        Phase 5 (:meth:`_maybe_attach_vllm_chat_reasoning`) does NOT
-        call this resolver — it reads ``cfg.server_compat["server_type"]``
-        directly off the single ``cfg`` it already fetched for the
-        ``replay_reasoning_to_model`` flag check, to avoid a second
-        ``registry.get_config`` round-trip.  Both readers MUST stay
-        aligned on the same field path; if you change one, change the
-        other.
-
-        Reads ``cfg.server_compat`` (the dedicated dataclass field set
-        by the model_registry loader) — NOT ``cfg.capabilities``.  Both
-        loader paths (DB at ``model_registry.py:401`` and config.toml at
-        ``model_registry.py:485``) ``caps.pop("server_compat", {})`` and
-        hoist the dict to the top-level field, so the capabilities dict
-        never carries server_compat in production.
-        """
-        target_alias = alias or self._model_alias or ""
-        if not self._registry or not target_alias:
-            return ""
-        try:
-            cfg: ModelConfig = self._registry.get_config(target_alias)
-            sc = cfg.server_compat if isinstance(cfg.server_compat, dict) else None
-            if isinstance(sc, dict):
-                return str(sc.get("server_type") or "")
-        except Exception:
-            # Best-effort lookup — synth-block source tagging is
-            # informational, never load-bearing.  Log at debug so a
-            # repeated registry-lookup failure during a session shows
-            # up under DEBUG triage but doesn't spam normal logs.
-            log.debug(
-                "_resolve_server_type lookup failed for alias=%s; defaulting to empty",
-                target_alias,
-                exc_info=True,
-            )
-        return ""
-
-    def _maybe_synth_reasoning_block(
+    def _finalize_provider_blocks(
         self,
         provider_blocks: list[dict[str, Any]],
         reasoning_parts: list[str],
+        *,
+        has_tool_calls: bool,
+        had_blank_ids: bool = False,
+        alias: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Stamp captured ``reasoning_parts`` as a synthetic ``reasoning_text``
-        block when no reasoning-bearing block already appears in
-        ``provider_blocks``.
+        """Delegate to :func:`turnstone.core.model_turn.finalize_provider_blocks`
+        — the ONE native-lane builder every harness shares (main-loop stream
+        accumulator here; sub-agent loop and judges via ``model_turn``).
 
-        Anthropic emits native ``thinking`` blocks; OpenAI Responses
-        emits native ``reasoning`` items via ``output_item.done``.
-        Both populate ``provider_blocks`` with reasoning-bearing
-        shapes during streaming and need no synthesis here.
-
-        OpenAI Chat Completions (vLLM ``--reasoning-parser``, llama.cpp
-        ``reasoning_format``, Gemini's ``/v1beta/openai/`` endpoint
-        when it surfaces ``reasoning_content``) streams reasoning as
-        ``reasoning_delta`` chunks but never emits a reasoning-bearing
-        provider block.  Without this synthesis the captured text would
-        be dropped at the end of the stream — visible live, invisible
-        on page reload.
-
-        Crucially, GoogleProvider attaches raw tool_call dicts as
-        ``provider_blocks`` on the finish chunk for ``thought_signature``
-        round-trip (``_google.py:_iter_stream``).  An earlier version
-        bailed out whenever ``provider_blocks`` was non-empty, which
-        silently lost reasoning text on Google + reasoning_delta turns.
-        The fix tests for reasoning-bearing block types specifically
-        (see ``_REASONING_BEARING_BLOCK_TYPES``) and APPENDS the
-        synthetic block to the existing list rather than replacing it
-        — preserving Google's tool-call fidelity blocks alongside the
-        new synthetic reasoning entry.
-
-        The synthetic block uses ``type="reasoning_text"`` (NOT
-        ``"thinking"``) so it falls through Phase 2's
-        ``ANTHROPIC_VALID_BLOCK_TYPES`` shape filter on cross-model
-        resumption — protecting against operator-switches from a
-        local-model session to Anthropic, which would otherwise hit
-        Anthropic's input boundary with an unsigned ``thinking`` block.
-
-        The optional ``source`` field tags the block with the
-        originating server (``vllm``, ``llamacpp``, ``sglang``, etc.)
-        resolved via :meth:`_resolve_server_type`, which reads
-        ``cfg.server_compat["server_type"]`` (the dedicated dataclass
-        field hoisted by the model_registry loader, NOT
-        ``cfg.capabilities``).  The synthetic block's ``source`` field
-        itself is informational metadata; Phase 5's vLLM replay path
-        (:meth:`_maybe_attach_vllm_chat_reasoning`) reads
-        ``cfg.server_compat`` directly rather than the synthetic
-        block's tag.
+        ``None`` *alias* (the main-loop caller) resolves to the session's
+        primary alias; the blank-id mirror gate and orphan-strip semantics
+        are documented on the module function.
         """
-        text = "".join(reasoning_parts)
-        if not text.strip():
-            return provider_blocks
-        # Native reasoning already present — Anthropic / OpenAI
-        # Responses path.  No synth needed; return reference unchanged
-        # so the existing identity contract holds.
-        for b in provider_blocks:
-            if isinstance(b, dict) and b.get("type") in _REASONING_BEARING_BLOCK_TYPES:
-                return provider_blocks
-        block: dict[str, Any] = {
-            "type": "reasoning_text",
-            "text": text,
-        }
-        server_type = self._resolve_server_type()
-        if server_type:
-            block["source"] = server_type
-        # Append rather than replace so non-reasoning fidelity blocks
-        # (e.g. Google tool_calls with thought_signature) survive.
-        return [*provider_blocks, block]
+        return finalize_provider_blocks(
+            provider_blocks,
+            reasoning_parts,
+            has_tool_calls=has_tool_calls,
+            had_blank_ids=had_blank_ids,
+            registry=self._registry,
+            alias=alias or self._model_alias or "",
+        )
 
     def _resolve_replay_reasoning_to_model(
         self,
@@ -2118,42 +2223,16 @@ class ChatSession:
         *,
         caps: ModelCapabilities | None = None,
     ) -> bool:
-        """Read ``ModelConfig.replay_reasoning_to_model`` for an alias.
+        """Delegate to
+        :func:`turnstone.core.model_turn.resolve_replay_reasoning_to_model`.
 
-        Used by the streaming + non-streaming wire-build paths to gate
-        verbatim reasoning-block replay (Phase 2 of the reasoning-
-        persistence feature).  The resolver's miss-fallback is
-        ``False``: when no registry / alias is available, or the lookup
-        raises, return ``False`` so the provider-side strip path runs.
-        Losing the strip on operator-flagged-on models would be a
-        worse default than losing the replay on operator-flagged-off
-        models — replaying reasoning text against an unknown operator
-        preference shouldn't happen.  The False-on-miss matches the
-        ``model_definitions`` server-side default for the column, so
-        cold workstreams behave the same as unconfigured ones.
-
-        When ``caps`` is provided, the operator flag is AND-gated with
-        ``caps.supports_reasoning_replay`` so a model lacking the
-        capability silently skips replay even when the operator flag
-        is set.  Mirrors the gate in
-        ``OpenAIResponsesProvider._build_kwargs`` and protects against
-        future Claude entries (or other Anthropic-shaped surfaces)
-        shipping with ``supports_reasoning_replay=False``.  When
-        ``caps`` is omitted the resolver returns the operator flag
-        unchanged — back-compat for callers that haven't been updated
-        to thread caps yet.
+        ``None`` *alias* (the main-loop caller) resolves to the session's
+        primary alias; False-on-miss and the caps AND-gate are documented on
+        the module function.
         """
-        target_alias = alias or self._model_alias or ""
-        if not self._registry or not target_alias:
-            return False
-        try:
-            cfg: ModelConfig = self._registry.get_config(target_alias)
-            operator_on = bool(cfg.replay_reasoning_to_model)
-        except Exception:
-            return False
-        if caps is None:
-            return operator_on
-        return operator_on and bool(caps.supports_reasoning_replay)
+        return resolve_replay_reasoning_to_model(
+            self._registry, alias or self._model_alias or "", caps=caps
+        )
 
     def _maybe_attach_vllm_chat_reasoning(
         self,
@@ -2161,66 +2240,27 @@ class ChatSession:
         provider: LLMProvider,
         alias: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Conditionally attach vLLM's non-standard ``reasoning`` field to
-        outgoing assistant messages so a vLLM-served reasoning model can
-        thread CoT across turns.
+        """Delegate to
+        :func:`turnstone.core.model_turn.maybe_attach_vllm_chat_reasoning`
+        (Phase 5 of reasoning persistence).
 
-        Phase 5 of reasoning-persistence — parallel path to Paths 1+2,
-        not a modification.  Three gates:
-
-        1. Provider is ``OpenAIChatCompletionsProvider`` (Chat Completions
-           surface, not Responses or Anthropic — those have their own
-           replay paths with loud-failure-protected dual-gates).
-        2. ``server_compat.server_type == "vllm"`` — bounds blast radius
-           to vLLM; canonical OpenAI / llama.cpp / sglang never see the
-           non-standard field.
-        3. Operator-set ``ModelConfig.replay_reasoning_to_model`` — same
-           per-model toggle PR #498 added; defaults False.
-
-        The static ``supports_reasoning_replay`` capability gate that
-        guards Paths 1+2 is intentionally NOT used here.  vLLM's chat
-        template silently drops ``reasoning`` if the loaded template
-        doesn't read ``reasoning_content`` — the gate would add code-
-        edit friction (capability tables live in
-        ``providers/_openai_common.py``, not the admin UI) without
-        preventing the silent failure that's the actual misconfiguration
-        risk.  Paths 1+2 keep the dual-gate because their failure mode
-        is loud (Anthropic 400 on unsigned thinking, OpenAI Responses
-        400 on ResponseReasoningItemParam for non-reasoning models);
-        Path C's failure is silent so the gate doesn't help.
-
-        Returns *messages* unchanged when any gate fails.
+        ``None`` *alias* (the main-loop caller) resolves to the session's
+        primary alias; the three gates and the deliberate absence of the
+        static capability gate are documented on the module function.
         """
-        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
-
-        if not isinstance(provider, OpenAIChatCompletionsProvider):
-            return messages
-        target_alias = alias or self._model_alias or ""
-        if not self._registry or not target_alias:
-            return messages
-        try:
-            cfg = self._registry.get_config(target_alias)
-        except Exception:
-            return messages
-        # Read both gate fields off the single ``cfg`` we already
-        # fetched, rather than re-entering ``_resolve_server_type``
-        # (which would do a second ``get_config`` call).  Mirrors the
-        # field location ``_resolve_server_type`` reads, so the two
-        # gates stay aligned if the loader ever changes shape.
-        sc = cfg.server_compat if isinstance(cfg.server_compat, dict) else None
-        if not isinstance(sc, dict) or sc.get("server_type") != "vllm":
-            return messages
-        if not bool(cfg.replay_reasoning_to_model):
-            return messages
-        return attach_vllm_chat_reasoning_field(messages)
+        return maybe_attach_vllm_chat_reasoning(
+            messages, provider, self._registry, alias or self._model_alias or ""
+        )
 
     def _save_config(self) -> None:
         """Persist LLM-affecting config so resumed workstreams behave identically."""
         config = {
             "model": self.model,
             "model_alias": self._model_alias or "",
-            "temperature": str(self.temperature),
-            "reasoning_effort": self.reasoning_effort,
+            # Unset knobs persist as "" — None means "no operator spoke"
+            # (wire omission) and must survive the resume round-trip.
+            "temperature": "" if self.temperature is None else str(self.temperature),
+            "reasoning_effort": self.reasoning_effort or "",
             "max_tokens": str(self.max_tokens),
             "instructions": self.instructions or "",
             "skill": self._skill_name or "",
@@ -2548,6 +2588,12 @@ class ChatSession:
         # is fixed at COORDINATOR_TOOLS.  Ignore MCP server changes.
         if self._kind == WorkstreamKind.COORDINATOR:
             return
+        # Monotonic change marker: the constructor snapshots this around
+        # its authoritative post-registration read and re-runs this
+        # callback if it advanced — otherwise a notification landing
+        # between that read and its assignments is clobbered by the
+        # staler snapshot (its only notification already consumed).
+        self._mcp_tools_change_seq += 1
         # Pass the effective user_id (acting user on shared workstreams,
         # owner otherwise) so the merged tool list includes that user's
         # pool catalog. The static path is included by ``get_tools``
@@ -2887,59 +2933,116 @@ class ChatSession:
         """
         self._watch_runner = runner
         self._watch_wake_fn = wake_fn
-        nudge_queue = self._nudge_queue
-        ws_id = self._ws_id
 
         def _dispatch(reminder: dict[str, Any], watch_id: str) -> None:
             # ``reminder`` is the structured dict produced by
-            # :func:`build_watch_reminder`.  ``text`` carries the
-            # formatted body — sanitised here over the full string so
-            # steering-vector / control-char payloads sourced from
-            # arbitrary shell output can't tamper with the envelope at
-            # interpolation time.  The remaining fields ride as the
+            # :func:`build_watch_reminder`; the optional fields ride as the
             # queue entry's ``metadata`` → sibling keys on the
             # ``watch_triggered`` system turn, surfaced in the operator
-            # bubble (command preview + poll counter).
-            text = reminder.get("text", "") if isinstance(reminder, dict) else ""
-            sanitized = sanitize_payload(text)
-            if not sanitized:
-                # All control chars / empty after strip — silently drop.
+            # bubble (command preview + poll counter).  Sanitization, the
+            # drop-oldest soft cap (latest output is most useful) and the
+            # wake live on the shared external-event rail —
+            # ``self._watch_wake_fn`` is read at FIRE time there, so an
+            # identity rebind that re-invoked ``set_watch_runner`` is
+            # honored without rebuilding this closure.
+            if not isinstance(reminder, dict):
+                # Untrusted boundary: a non-dict reminder must drop silently
+                # (as the old empty-text early-return did), not TypeError out
+                # of the dispatch closure — WatchRunner would hold the row
+                # and re-fire it every tick.
                 return
-            # Soft cap drops oldest — latest output is most useful.
-            if nudge_queue.cap_at_or_drop_oldest(
-                "watch_triggered", _WATCH_QUEUE_SOFT_CAP, channel="any"
-            ):
-                log.warning(
-                    "watch_dispatch.queue_full ws=%s cap=%d dropped_oldest=True",
-                    ws_id,
-                    _WATCH_QUEUE_SOFT_CAP,
-                )
-
-            def _maybe_sanitize(v: Any) -> Any:
-                return sanitize_payload(v) if isinstance(v, str) else v
-
-            metadata = {
-                k: _maybe_sanitize(reminder[k])
-                for k in WATCH_REMINDER_OPTIONAL_KEYS
-                if k in reminder
-            }
-            nudge_queue.enqueue(
+            text = reminder.get("text", "")
+            metadata = {k: reminder[k] for k in WATCH_REMINDER_OPTIONAL_KEYS if k in reminder}
+            self._notify_external_event(
                 "watch_triggered",
-                sanitized,
-                "any",
+                text,
                 metadata=metadata or None,
+                soft_cap=_WATCH_QUEUE_SOFT_CAP,
             )
-            if wake_fn is not None:
-                try:
-                    wake_fn()
-                except Exception:
-                    log.warning("watch_dispatch.wake_failed ws=%s", ws_id, exc_info=True)
 
         self._watch_dispatch_fn = _dispatch
         runner.set_dispatch_fn(self._ws_id, _dispatch)
 
+    def _notify_external_event(
+        self,
+        nudge_type: str,
+        text: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+        valid_until: Callable[[], bool] | None = None,
+        soft_cap: int | None = None,
+    ) -> None:
+        """THE external-event rail: sanitize → (cap) → enqueue ``"any"`` → wake.
+
+        Every producer of autonomous notices (watch fires, background-shell
+        exits) rides this one helper, so policy fixes — caps, sanitization,
+        wake-failure handling — can never silently apply to only one of
+        them.  ``sanitize_payload`` runs over the full text (and string
+        metadata values) so steering-vector / control-char payloads sourced
+        from arbitrary process output can't tamper with the envelope; an
+        all-control-chars text drops the event silently.  ``soft_cap``
+        drop-oldest counts across ALL channels (``channel=None``) so
+        entries a user cancel demoted to ``"quiet"`` still occupy the
+        budget.  The wake makes an already-idle workstream deliver the
+        entry now — busy workstreams are safe, ``session_worker.send``
+        downgrades to a no-op while a worker owns the session.
+        """
+        if not isinstance(text, str):
+            # Untrusted producers (watch reminder payloads) can carry a
+            # non-string text; sanitize_payload would TypeError and a raise
+            # out of a dispatch closure makes WatchRunner hold + re-fire the
+            # row every tick.  Drop silently, same as empty-after-sanitize.
+            log.debug("external_event.non_string_text ws=%s type=%s", self._ws_id, nudge_type)
+            return
+        sanitized = sanitize_payload(text)
+        if not sanitized:
+            return
+        if soft_cap is not None and self._nudge_queue.cap_at_or_drop_oldest(
+            nudge_type, soft_cap, channel=None
+        ):
+            log.warning(
+                "external_event.queue_full ws=%s type=%s cap=%d dropped_oldest=True",
+                self._ws_id,
+                nudge_type,
+                soft_cap,
+            )
+        clean_meta: dict[str, Any] | None = None
+        if metadata:
+            clean_meta = {
+                k: (sanitize_payload(v) if isinstance(v, str) else v) for k, v in metadata.items()
+            }
+        self._nudge_queue.enqueue(
+            nudge_type,
+            sanitized,
+            "any",
+            valid_until=valid_until,
+            metadata=clean_meta or None,
+        )
+        wake_fn = self._watch_wake_fn
+        if wake_fn is not None:
+            try:
+                wake_fn()
+            except Exception:
+                # The enqueue already happened; a raise here would abort the
+                # producer (e.g. WatchRunner._poll_watch before its watch-row
+                # update commits — re-firing the same reminder every tick).
+                log.warning(
+                    "external_event.wake_failed ws=%s type=%s",
+                    self._ws_id,
+                    nudge_type,
+                    exc_info=True,
+                )
+
     def close(self) -> None:
-        """Release resources (listener registrations, etc.)."""
+        """Release resources (listener registrations, etc.).
+
+        Instant signal operations run FIRST (judge cancel events, listener
+        deregistrations); the background-shell teardown runs last because it
+        is the only step with a blocking phase (a bounded thread-join, up to
+        ``_CLOSE_JOIN_BUDGET_S`` when a drain is wedged) and nothing here
+        depends on it — serializing instant steps behind it would keep judge
+        daemons burning inference for the whole join budget on every close.
+        """
         if self._judge_cancel_event is not None:
             self._judge_cancel_event.set()
         # Abort every in-flight judge daemon — with parallel task agents
@@ -2983,6 +3086,12 @@ class ChatSession:
                 self._coord_client.close()
             except Exception:
                 log.debug("chat_session.coord_client_close_failed", exc_info=True)
+        # Last: the only step with a blocking phase (see docstring).  Kill
+        # signals fire at its start; every teardown path funnels through
+        # close(), so nothing detached outlives the workstream.  Queued exit
+        # notices go stale with the registry (``valid_until``) and drop at
+        # the next drain.
+        self._background_shells.close()
         self._cleanup_skill_resources()
 
     def _drop_mcp_surface(self) -> None:
@@ -3036,7 +3145,21 @@ class ChatSession:
             return
 
         lines: list[str] = []
-        for srv, (added, removed) in sorted(results.items()):
+        for srv, diff in sorted(results.items()):
+            if diff is None:
+                # No catalog produced — the refresh either was SKIPPED
+                # (lock held by a concurrent reconnect/push refresh, or
+                # removed mid-pass) or FAILED. Disambiguate via the
+                # authoritative outcome so the operator is never told a
+                # stale/broken server is current. Both are distinct from
+                # "no changes".
+                outcome = self._mcp_client.last_refresh_outcome(srv) or ""
+                if outcome.startswith("error"):
+                    lines.append(f"  {srv}: {RED}refresh failed{RESET} ({dim(outcome)})")
+                else:
+                    lines.append(f"  {srv}: {dim('skipped (busy — retry scheduled)')}")
+                continue
+            added, removed = diff
             if added or removed:
                 summary: list[str] = []
                 if added:
@@ -3092,7 +3215,7 @@ class ChatSession:
         available" (the synthetic-snapshot floor).
         """
         eid = getattr(self.ui, "_event_id", None)
-        return eid if isinstance(eid, int) else None
+        return _coerce_event_id(eid)
 
     def _tool_def_chars(self) -> int:
         """Total serialized char size of the active tool definitions (resent on
@@ -3212,29 +3335,27 @@ class ChatSession:
         my_generation: int = 0,
         carry_spill: bool = False,
     ) -> bool:
-        """Emit the auto-compaction notice, compact, and refresh the status
-        line.  Shared by the mid-turn policy (:meth:`_maybe_compact_midturn`)
-        and the end-of-turn check so the notice wording, the percentage, and
-        the post-compaction status refresh stay in lockstep.  ``where`` is an
-        optional qualifier for the notice (e.g. ``"mid-turn"``); ``preserve_tail``
+        """Run an auto-compaction and refresh the status line.  Shared by the
+        mid-turn policy (:meth:`_maybe_compact_midturn`) and the end-of-turn
+        check so the trigger wording, the percentage, and the post-compaction
+        status refresh stay in lockstep.  The auto notice itself rides the
+        ``on_compaction`` start event (via ``where``/``pct``).  ``where`` is an
+        optional qualifier for that notice (e.g. ``"mid-turn"``); ``preserve_tail``
         is forwarded to :meth:`_compact_messages` (e.g. to keep an in-flight
         tool-call turn during compact-before-truncate); ``my_generation`` is
         forwarded so the message swap aborts if a newer send supersedes this one
-        mid-compaction (0 = the manual /compact path, which has no generation);
+        mid-compaction (the manual path claims its own via :meth:`compact_now`);
         ``carry_spill`` is forwarded so the end-of-turn site can copy the
         model's wind-down turn onto the summary verbatim.
         Returns whether a summary was actually produced (False if compaction
         bailed) so callers can avoid acting on a compaction that did not happen."""
-        qualifier = f" {where}" if where else ""
-        pct_display = round(self.auto_compact_pct * 100)
-        self.ui.on_info(
-            f"\n[Auto-compacting{qualifier}: prompt exceeds {pct_display}% of context window]"
-        )
         compacted = self._compact_messages(
             auto=True,
             preserve_tail=preserve_tail,
             my_generation=my_generation,
             carry_spill=carry_spill,
+            where=where,
+            threshold_pct=round(self.auto_compact_pct * 100),
         )
         self._print_status_line()
         return compacted
@@ -3342,18 +3463,16 @@ class ChatSession:
 
             result = self._utility_completion(
                 [
-                    {
-                        "role": "system",
-                        "content": (
-                            "# Instructions\n\n"
-                            "You are a conversation title generator. "
-                            "The user will show you the opening of a conversation. "
-                            "Respond with ONLY a short title (3-8 words). "
-                            "Do NOT answer the conversation. Do NOT explain. "
-                            "Output ONLY the title text, nothing else."
-                        ),
-                    },
-                    {"role": "user", "content": snippet},
+                    Turn.system(
+                        "# Instructions\n\n"
+                        "You are a conversation title generator. "
+                        "The user will show you the opening of a conversation. "
+                        "Respond with ONLY a short title of AT MOST 3 words — "
+                        "this is a hard rule; 2-3 words is ideal. "
+                        "Do NOT answer the conversation. Do NOT explain. "
+                        "Output ONLY the title text, nothing else."
+                    ),
+                    Turn.user(snippet),
                 ],
                 max_tokens=_TITLE_MAX_TOKENS,
             )
@@ -3533,9 +3652,12 @@ class ChatSession:
                     self.model,
                 )
             if "temperature" in config:
-                self.temperature = float(config["temperature"])
+                # "" = unset (wire omission); "None" guards rows written
+                # by the brief str(None) era of _save_config.
+                raw_temp = config["temperature"]
+                self.temperature = float(raw_temp) if raw_temp not in (None, "", "None") else None
             if "reasoning_effort" in config:
-                self.reasoning_effort = config["reasoning_effort"]
+                self.reasoning_effort = config["reasoning_effort"] or None
             if "max_tokens" in config:
                 self.max_tokens = int(config["max_tokens"])
             if "instructions" in config:
@@ -4269,6 +4391,15 @@ class ChatSession:
                 alias=alias,
                 content_hash=content_hash,
                 parts=parts,
+                # Thread the registry + config store so the perception lane
+                # resolves the alias's extra_params / capability overrides /
+                # temperature ladder like every other lane — without these,
+                # operator settings on the perception alias never reach the
+                # wire and there is no remediation path for a degraded,
+                # memoized description.
+                registry=self._registry,
+                config_store=self._config_store,
+                capabilities=caps,
             )
         if not text:
             return None
@@ -4765,104 +4896,88 @@ class ChatSession:
         provider: LLMProvider | None = None,
         model_alias: str | None = None,
     ) -> dict[str, Any] | None:
-        """Build provider-specific extra parameters.
+        """Delegate to :func:`turnstone.core.model_turn.provider_extra_params`.
 
-        Forwards operator-supplied ``server_compat["extra_body"]`` overrides
-        (``skip_special_tokens``, ``reasoning_format``, or explicit
-        ``chat_template_kwargs``) to the OpenAI SDK ``extra_body`` on the
-        OpenAI-shaped lanes, and to the Anthropic SDK ``extra_body`` on the
-        anthropic-compatible lane.  Entries set here are static operator
-        pins — they win over the dynamic knob mapping below.
-
-        Reasoning params (the ``enable_thinking``/``thinking`` toggle and
-        the ``effort_param`` graded key) are added separately by the
-        providers via ``merge_reasoning_template_kwargs``, driven by
-        ``ModelCapabilities`` and the session effort knob — the Responses
-        API surface handles reasoning natively and ignores ``extra_body``.
-
-        *model_alias* selects which stored config supplies server compat
-        settings.  When ``None``, defaults to the session's primary alias.
+        ``None`` *provider* / *model_alias* resolve to the session's primary
+        provider and alias; which lanes consume ``extra_body`` is documented
+        on the module function.
         """
-        from turnstone.core.server_compat import merge_server_compat
-
         prov = provider or self._provider
-        # extra_body consumers: the OpenAI-shaped providers, plus the
-        # anthropic-compatible lane (server_compat extra_body rides the
-        # Anthropic SDK's extra_body).  Real Anthropic and Google keep
-        # their own param paths handled inside their providers.
-        if prov.provider_name not in ("openai", "openai-compatible", "anthropic-compatible"):
-            return None
-        extra = merge_server_compat(None, self._get_server_compat(model_alias))
-        return extra or None
-
-    def _get_server_compat(self, model_alias: str | None = None) -> dict[str, Any]:
-        """Get server compatibility settings from a model config.
-
-        *model_alias* selects the config to read.  Falls back to the
-        session's primary alias when ``None``.  The returned dict is the
-        live ``ModelConfig.server_compat`` reference — callers must not
-        mutate it.  ``merge_server_compat`` reads only.
-        """
-        alias = model_alias or self._model_alias
-        if self._registry and alias:
-            try:
-                return self._registry.get_config(alias).server_compat
-            except (ValueError, KeyError):
-                pass
-        return {}
+        return provider_extra_params(prov, self._registry, model_alias or self._model_alias or "")
 
     def _utility_completion(
         self,
-        messages: list[dict[str, Any]],
+        turns: list[Turn],
         *,
         max_tokens: int = 4096,
         temperature: float | None = None,
-        reasoning_effort: str = "low",
-    ) -> CompletionResult:
-        """Run a lightweight internal completion (title gen, compaction, extraction).
+        reasoning_effort: str | None = None,
+        cancel_ref: list[Any] | None = None,
+    ) -> ModelTurnResult:
+        """Run a lightweight internal completion (title gen, compaction,
+        extraction) through ``model_turn`` on the session's primary lane.
 
-        Threads ``reasoning_effort`` through both the direct keyword (for
-        commercial providers) and ``extra_params`` (for local model servers)
-        so callers don't need to duplicate it.  ``max_tokens`` is clamped to
-        the model's advertised output limit so small models don't error.
+        ``max_tokens`` is clamped to the model's advertised output limit so
+        small models don't error.
 
         ``temperature`` defaults to the session temperature (``self.temperature``)
         — the same operator/registry-resolved value the main turn uses — rather
         than a hard-coded constant: utility calls should not silently override an
-        explicit ``[models.*]`` temperature.  The provider still drops it for
-        models that forbid temperature (GPT-5 base, O-series) or pins it (Claude
-        with thinking), so this only governs models that genuinely accept one.
+        explicit ``[models.*]`` temperature.  ``reasoning_effort`` ``None``
+        inherits the lane's full assignment scheme (operator rungs → model
+        definition → omit) with NO code-supplied default: a code-chosen
+        effort is an unvetted token on local vocabularies and can flip
+        template thinking toggles the operator never engaged.  These calls
+        run inside small token budgets, so on thinking models the operator
+        must budget effort via the alias/model definition — an unbounded
+        thinking pass consuming the whole budget surfaces as the documented
+        empty-content signature (#676), and the max_tokens here are sized
+        generously for exactly that reason.  Callers relaying the session's
+        user-facing effort knob (web-fetch extraction) pass it explicitly.
+        extra_params resolve inside the lane from the same single config
+        fetch as the rest.
         """
         caps = self._get_capabilities()
         clamped = min(max_tokens, caps.max_output_tokens) if caps.max_output_tokens else max_tokens
-        messages = self._maybe_attach_vllm_chat_reasoning(messages, self._provider)
-        result = self._provider.create_completion(
-            client=self.client,
-            model=self.model,
-            messages=messages,
+        lane = resolve_lane(
+            self._provider,
+            self.client,
+            self.model,
+            alias=self._model_alias or "",
+            registry=self._registry,
+            capabilities=caps,
+            config_store=self._config_store,
+        )
+        result = model_turn(
+            lane,
+            turns,
             max_tokens=clamped,
             temperature=self.temperature if temperature is None else temperature,
             reasoning_effort=reasoning_effort,
-            extra_params=self._provider_extra_params(),
-            capabilities=caps,
-            replay_reasoning_to_model=self._resolve_replay_reasoning_to_model(caps=caps),
+            # The abort seam (default None): compaction passes a fresh
+            # per-attempt _CancelRef so a user Stop closes the in-flight
+            # summary HTTP stream instead of waiting it out.  Title-gen
+            # keeps None (not user-cancellable), and web-fetch extraction
+            # MUST keep None — it runs on parallel tool threads and a
+            # registration would clobber the main stream's _cancel_stream.
+            cancel_ref=cancel_ref,
         )
         # Utility completions (title gen, compaction, web-fetch extraction)
         # bypass the streaming on_status path — record their usage so the
         # governance dashboard reflects this spend.
-        self._record_aux_usage(result)
+        self._record_aux_usage(result.usage)
         return result
 
-    def _record_aux_usage(self, result: CompletionResult, *, model: str | None = None) -> None:
+    def _record_aux_usage(self, usage: UsageInfo | None, *, model: str | None = None) -> None:
         """Persist token usage for a non-streaming auxiliary completion.
 
         Title generation, compaction, web-fetch summarisation, and
-        task sub-agents all run via ``create_completion`` and bypass
-        the streaming ``on_status`` accounting path; without this their
-        spend never reaches the usage dashboard. Delegates to the UI's
-        ``on_aux_usage`` hook (which owns the storage write + any node
-        metrics), mirroring how ``_print_status_line`` routes main-loop
-        usage through ``on_status``.
+        task sub-agents all run outside the streaming ``on_status``
+        accounting path; without this their spend never reaches the
+        usage dashboard. Delegates to the UI's ``on_aux_usage`` hook
+        (which owns the storage write + any node metrics), mirroring how
+        ``_print_status_line`` routes main-loop usage through
+        ``on_status``.
 
         ``model`` defaults to the session model (utility calls share it);
         sub-agent callers pass the agent's own model so per-model
@@ -4870,18 +4985,17 @@ class ChatSession:
         minimal UI stubs (some tests, replay shims) predate it and should
         skip recording rather than crash a title-gen or sub-agent turn.
         """
-        u = result.usage
-        if u is None:
+        if usage is None:
             return
         record = getattr(self.ui, "on_aux_usage", None)
         if record is None:
             return
         record(
             {
-                "prompt_tokens": u.prompt_tokens,
-                "completion_tokens": u.completion_tokens,
-                "cache_creation_tokens": u.cache_creation_tokens,
-                "cache_read_tokens": u.cache_read_tokens,
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "cache_creation_tokens": usage.cache_creation_tokens,
+                "cache_read_tokens": usage.cache_read_tokens,
                 "model": model or self.model,
             }
         )
@@ -5191,7 +5305,15 @@ class ChatSession:
                     tools=self._get_active_tools(),
                     max_tokens=self.max_tokens,
                     temperature=self.temperature,
-                    reasoning_effort=self.reasoning_effort,
+                    # The in-code model-definition rung applies here exactly as
+                    # it does in model_turn's effective computation — the main
+                    # loop must sample identically to every auxiliary lane on
+                    # the same alias (resolve_lane's stated contract).  Session
+                    # effort (operator/user rungs) wins; unset falls to the
+                    # caps declaration; None omits the param.
+                    reasoning_effort=(
+                        self.reasoning_effort or resolved_caps.default_reasoning_effort or None
+                    ),
                     extra_params=self._provider_extra_params(
                         provider=prov, model_alias=model_alias
                     ),
@@ -5236,7 +5358,9 @@ class ChatSession:
                 last_err = e
                 delay = self._RETRY_BASE_DELAY * (2**attempt)
                 self.ui.on_info(f"[Retrying in {delay:.0f}s: {ename}]")
-                time.sleep(delay)
+                # Cancel-aware backoff (event arm only — no generation in
+                # scope here, matching the loop-top _check_cancelled()).
+                self._backoff_or_cancelled(delay)
         assert last_err is not None  # unreachable, but satisfies type checker
         raise last_err
 
@@ -5279,6 +5403,74 @@ class ChatSession:
             raise GenerationCancelled()
         if my_generation and my_generation != self._generation:
             raise GenerationCancelled()
+
+    def _claim_generation(self) -> int:
+        """Claim the next generation and install its fresh cancel event.
+
+        The entry half of the per-generation cancel discipline shared by
+        :meth:`send` and :meth:`compact_now`.  The old event object stays
+        set for any abandoned thread — ``_exec_bash`` captures a local
+        reference so subprocesses from old generations are still killed.
+
+        The claim is also the exact moment any prior compaction becomes
+        provably stale (the worker slot serializes turns), so the UI is
+        told to break a stale compaction activity latch here — otherwise a
+        force-abandoned compaction's latch suppresses the whole successor
+        turn's pill writes, re-broadcasting "Compacting context…" through
+        a live turn.  getattr-guarded like ``on_aux_usage`` (minimal UI
+        stubs predate the hook) AND call-guarded: this emission sits on
+        send()'s PRE-turn path — before the user turn is appended, before
+        ``_record_fatal_error``'s coverage — so a raising override
+        (``_broadcast_activity`` is a documented override seam) must
+        degrade to a lost latch-break, never to a silently dropped user
+        message.  Same policy as ``_compaction_event``'s dispatch tail;
+        the claim-state writes above stay infallible either way.
+        """
+        self._generation += 1
+        self._cancel_event = threading.Event()
+        release = getattr(self.ui, "on_generation_claimed", None)
+        if release is not None:
+            try:
+                release(self._generation)
+            except Exception:
+                log.debug("ui.on_generation_claimed raised; claim proceeds", exc_info=True)
+        return self._generation
+
+    def _consume_cancel(self, my_generation: int) -> bool:
+        """Clear this generation's cancel signal on exit; report if one landed.
+
+        The exit half of the per-generation discipline: a cancel that
+        targeted THIS generation must not leak into a later idle operation.
+        Only acts while still the active generation — a successor owns a
+        fresh event that must not be cleared from under it.  Returns
+        whether a cancel had been requested (set-but-unraised), so a
+        caller whose body completed anyway can still honor the stop.
+        """
+        if self._generation != my_generation:
+            return False
+        landed = self._cancel_event.is_set()
+        self._cancel_event.clear()
+        return landed
+
+    def _backoff_or_cancelled(self, delay: float, my_generation: int = 0) -> None:
+        """Sleep out a retry backoff, aborting the instant a Stop lands.
+
+        Waits on the CURRENT cancel event rather than ``time.sleep`` so a
+        cancel during a (possibly minutes-long exponential) backoff aborts
+        immediately instead of burning the delay plus one more model call.
+        Two arms, both required: the event object is replaced per
+        generation, so a wait on a superseded generation's old event can
+        time out without ever seeing the successor's cancel — the
+        ``_check_cancelled`` re-check catches that via its generation arm.
+        ``my_generation=0`` callers keep event-arm-only semantics (same
+        default as ``_check_cancelled``).  Raises
+        :class:`GenerationCancelled` — the shared shape for EVERY retry
+        backoff on this class: a hand-rolled ``time.sleep`` backoff is
+        Stop-blind and burns the full delay plus one more model call.
+        """
+        if self._cancel_event.wait(delay):
+            raise GenerationCancelled() from None
+        self._check_cancelled(my_generation)
 
     def _append_user_turn(
         self,
@@ -5555,7 +5747,9 @@ class ChatSession:
         # event was delivered to double anyway).
         emitted_event_id: int | None = None
         try:
-            emitted_event_id = self.ui.on_system_turn(content, source, meta or None)
+            emitted_event_id = _coerce_event_id(
+                self.ui.on_system_turn(content, source, meta or None)
+            )
         except Exception:
             log.warning("ui.on_system_turn failed; system turn still appended", exc_info=True)
         save_message(
@@ -5563,7 +5757,7 @@ class ChatSession:
             "system",
             content,
             source=source,
-            event_id=emitted_event_id if isinstance(emitted_event_id, int) else self._ui_event_id(),
+            event_id=emitted_event_id if emitted_event_id is not None else self._ui_event_id(),
             meta=meta_json,
         )
 
@@ -5640,15 +5834,7 @@ class ChatSession:
                 mcp.remove_prompt_listener(self._mcp_prompt_cb, user_id=old_listener_uid)
                 mcp.add_prompt_listener(self._mcp_prompt_cb, user_id=new_listener_uid)
             self._mcp_listener_user_id = new_listener_uid
-        if new_listener_uid and hasattr(mcp, "prime_user_pools"):
-            try:
-                mcp.prime_user_pools(new_listener_uid)
-            except Exception:
-                log.debug(
-                    "mcp prime_user_pools scheduling failed user=%s",
-                    new_listener_uid,
-                    exc_info=True,
-                )
+        try_prime_user_pools(mcp, new_listener_uid, context="acting-user-change")
         # Rebuild the merged tool list and resource/prompt-dependent
         # state under the new identity NOW — the prime above completes
         # asynchronously and only notifies on catalog changes, while
@@ -5714,12 +5900,7 @@ class ChatSession:
         # would otherwise leave the latch set on the long-lived session and
         # trip a premature, advisory-skipping compaction on the next send.
         self._compaction_advised = False
-        self._generation += 1
-        my_generation = self._generation
-        # Fresh cancel event per generation.  The old event object stays
-        # set for any abandoned thread — _exec_bash captures a local
-        # reference so subprocesses from old generations are still killed.
-        self._cancel_event = threading.Event()
+        my_generation = self._claim_generation()
         self._cancelled_partial_msg = None
         # Fresh per-send attachment wire-part memo (see __init__): bounds the
         # heavy rasterized-page parts to one send and picks up any mid-session
@@ -6313,26 +6494,38 @@ class ChatSession:
             # Consume this generation's cancel signal on exit so a cancel that
             # targeted THIS send can't later abort an unrelated idle operation
             # (e.g. a manual /compact between sends would otherwise inherit the
-            # still-set event).  Only when still the active generation — a newer
-            # send owns a fresh event we must not clear out from under it.  This is
-            # why a manual /compact no longer needs to reset the event itself
-            # (which would have disarmed a cancel aimed at a concurrent send).
-            if self._generation == my_generation:
-                self._cancel_event.clear()
+            # still-set event).  A late-landing cancel needs no extra handling
+            # here — send's exits never auto-run further work (queued messages
+            # are flushed, not answered), unlike compact_now's.
+            self._consume_cancel(my_generation)
 
     def _drain_pending_advisories(self) -> None:
-        """Drop every pending nudge regardless of channel.
+        """Drop the abandoned generation's advisory nudges — not external events.
 
         Tool-channel nudges (``tool_error``, ``repeat``, ``denial``)
         queued earlier in this batch and user-channel nudges
         (``correction``, …) queued during ``_check_metacognitive_nudge``
-        but not yet drained share the same per-session
-        :class:`NudgeQueue`.
-        When a generation is abandoned (cancel, KeyboardInterrupt,
-        unexpected exception) the entire queue drops so nothing bleeds
-        into the next send's tool loop or next user turn.
+        are commentary ABOUT the generation being abandoned (cancel,
+        KeyboardInterrupt, unexpected exception) — they drop so nothing
+        stale bleeds into the next send's tool loop or user turn.
+
+        ``"any"``-channel entries survive but are DEMOTED to ``"quiet"``:
+        those are external events (``watch_triggered``,
+        ``background_shell_exit``) that happened regardless of the
+        generation's fate, and their producers promised the model a notice
+        — a background dev server that crashed during a cancelled turn must
+        still be announced at the next seam, or the model keeps talking to
+        a dead server.  But they must not CAUSE that seam: an abandoned
+        generation ends in ``_emit_state("idle")``, and a wake-eligible
+        entry there would make the ``IdleNudgeWatcher`` resume the
+        workstream seconds after the user pressed Stop.  ``"quiet"``
+        delivers at the next legitimate seam (user message, tool batch, or
+        a wake earned by a NEW event) without ever being the wake reason.
+        Stale entries are handled at drain time by their ``valid_until``
+        predicates.
         """
-        self._nudge_queue.clear()
+        self._nudge_queue.clear_channels({"tool", "user"})
+        self._nudge_queue.demote_channel("any", QUIET_CHANNEL)
 
     def _synthesize_cancelled_results(self, reason: str) -> None:
         """Synthesize tool_result messages for orphaned tool_calls after cancel.
@@ -6731,20 +6924,11 @@ class ChatSession:
                     if in_think:
                         in_think = False
                     for tcd in chunk.tool_call_deltas:
-                        idx = tcd.index
-                        if idx not in tool_calls_acc:
-                            tool_calls_acc[idx] = {
-                                "id": "",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            }
-                        tc = tool_calls_acc[idx]
-                        if tcd.id:
-                            tc["id"] = tcd.id
-                        if tcd.name:
-                            tc["function"]["name"] = tcd.name
-                        if tcd.arguments_delta:
-                            tc["function"]["arguments"] += tcd.arguments_delta
+                        # THE tool-call merge rule, shared with drain_stream
+                        # and the Google raw-fidelity capture — the chat
+                        # loop and every drained lane assemble identical
+                        # calls from identical wire streams.
+                        accumulate_tool_call_delta(tool_calls_acc, tcd)
 
                 # Informational messages (e.g. server-side web search status)
                 if chunk.info_delta:
@@ -6844,7 +7028,13 @@ class ChatSession:
         content = "".join(content_parts)
         msg["content"] = content or ""
 
+        had_blank_ids = False
         if tool_calls_acc:
+            # Record blanks BEFORE the uuid back-fill (the back-fill reaches
+            # only this mirror; the native blocks keep the blank id verbatim)
+            # — threaded to _finalize_provider_blocks, which drops the blocks
+            # a back-filled id would desync.
+            had_blank_ids = any(not tc.get("id") for tc in tool_calls_acc.values())
             self._ensure_tool_call_ids(tool_calls_acc)
             ordered = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
             msg["tool_calls"] = ordered
@@ -6873,18 +7063,15 @@ class ChatSession:
 
         # Store raw provider content blocks for multi-turn preservation
         # (e.g. Anthropic web_search_tool_result with encrypted_content).
-        # Phase 3 path-3 capture: when no native blocks were emitted but
-        # ``reasoning_delta`` chunks accumulated text, synthesize a
-        # ``reasoning_text`` block so the captured reasoning survives
-        # past the live stream and surfaces on history reload.
-        provider_blocks = self._maybe_synth_reasoning_block(provider_blocks, reasoning_parts)
-        # Enforce the native↔tool_calls mirror in memory too.  A truncation that cleared
-        # tool_calls (finish_reason="length") can leave an orphan tool_use in the captured
-        # blocks; the save-time chokepoint fixes the persisted row, but a same-session
-        # continuation reads this in-memory copy, so strip the orphan here as well.
-        # See storage._utils.normalize_native_for_save.
-        if provider_blocks and not msg.get("tool_calls"):
-            provider_blocks = strip_orphan_client_tool_blocks(provider_blocks)
+        # Finalization (path-3 reasoning synthesis + the in-memory
+        # native↔tool_calls mirror gate) is shared with the sub-agent loop —
+        # see _finalize_provider_blocks.
+        provider_blocks = self._finalize_provider_blocks(
+            provider_blocks,
+            reasoning_parts,
+            has_tool_calls=bool(msg.get("tool_calls")),
+            had_blank_ids=had_blank_ids,
+        )
         if provider_blocks:
             msg["_provider_content"] = provider_blocks
 
@@ -7121,7 +7308,9 @@ class ChatSession:
         if not self._last_usage:
             return
         usage: dict[str, Any] = {**self._last_usage, "model": self.model}
-        self.ui.on_status(usage, self.context_window, self.reasoning_effort)
+        # "" = no effort resolved anywhere (the wire omitted the param);
+        # the UI protocol keeps a plain str.
+        self.ui.on_status(usage, self.context_window, self.reasoning_effort or "")
 
     # -- Conversation compaction ------------------------------------------------
 
@@ -7408,7 +7597,7 @@ class ChatSession:
             batches.append(current)
         return batches
 
-    def _summarize_once(self, system_prompt: str, body: str) -> str:
+    def _summarize_once(self, system_prompt: str, body: str, my_generation: int = 0) -> str:
         """Run one summary completion over ``body`` and return the cleaned text.
 
         Owns the retry loop (transient errors only, exponential backoff) and the
@@ -7416,34 +7605,60 @@ class ChatSession:
         so the caller can abort the whole compaction before any message swap.
         """
         summary_msgs = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": self._COMPACT_USER_PREFIX + body},
+            Turn.system(system_prompt),
+            Turn.user(self._COMPACT_USER_PREFIX + body),
         ]
-        result: CompletionResult | None = None
+        result: ModelTurnResult | None = None
         for attempt in range(self._MAX_RETRIES + 1):
             try:
                 result = self._utility_completion(
                     summary_msgs,
                     max_tokens=self._summary_output_tokens(),
+                    # Fresh per-attempt abort seam: _CancelRef.append
+                    # registers the summary HTTP stream in _cancel_stream
+                    # eagerly (and closes on arrival if a Stop already
+                    # landed), so cancel() aborts the blocked read instead
+                    # of waiting out a whole model call — the force-stop
+                    # orphan window collapses from one summary call to the
+                    # next checkpoint.  A fresh instance (never the shared
+                    # self._cancel_ref) keeps the main loop's per-attempt
+                    # clear and [0]-fallback semantics untouched, and the
+                    # boundary checks in _summarize_batch/_backoff guarantee
+                    # a superseded compaction makes no further calls — so
+                    # it can never clobber a successor's registration.
+                    cancel_ref=_CancelRef(self, my_generation),
                 )
                 break
             except Exception as e:
+                # A closed-by-cancel stream surfaces as a provider error —
+                # map it to the cancel BEFORE the retry policy reads it, so
+                # a Stop on the final attempt ends the compaction as
+                # cancelled, never as a red "Compaction failed" (the main
+                # drain path makes the same closed-stream→GenerationCancelled
+                # translation).
+                self._check_cancelled(my_generation)
                 ename = type(e).__name__
                 if self._stop_retrying(e, attempt, self._provider):
                     # Overflow is deterministic — let _summarize_batch subdivide
                     # instead of retrying an identical oversized call.
                     raise
                 delay = self._RETRY_BASE_DELAY * (2**attempt)
-                self.ui.on_info(f"[Compact retrying in {delay:.0f}s: {ename}]")
-                time.sleep(delay)
+                self._compaction_event(
+                    my_generation, {"phase": "progress", "retry_in": delay, "error": ename}
+                )
+                self._backoff_or_cancelled(delay, my_generation)
         assert result is not None
         # Strip any <think>/<reasoning> tags the summarizer may emit
         summary = self._strip_reasoning(result.content or "")
         if result.finish_reason == "length":
-            self.ui.on_info("[Warning: compaction summary was truncated]")
+            self._compaction_event(
+                my_generation, {"phase": "progress", "warning": "summary_truncated"}
+            )
         return summary
 
-    def _summarize_blocks(self, blocks: list[str], *, depth: int = 0) -> str:
+    def _summarize_blocks(
+        self, blocks: list[str], *, depth: int = 0, my_generation: int = 0
+    ) -> str:
         """Summarize ``blocks`` into one dense summary, chunking + recursing so no
         single model call exceeds the model window.
 
@@ -7472,7 +7687,7 @@ class ChatSession:
             raise _CompactionIrreducibleError
         batches = self._pack_blocks(blocks, self._summary_input_budget_chars())
         if len(batches) == 1:
-            return self._summarize_batch(system_prompt, batches[0], depth)
+            return self._summarize_batch(system_prompt, batches[0], depth, my_generation)
 
         # More than one batch: recurse-merge the per-batch summaries.  A block-count
         # guard would be wrong here — _summarize_batch's binary subdivision can
@@ -7481,11 +7696,18 @@ class ChatSession:
         total = len(batches)
         summaries: list[str] = []
         for k, batch in enumerate(batches, start=1):
-            self.ui.on_info(f"[compacting part {k}/{total}…]")
-            summaries.append(self._summarize_batch(system_prompt, batch, depth))
-        return self._summarize_blocks(summaries, depth=depth + 1)
+            # depth 0 = summarizing transcript batches; depth > 0 = merging
+            # partial summaries.  The web card renders depth 0 as a
+            # determinate part-k-of-N bar and deeper levels as a merge note.
+            self._compaction_event(
+                my_generation, {"phase": "progress", "part": k, "total": total, "depth": depth}
+            )
+            summaries.append(self._summarize_batch(system_prompt, batch, depth, my_generation))
+        return self._summarize_blocks(summaries, depth=depth + 1, my_generation=my_generation)
 
-    def _summarize_batch(self, system_prompt: str, batch: list[str], depth: int) -> str:
+    def _summarize_batch(
+        self, system_prompt: str, batch: list[str], depth: int, my_generation: int = 0
+    ) -> str:
         """Summarize one packed batch, subdividing on a token-window overflow.
 
         The char budget that produced ``batch`` is only an estimate, so the model
@@ -7503,10 +7725,13 @@ class ChatSession:
         # Cooperative cancellation: a cancel mid-compaction aborts here.  It raises
         # GenerationCancelled (a BaseException), so _compact_messages' ``except
         # Exception`` can't swallow it and the message-swap below never runs — the
-        # history is left untouched.
-        self._check_cancelled()
+        # history is left untouched.  my_generation matters for the force-cancel
+        # orphan: a successor's claim REPLACES the cancel event, so the event arm
+        # alone would let an abandoned compaction keep issuing summary calls —
+        # the generation arm is what retires it at the next batch boundary.
+        self._check_cancelled(my_generation)
         try:
-            return self._summarize_once(system_prompt, "\n\n".join(batch))
+            return self._summarize_once(system_prompt, "\n\n".join(batch), my_generation)
         except Exception as e:
             if not _is_ctx_overflow(e):
                 raise
@@ -7517,9 +7742,11 @@ class ChatSession:
                 # as fits — a wide over-window batch costs ~log2(N) calls, not one
                 # model call per block.
                 mid = len(batch) // 2
-                left = self._summarize_batch(system_prompt, batch[:mid], depth)
-                right = self._summarize_batch(system_prompt, batch[mid:], depth)
-                return self._summarize_blocks([left, right], depth=depth + 1)
+                left = self._summarize_batch(system_prompt, batch[:mid], depth, my_generation)
+                right = self._summarize_batch(system_prompt, batch[mid:], depth, my_generation)
+                return self._summarize_blocks(
+                    [left, right], depth=depth + 1, my_generation=my_generation
+                )
             # A lone block overflows by itself: the char budget over-estimated how
             # many tokens it holds.  Shrink progressively — halve the truncation
             # budget and retry, keeping as much of the message as the real window
@@ -7531,7 +7758,7 @@ class ChatSession:
             while True:
                 try:
                     return self._summarize_once(
-                        system_prompt, self._truncate_block(batch[0], budget)
+                        system_prompt, self._truncate_block(batch[0], budget), my_generation
                     )
                 except Exception as e2:
                     if not _is_ctx_overflow(e2):
@@ -7541,6 +7768,203 @@ class ChatSession:
                     budget = max(self._MIN_SUMMARY_BUDGET_CHARS, budget // 2)
 
     def _compact_messages(
+        self,
+        auto: bool = False,
+        preserve_tail: int = 0,
+        my_generation: int = 0,
+        carry_spill: bool = False,
+        where: str = "",
+        threshold_pct: int | None = None,
+    ) -> bool:
+        """Compact conversation history — the lifecycle-event wrapper.
+
+        Owns the cooperative-latch clear and the ``on_compaction`` lifecycle
+        contract: exactly one ``start`` event, then exactly one ``end`` event
+        on EVERY exit — the handled bails inside
+        :meth:`_compact_messages_impl` emit their own failed ``end`` (with a
+        per-site reason), and this wrapper backstops the raising exits
+        (``GenerationCancelled`` from a cancel mid-summary, unexpected
+        errors) so a UI that painted an in-progress card on ``start`` can
+        never be left with a stuck progress bar.  ``where`` is the auto
+        trigger's qualifier (``"mid-turn"`` …) and ``threshold_pct`` the
+        auto-compact percentage — both ride the ``start`` event, and only
+        :meth:`_do_auto_compact` passes the pct: the context-overflow retry
+        path also compacts with ``auto=True`` but never evaluated the
+        threshold, so a pct there would fabricate a trigger explanation
+        contradicting the overflow notice printed a line above it.
+        """
+        # Clear the cooperative latch on every compaction *attempt*, ahead of
+        # the early-return guards in the impl — a bailed compaction (too few/
+        # large messages, summary error) must fall back to the advisory grace
+        # state next cycle rather than retry-storm on the same over-soft
+        # estimate.
+        self._compaction_advised = False
+        trigger = "auto" if auto else "manual"
+        start_payload: dict[str, Any] = {"phase": "start", "trigger": trigger}
+        if auto:
+            start_payload["where"] = where
+            if threshold_pct is not None:
+                start_payload["pct"] = threshold_pct
+        self._compaction_event(my_generation, start_payload)
+        try:
+            return self._compact_messages_impl(auto, preserve_tail, my_generation, carry_spill)
+        except BaseException as e:
+            # GenerationCancelled is a BaseException — the except above the
+            # message swap lets it propagate so history stays untouched; the
+            # UIs still need the end event to retire the in-progress card.
+            # Any OTHER non-Exception BaseException (KeyboardInterrupt at
+            # the CLI, SystemExit) is a deliberate abort too, not a
+            # compaction failure — report cancelled, never a red error row
+            # (str(KeyboardInterrupt()) is "" and would render "Compaction
+            # failed: ").
+            cancelled = isinstance(e, GenerationCancelled) or not isinstance(e, Exception)
+            message = "Compaction cancelled." if cancelled else f"Compaction failed: {e}"
+            # _compaction_bailed is the single failed-end emitter.  The
+            # error notification is trigger-scoped: AUTO raising exits
+            # propagate into send()'s fatal handler, which fires the one
+            # on_error — emitting here too doubled the red rows and the
+            # error metric.  MANUAL raising exits have no downstream
+            # emitter (the web compact worker's runner only logs; the CLI
+            # REPL suppresses below), so the wrapper's is the one red row.
+            self._compaction_bailed(
+                "cancelled" if cancelled else "error",
+                message,
+                trigger=trigger,
+                my_generation=my_generation,
+                emit_error=(trigger == "manual"),
+            )
+            raise
+
+    def _compaction_event(self, my_generation: int, payload: dict[str, Any]) -> int | None:
+        """Emit one compaction lifecycle event stamped with its owning id.
+
+        ``compaction_id`` (the owning generation) ties every progress/end
+        event to the compaction that started it, and ``superseded`` marks
+        events from a generation that is no longer current (a
+        force-abandoned worker running out its last summary call).
+        :meth:`SessionUIBase.on_compaction <turnstone.core.session_ui_base.SessionUIBase.on_compaction>`
+        consumes ``superseded`` (never enqueued): a superseded event must
+        not drive the activity-pill restore or animate a successor's card.
+        ``my_generation`` is 0 on direct test invocations — falsy, so such
+        events are never marked superseded (matching ``_check_cancelled``).
+
+        Failed ends additionally carry ``notice`` — the single display-
+        policy site: renderers show the failure message only when it is
+        true, instead of each re-deriving suppression from reason/trigger/
+        superseded (the cross-runtime drift trap the old hand-synced
+        cli.py/conversation.js clauses documented).  Error-reason ends are
+        suppressed because :meth:`_compaction_bailed` already fired the one
+        red ``on_error`` row; cancelled-auto ends because the surrounding
+        send prints its own "[Generation cancelled]"; superseded ends
+        because nobody is waiting on a force-abandoned compaction and its
+        notice mid-turn reads as the LIVE work being cancelled.
+        """
+        stale = bool(my_generation and my_generation != self._generation)
+        event: dict[str, Any] = {"compaction_id": my_generation, "superseded": stale, **payload}
+        if payload.get("phase") == "end" and not payload.get("ok"):
+            event["notice"] = (
+                not stale
+                and payload.get("reason") != "error"
+                and not (payload.get("reason") == "cancelled" and payload.get("trigger") == "auto")
+            )
+        # getattr-guarded like on_generation_claimed/on_aux_usage: a
+        # duck-typed SessionUI predating the hook must not hit an
+        # AttributeError that wedges every long session at its first
+        # auto-compaction.  This probe only catches DUCK-typed UIs — an
+        # explicit ``class MyUI(SessionUI)`` inherits the protocol
+        # member as a real method and never lands in the None arm, which
+        # is why the protocol default body renders the same classic
+        # lines itself (see SessionUI.on_compaction): both compat routes
+        # converge on render_compaction_event_as_info, policy
+        # single-sited.
+        emit = getattr(self.ui, "on_compaction", None)
+        try:
+            if emit is None:
+                # Pre-hook UIs get the classic info lines back (an
+                # auto-compaction must never swap history with zero
+                # announcement — the pre-1.8 lines reached every UI
+                # unconditionally).  Invoked for superseded events too: a
+                # superseded OK end announces a swap that really committed,
+                # and failed-end staleness is already encoded in ``notice``.
+                # ``on_info`` is getattr-guarded like the hook itself — the
+                # never-crash property is the floor; a UI with neither hook
+                # keeps compacting silently.  Deliberately NOT dual-emitted
+                # for hook-aware UIs or SSE: pre-1.8 SSE/SDK clients that
+                # ignore unknown `compaction` events lose these lines — a
+                # documented 1.8 breaking change (CHANGELOG); dual emission
+                # would double-render on every current client.
+                info = getattr(self.ui, "on_info", None)
+                if info is not None:
+                    from turnstone.core.compaction_render import render_compaction_event_as_info
+
+                    render_compaction_event_as_info(event, info)
+                return None
+            result = emit(event)
+        except Exception:
+            # The single raise-proofing site for EVERY lifecycle emission
+            # (both compat routes, all phases): a raising duck-typed hook
+            # must degrade to a lost render, never to a lost EVENT —
+            # unguarded, a raising failed-END emit voided the
+            # exactly-one-end contract through the wrapper backstop
+            # (frozen progress bar on every pane), and a raising SUCCESS
+            # end after the committed swap made the backstop fabricate a
+            # failed end + red row for a compaction that succeeded.  The
+            # cost on raise is only the marker-stamp id — the receiving
+            # hook was broken anyway.  Same policy as this method's own
+            # getattr guard ("must not wedge every long session") and the
+            # same shape as _emit_send_ui.
+            log.debug("compaction lifecycle hook raised; event dropped for this UI", exc_info=True)
+            return None
+        # Duck-typed hooks aren't bound to the protocol's return type; the
+        # marker-stamp consumer needs int-or-None, nothing else (and a
+        # hook returning True must not stamp a bool — see _coerce_event_id).
+        return _coerce_event_id(result)
+
+    def _compaction_bailed(
+        self,
+        reason: str,
+        message: str,
+        *,
+        trigger: str,
+        my_generation: int,
+        emit_error: bool = True,
+    ) -> bool:
+        """Emit a failed-compaction ``end`` event and return ``False``.
+
+        The single failed-end emitter: :meth:`_compact_messages_impl`'s
+        handled bails AND the wrapper's raising backstop both route here —
+        each carries a machine ``reason`` (drives the web card's failure
+        state) and the human ``message``.  ``reason="error"``
+        additionally fires :meth:`on_error` — the typed error event and the
+        Prometheus error counter this path fed before the lifecycle events
+        existed; the panes render the red row from THAT and treat the end
+        event as card-teardown only, so the text isn't shown twice.
+
+        ``emit_error=False`` is the RAISING backstop's auto-trigger arm:
+        those exceptions propagate into ``send()``'s fatal handler, whose
+        ``_record_fatal_error`` fires the single on_error — a second one
+        here doubled every pane's red rows and the node's error metric.
+        Handled bails never propagate, so they always emit.
+        """
+        if reason == "error" and emit_error:
+            try:
+                # Guarded like _record_fatal_error's on_error: a raising
+                # duck-typed hook (bounded listener queue.Full) must not
+                # escape BEFORE the end emit below — that voided the
+                # exactly-one-end contract on both bail passes and left
+                # every pane a frozen progress bar.  Order kept
+                # (on_error first): the panes render the red row from it
+                # and treat the end event as card-teardown only.
+                self.ui.on_error(message)
+            except Exception:
+                log.debug("ui.on_error failed during compaction bail", exc_info=True)
+        self._compaction_event(
+            my_generation,
+            {"phase": "end", "ok": False, "reason": reason, "message": message, "trigger": trigger},
+        )
+        return False
+
+    def _compact_messages_impl(
         self,
         auto: bool = False,
         preserve_tail: int = 0,
@@ -7573,14 +7997,16 @@ class ChatSession:
         the summarizer also reads the spill, but its paraphrase must not be
         the only survivor.
         """
-        # Clear the cooperative latch on every compaction *attempt*, ahead of
-        # the early-return guards below — a bailed compaction (too few/large
-        # messages, summary error) must fall back to the advisory grace state
-        # next cycle rather than retry-storm on the same over-soft estimate.
-        self._compaction_advised = False
+        # Presentation label derived from the one semantic flag — deriving
+        # locally makes an auto=True/trigger="manual" drift impossible.
+        trigger = "auto" if auto else "manual"
         if len(self.messages) < 2:
-            self.ui.on_info("Not enough messages to compact.")
-            return False
+            return self._compaction_bailed(
+                "not_enough_messages",
+                "Not enough messages to compact.",
+                trigger=trigger,
+                my_generation=my_generation,
+            )
 
         # Optionally keep the last ``preserve_tail`` messages verbatim — e.g. an
         # in-flight assistant tool-call whose results are about to be appended, or
@@ -7615,24 +8041,37 @@ class ChatSession:
         to_summarize_dicts = dicts_from_turns(to_summarize)
         blocks = self._summary_blocks(to_summarize_dicts)
         if not blocks:
-            self.ui.on_info("Not enough messages to compact.")
-            return False
+            return self._compaction_bailed(
+                "not_enough_messages",
+                "Not enough messages to compact.",
+                trigger=trigger,
+                my_generation=my_generation,
+            )
 
         self.ui.on_thinking_start()
         try:
-            summary = self._summarize_blocks(blocks)
+            summary = self._summarize_blocks(blocks, my_generation=my_generation)
         except _CompactionIrreducibleError:
-            self.ui.on_info("Messages too large to fit in summary context.")
-            return False
+            return self._compaction_bailed(
+                "irreducible",
+                "Messages too large to fit in summary context.",
+                trigger=trigger,
+                my_generation=my_generation,
+            )
         except Exception as e:
-            self.ui.on_error(f"Compaction failed: {e}")
-            return False
+            return self._compaction_bailed(
+                "error", f"Compaction failed: {e}", trigger=trigger, my_generation=my_generation
+            )
         finally:
             self.ui.on_thinking_stop()
 
         if not summary.strip():
-            self.ui.on_info("Compaction produced an empty summary; keeping history.")
-            return False
+            return self._compaction_bailed(
+                "empty_summary",
+                "Compaction produced an empty summary; keeping history.",
+                trigger=trigger,
+                my_generation=my_generation,
+            )
 
         # The verbatim carries: the wind-down spill and the continuation-hint
         # quote of the ask.  Both can fire on the SAME compaction (the
@@ -7742,14 +8181,20 @@ class ChatSession:
                 "total_tokens": after_tokens,
             }
 
-        self.ui.on_info(f"[compacted: ~{before_tokens:,} -> ~{after_tokens:,} tokens]")
-        separator = "\u2500" * 60
-        lines = [separator]
-        for line in summary.splitlines():
-            lines.append(f"  {line}")
-        lines.append(separator)
-        self.ui.on_info("\n".join(lines))
-
+        # The successful end event carries everything a UI needs to paint the
+        # result card (token delta + the summary text); its id stamps the
+        # marker row below so /history and the live stream stay aligned.
+        end_event_id = self._compaction_event(
+            my_generation,
+            {
+                "phase": "end",
+                "ok": True,
+                "trigger": trigger,
+                "before_tokens": before_tokens,
+                "after_tokens": after_tokens,
+                "summary": summary,
+            },
+        )
         # Persist a compaction checkpoint so a reopen rehydrates [summary]+[tail]
         # instead of the full transcript — which, on a long session or one switched
         # to a smaller-context model, can exceed the window and deadlock the first
@@ -7762,13 +8207,27 @@ class ChatSession:
         if self._ws_id:
             watermark = get_compaction_watermark(self._ws_id, preserve_tail)
             if watermark is not None:
+                # ``before_tokens``/``after_tokens``/``trigger`` are display
+                # additions for the /history compaction card; the resume
+                # slice reads only ``watermark`` (parse_checkpoint_watermark
+                # ignores the extra keys).  The row is stamped with the end
+                # event's id so a fresh-connect cursor computed from /history
+                # sits at-or-past the live event — repaint and replay can't
+                # both render the card.
                 save_message(
                     self._ws_id,
                     "assistant",
                     summary,
                     source=COMPACTION_SOURCE,
-                    meta=json.dumps({"watermark": watermark}),
-                    event_id=self._ui_event_id(),
+                    meta=json.dumps(
+                        {
+                            "watermark": watermark,
+                            "before_tokens": before_tokens,
+                            "after_tokens": after_tokens,
+                            "trigger": trigger,
+                        }
+                    ),
+                    event_id=end_event_id if end_event_id is not None else self._ui_event_id(),
                     producer=self._provider.provider_name if self._provider else None,
                 )
         return True
@@ -7799,9 +8258,15 @@ class ChatSession:
                 session_provider=self._provider,
                 session_client=self.client,
                 session_model=self.model,
-                context_window=caps.context_window,
+                session_capabilities=caps,
                 rule_registry=self._rule_registry,
                 model_registry=self._registry,
+                # On judge.model-unset fallback the judge inherits the session
+                # model — thread its alias too, so the lane resolves
+                # extra_params / live flags like every other session lane.
+                session_model_alias=self._model_alias or "",
+                # For the temperature ladder's global rung (model.temperature).
+                config_store=self._config_store,
             )
         except Exception:
             log.warning("judge.init_failed", exc_info=True)
@@ -7831,10 +8296,14 @@ class ChatSession:
                 session_client=self.client,
                 session_model=self.model,
                 model_registry=self._registry,
-                # Session's real (config/registry-aware) window, so the oversize
-                # guard is accurate when output_guard_model is unset — same
+                # Session's resolved (config/registry-aware) capabilities, so the
+                # oversize guard's window is accurate and operator-declared caps
+                # reach the judge wire when output_guard_model is unset — same
                 # source IntentJudge gets via _ensure_judge.
-                context_window=self._get_capabilities().context_window,
+                session_capabilities=self._get_capabilities(),
+                session_model_alias=self._model_alias or "",
+                # For the temperature ladder's global rung (model.temperature).
+                config_store=self._config_store,
             )
         except Exception:
             log.warning("output_guard_judge.init_failed", exc_info=True)
@@ -7973,6 +8442,10 @@ class ChatSession:
                     "command": it.get("command", ""),
                     "timeout": it.get("timeout"),
                     "stop_on_error": bool(it.get("stop_on_error")),
+                    # Detachment is part of the intent: a backgrounded
+                    # process outlives the call (#817), which changes what
+                    # the judge is approving — never amputate it.
+                    "run_in_background": bool(it.get("run_in_background")),
                 }
             elif name == "write_file":
                 it["func_args"] = {
@@ -8661,9 +9134,11 @@ class ChatSession:
             )
 
         cleaned, priority = parse_priority(text)
-        # Cap individual message length to prevent context bloat
-        if len(cleaned) > 2000:
-            cleaned = cleaned[:2000] + "..."
+        # Cap individual message length to prevent context bloat (the
+        # shared bound — the /send defer-fidelity check refuses fold-ins
+        # that could hit this truncation).
+        if len(cleaned) > INTERJECTION_CAP_CHARS:
+            cleaned = cleaned[:INTERJECTION_CAP_CHARS] + "..."
         # Full UUID hex (128 bits) rather than a truncated prefix — this id is
         # the ``send_id`` tracking token threaded through the turn, so the wide
         # space keeps the birthday bound comfortable.
@@ -8679,6 +9154,71 @@ class ChatSession:
         with self._queued_lock:
             popped = self._queued_messages.pop(msg_id, None)
         return popped is not None
+
+    def flush_queued_messages(self) -> bool:
+        """Drain queued messages into a combined user turn (public seam).
+
+        Defensive backstop for workers that can find text stranded in the
+        queue from BEFORE their window (a dying send worker's closing race)
+        — the /compact worker's exit seam is the caller.  Messages sent
+        DURING a command window never reach this queue: the /send route
+        defers them (``ws._pending_sends``) while ``worker_kind ==
+        "command"`` and the drain task dispatches them as ordinary sends
+        afterwards.  Must only be called by the thread that owns the
+        worker slot — it mutates ``self.messages``.
+        """
+        return self._flush_queued_messages()
+
+    def compact_now(self) -> bool:
+        """Manual compaction with send()'s full generation discipline.
+
+        The web /compact worker path.  Mirrors send()'s entry — claim the
+        next generation and install a fresh cancel event — so:
+
+        * an abandoned (force-cancelled) compaction can never swap history
+          under a successor turn: the successor's claim makes this
+          generation stale and the pre-swap ``_check_cancelled`` raises
+          (send() prevents the identical race the identical way);
+        * a cancel that landed while idle (a Stop click between turns)
+          can't instantly abort the next /compact — the stale set event is
+          replaced here, exactly as send() replaces it per generation;
+        * a cancel aimed at THIS compaction is consumed on exit (while
+          still the active generation), so it can't leak into a later idle
+          operation — previously nothing cleared it until the next send,
+          which bricked every /compact retry as instantly \"cancelled\".
+
+        Raises :class:`GenerationCancelled` (after consuming the event) so
+        the caller can distinguish a user stop from a bail; returns whether
+        a summary was produced otherwise.  That raise ALSO covers a Stop
+        that lands after the impl's last cancel check (the swap /
+        marker-persist tail) or during a retry backoff that then bails:
+        the compaction outcome stands, but an explicit Stop must never be
+        silently eaten — the caller must not auto-run anything on the
+        user's behalf after one.  The CLI's ``handle_command`` route
+        delegates here too — the REPL is single-threaded so the discipline
+        is redundant there, but one path means one behaviour.
+        """
+        my_generation = self._claim_generation()
+        cancel_landed = False
+        try:
+            compacted = self._compact_messages(my_generation=my_generation)
+        finally:
+            # Consume this generation's cancel signal (send()'s exit does
+            # the same).  A body raise propagates past this; the landed
+            # flag matters only on the completed-anyway paths below.
+            cancel_landed = self._consume_cancel(my_generation)
+        if compacted:
+            # Refresh the status line/context pill so the freed window is
+            # visible immediately — parity with _do_auto_compact.  BEFORE
+            # honoring a tail-landing Stop: the compaction genuinely
+            # happened (swap + marker + OK card), so the pill must reflect
+            # it either way — the raise below only suppresses follow-up
+            # work, it must not leave the pill claiming a full context
+            # next to a "context compacted" card.
+            self._print_status_line()
+        if cancel_landed:
+            raise GenerationCancelled()
+        return compacted
 
     def _flush_queued_messages(self, prefix: str = "") -> bool:
         """Drain queued messages into a single combined user turn.
@@ -8704,16 +9244,18 @@ class ChatSession:
         with self._queued_lock:
             items = list(self._queued_messages.values())
             self._queued_messages.clear()
-        if not items and not prefix:
+        queued_text = "\n\n".join(
+            f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in items
+        )
+        if not queued_text and not prefix:
             return False
 
-        parts = [f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in items]
-        if prefix and parts:
-            content = prefix + "\n\n" + "\n\n".join(parts)
+        if prefix and queued_text:
+            content = prefix + "\n\n" + queued_text
         elif prefix:
             content = prefix
         else:
-            content = "\n\n".join(parts)
+            content = queued_text
         self._append_user_turn(content, ())
         return True
 
@@ -9050,14 +9592,10 @@ class ChatSession:
     def _ensure_tool_call_ids(tool_calls: list[dict[str, Any]] | dict[int, dict[str, Any]]) -> None:
         """Fill in missing tool call IDs with synthetic UUIDs.
 
-        Some local servers (llama.cpp, older vLLM) omit or leave the id
-        blank; an empty tool_call_id corrupts subsequent turns because
-        the matching tool-result message can't reference the call.
+        Delegates to :func:`turnstone.core.model_turn.ensure_tool_call_ids`
+        (the re-ingest half of the shared plant-call seam).
         """
-        items = tool_calls.values() if isinstance(tool_calls, dict) else tool_calls
-        for tc in items:
-            if not tc.get("id"):
-                tc["id"] = f"call_{uuid.uuid4().hex}"
+        ensure_tool_call_ids(tool_calls)
 
     def _safe_prepare_tool(self, tc: dict[str, Any]) -> dict[str, Any]:
         """Wrap :meth:`_prepare_tool` so a single failing preparer is
@@ -9232,6 +9770,8 @@ class ChatSession:
 
         preparers = {
             "bash": self._prepare_bash,
+            "bash_output": self._prepare_bash_output,
+            "kill_shell": self._prepare_kill_shell,
             "read_file": self._prepare_read_file,
             "search": self._prepare_search,
             "diff_file": self._prepare_diff,
@@ -9345,6 +9885,31 @@ class ChatSession:
         if is_multiline:
             preview = f"{DIM}{textwrap.indent(command, '    ')}{RESET}"
 
+        # ``is_background`` accepted as an undocumented alias (Gemini's shell
+        # tool trained that name); ``run_in_background`` is the documented one.
+        # Lenient coercion: a string-typed "true" must not silently run the
+        # command in the foreground (where the group kill would then reap the
+        # server the model believed it detached).
+        background = _is_truthy_flag(args.get("run_in_background")) or _is_truthy_flag(
+            args.get("is_background")
+        )
+        if background:
+            # Same approval gate as foreground — the command is what's
+            # dangerous, not the detachment.  ``timeout`` is ignored: there
+            # is no bounded wait to time out (documented in the schema).
+            return {
+                "call_id": call_id,
+                "func_name": "bash",
+                "header": f"\u2699 bash (background): {display_cmd}",
+                "preview": preview,
+                "needs_approval": True,
+                "approval_label": "bash",
+                "execute": self._exec_bash_background,
+                "command": command,
+                "run_in_background": True,
+                "stop_on_error": _is_truthy_flag(args.get("stop_on_error")),
+            }
+
         return {
             "call_id": call_id,
             "func_name": "bash",
@@ -9359,7 +9924,71 @@ class ChatSession:
             "execute": self._exec_bash,
             "command": command,
             "timeout": timeout,
-            "stop_on_error": args.get("stop_on_error") is True,
+            # Same lenient dialect as run_in_background — a string-typed
+            # "true" must add ``set -e``, not silently drop it.
+            "stop_on_error": _is_truthy_flag(args.get("stop_on_error")),
+        }
+
+    def _prepare_bash_output(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        shell_id = str(args.get("id") or "").strip()
+        if not shell_id:
+            return {
+                "call_id": call_id,
+                "func_name": "bash_output",
+                "header": "\u2717 bash_output: missing id",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: missing id (the bash_N handle returned when the shell started)",
+            }
+        filter_arg = args.get("filter")
+        if filter_arg is not None and not isinstance(filter_arg, str):
+            # An ill-typed filter must error, not silently run unfiltered —
+            # the unfiltered read would consume the whole delta the model
+            # wanted narrowed.
+            return {
+                "call_id": call_id,
+                "func_name": "bash_output",
+                "header": "\u2717 bash_output: invalid filter",
+                "preview": "",
+                "needs_approval": False,
+                "error": (
+                    f"Error: filter must be a regex string "
+                    f"(got {type(filter_arg).__name__}); no output was consumed"
+                ),
+            }
+        return {
+            "call_id": call_id,
+            "func_name": "bash_output",
+            "header": f"\u2699 bash_output: {shell_id}",
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_bash_output,
+            "shell_id": shell_id,
+            "filter": filter_arg or None,
+        }
+
+    def _prepare_kill_shell(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        shell_id = str(args.get("id") or "").strip()
+        if not shell_id:
+            return {
+                "call_id": call_id,
+                "func_name": "kill_shell",
+                "header": "\u2717 kill_shell: missing id",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: missing id (the bash_N handle returned when the shell started)",
+            }
+        # Auto-approved: the argument space is closed (this session's own
+        # registered shells) and killing one is strictly risk-reducing —
+        # the dangerous direction was gated when the shell was started.
+        return {
+            "call_id": call_id,
+            "func_name": "kill_shell",
+            "header": f"\u2699 kill_shell: {shell_id}",
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_kill_shell,
+            "shell_id": shell_id,
         }
 
     @property
@@ -10732,8 +11361,9 @@ class ChatSession:
         rather than draining again (the predicate-aware drain runs once, in
         ``deliver_wake_nudge_from_queue``).
         """
-        if self._wake_drained_reminders is not None:
-            entries = self._wake_drained_reminders
+        from_wake = self._wake_drained_reminders is not None
+        if from_wake:
+            entries = self._wake_drained_reminders or []
             self._wake_drained_reminders = None  # consume — only delivered once
         else:
             items = self._nudge_queue.drain(USER_DRAIN)
@@ -10743,12 +11373,24 @@ class ChatSession:
                 if meta:
                     entry.update(meta)
                 entries.append(entry)
-        for entry in entries:
+        for i, entry in enumerate(entries):
             source = str(entry.get("type") or "")
             if not source:
                 continue
             meta = {k: v for k, v in entry.items() if k not in ("type", "text")}
-            self._append_system_turn(source, str(entry.get("text") or ""), **meta)
+            try:
+                self._append_system_turn(source, str(entry.get("text") or ""), **meta)
+            except BaseException:
+                if from_wake:
+                    # Mid-batch failure on a wake: re-stash the un-emitted
+                    # TAIL (including the failing entry — its persistence is
+                    # UNKNOWN; at-least-once beats silently-eaten for an
+                    # exit notice that fires exactly once) so the wake
+                    # caller's finally can re-enqueue instead of losing the
+                    # suffix.  Non-wake callers drain directly and keep the
+                    # pre-existing best-effort semantics.
+                    self._wake_drained_reminders = entries[i:]
+                raise
 
     def _queue_tool_advisory(self, nudge_type: str, text: str) -> None:
         """Queue a metacognitive nudge for the next tool-result batch.
@@ -10805,16 +11447,34 @@ class ChatSession:
         post-retry stream failure leaves them in place — operator
         intervention is required for the underlying failure anyway.
         """
-        items = self._nudge_queue.drain(USER_DRAIN)
-        if not items:
+        # Two-pass drain: wake-eligible channels first.  ``"quiet"`` entries
+        # (external events demoted by a user cancel) ride a wake earned by
+        # others but never justify one — if every wake-eligible candidate
+        # evaporated at drain time (``valid_until``), bail WITHOUT touching
+        # the quiet entries: they stay queued for the next legitimate seam
+        # instead of resuming a workstream the user stopped.  The merged
+        # batch is re-sorted by queue insertion ``seq`` so cross-channel
+        # chronology survives the two passes (a demoted poll-4 fire must
+        # not render after the poll-5 fire that earned the wake).
+        drained = self._nudge_queue.drain_entries(WAKE_PENDING)
+        if not drained:
             return
+        drained += self._nudge_queue.drain_entries(QUIET_DRAIN)
+        drained.sort(key=lambda e: e.seq)
         self._wake_source_tag = "system_nudge"
         wake_reminders: list[dict[str, Any]] = []
-        for nudge_type, text, meta in items:
-            entry: dict[str, Any] = {"type": nudge_type, "text": text}
-            if meta:
-                entry.update(meta)
+        # Identity map from reminder dict → its source Entry: the failure
+        # path recovers each un-emitted entry by ``id(reminder)`` lookup,
+        # never by index arithmetic, so it stays correct even if a future
+        # edit filters or reorders the reminder list between here and
+        # ``_emit_pending_user_nudges``.
+        entry_by_reminder: dict[int, Entry] = {}
+        for queued in drained:
+            entry: dict[str, Any] = {"type": queued.nudge_type, "text": queued.text}
+            if queued.metadata:
+                entry.update(queued.metadata)
             wake_reminders.append(entry)
+            entry_by_reminder[id(entry)] = queued
         self._wake_drained_reminders = wake_reminders
         try:
             self.send("", from_wake=True)
@@ -10828,7 +11488,36 @@ class ChatSession:
             log.info("wake_nudge.cancelled ws=%s", self._ws_id[:8])
         finally:
             self._wake_source_tag = ""
+            undelivered = self._wake_drained_reminders
             self._wake_drained_reminders = None
+            if undelivered:
+                # The send died before ``_emit_pending_user_nudges`` finished
+                # the batch (it re-stashes the un-emitted TAIL on a mid-batch
+                # failure, and nulls the attr only when done).  Recovery is
+                # EXTERNAL-notices-only, and always to ``"quiet"``:
+                # ``requeue`` keeps seq (a re-queued poll-4 still renders
+                # before poll-5 on the retry) and the ``valid_until``
+                # predicate (a stale notice stays droppable), while quiet
+                # keeps the entry OUT of the wake gate.  A ``"user"``
+                # advisory is deliberately DROPPED instead: re-queueing it
+                # wake-eligible re-arms ``_retry_pending_wake``'s zero-
+                # backoff worker-exit gate — a repeatable pre-consumption
+                # send failure would respawn wake workers in an unbounded
+                # hot loop (persisting an orphan synthetic user turn per
+                # spin).  Losing a generation-scoped metacog hint on a
+                # rare failed wake is the strictly smaller harm.
+                for reminder in undelivered:
+                    recovered = entry_by_reminder.get(id(reminder))
+                    if recovered is None or not recovered.text:
+                        continue
+                    if recovered.channel == "user":
+                        log.debug(
+                            "wake_nudge.user_advisory_dropped ws=%s type=%s",
+                            self._ws_id[:8],
+                            recovered.nudge_type,
+                        )
+                        continue
+                    self._nudge_queue.requeue(recovered, channel=QUIET_CHANNEL)
 
     def _apply_post_execute_advisories(
         self,
@@ -10871,10 +11560,19 @@ class ChatSession:
         for i, (tc_id, output) in enumerate(results):
             tc = _tc_by_id.get(tc_id)
             if tc and isinstance(output, str):
+                # Delta-cursor readers (``_REPEAT_EXEMPT_TOOLS``): identical
+                # args ARE the documented usage (poll the same handle) and
+                # the result differs by construction — a "result is the
+                # same" warning would be factually false.  They are still
+                # RECORDED (never skipped): the detector's contract is that
+                # any different signature breaks a streak, so an exempt call
+                # interleaved between identical bash calls must keep those
+                # bash calls from reading as consecutive.
+                exempt = tc["function"]["name"] in _REPEAT_EXEMPT_TOOLS
                 raw = tc["function"]["name"] + ":" + tc["function"]["arguments"]
                 sig = hashlib.sha256(raw.encode()).hexdigest()
                 is_json = output.lstrip().startswith(("{", "["))
-                if self._repeat_detector.record(sig):
+                if self._repeat_detector.record(sig) and not exempt:
                     _repeat_detected = True
                     if not is_json:
                         output += (
@@ -10976,21 +11674,16 @@ class ChatSession:
         """Return ``args[key]`` as a bool with robust string coercion.
 
         Plain ``bool(x)`` treats ``"false"`` as truthy (non-empty string).
-        Accept actual bools verbatim; parse common string forms; return
-        ``default`` for anything else.
+        Accept actual bools verbatim; delegate the truthy dialect to
+        :func:`_is_truthy_flag` (ONE coercion dialect file-wide); return
+        ``default`` for a missing key or an unrecognized string.
         """
         val = args.get(key)
-        if isinstance(val, bool):
-            return val
-        if isinstance(val, str):
-            normalized = val.strip().lower()
-            if normalized in ("true", "1", "yes", "on"):
-                return True
-            if normalized in ("false", "0", "no", "off", ""):
-                return False
-        if isinstance(val, (int, float)) and not isinstance(val, bool):
-            return bool(val)
-        return default
+        if val is None:
+            return default
+        if isinstance(val, str) and val.strip().lower() not in _KNOWN_BOOL_STRINGS:
+            return default
+        return _is_truthy_flag(val)
 
     @staticmethod
     def _flatten_spawn_arg(value: Any, cap: int) -> str:
@@ -14031,25 +14724,19 @@ class ChatSession:
         call_id, command = item["call_id"], item["command"]
         timeout = item.get("timeout") or self.tool_timeout
         try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
-                preamble = "set -o pipefail\n"
-                if item.get("stop_on_error"):
-                    preamble += "set -e\n"
-                f.write(preamble + command)
-                script_path = f.name
-            # Pre-bind so the ``finally`` can't raise ``UnboundLocalError`` and
-            # mask the real error if ``Popen`` below fails.
+            # Pre-bind so the ``finally`` can't raise ``UnboundLocalError``
+            # and mask the real error if the spawn below fails.
             proc: subprocess.Popen[str] | None = None
+            script_path: str | None = None
             try:
                 from turnstone.core.env import scrubbed_env
 
-                proc = subprocess.Popen(
-                    ["bash", script_path],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    errors="replace",
-                    start_new_session=True,
+                # Shared prologue with the background registry (script file +
+                # detached group leader + pgid snapshot) — one spawn recipe
+                # for both variants of the tool, so they cannot drift.
+                proc, pgid, script_path = spawn_group_leader(
+                    command,
+                    stop_on_error=item.get("stop_on_error") is True,
                     env=scrubbed_env(extra=self._skill_resource_env()),
                 )
                 with self._procs_lock:
@@ -14065,54 +14752,38 @@ class ChatSession:
                 stdout_parts: list[str] = []
                 stderr_lines: list[str] = []
 
-                def _drain(pipe: Any, sink: list[str], to_ui: bool) -> None:
+                # End-of-stream tolerance lives in the shared
+                # ``drain_pipe_lines`` (the drain half of the recipe both
+                # bash variants share); only the sinks differ — stdout also
+                # streams to the UI.
+                def _on_stdout(line: str) -> None:
+                    stdout_parts.append(line)
                     try:
-                        for line in pipe:
-                            sink.append(line)
-                            if to_ui:
-                                try:
-                                    self.ui.on_tool_output_chunk(call_id, line)
-                                except Exception:
-                                    log.debug(
-                                        "UI callback error during tool output",
-                                        exc_info=True,
-                                    )
-                    except (ValueError, OSError):
-                        # Pipe torn down by the session-group kill below is the
-                        # expected case; anything else must not kill the drain
-                        # silently.  (Undecodable bytes can't land here — the
-                        # ``errors="replace"`` on Popen pre-empts UnicodeDecodeError,
-                        # which is a ValueError that would otherwise drop all output.)
-                        log.debug("bash.drain_read_error", exc_info=True)
+                        self.ui.on_tool_output_chunk(call_id, line)
+                    except Exception:
+                        log.debug("UI callback error during tool output", exc_info=True)
 
                 assert proc.stdout is not None and proc.stderr is not None
                 stdout_thread = threading.Thread(
-                    target=_drain,
-                    args=(proc.stdout, stdout_parts, True),
+                    target=drain_pipe_lines,
+                    args=(proc.stdout, _on_stdout),
                     name=f"bash-drain-out-{call_id}",
                     daemon=True,
                 )
                 stderr_thread = threading.Thread(
-                    target=_drain,
-                    args=(proc.stderr, stderr_lines, False),
+                    target=drain_pipe_lines,
+                    args=(proc.stderr, stderr_lines.append),
                     name=f"bash-drain-err-{call_id}",
                     daemon=True,
                 )
                 stdout_thread.start()
                 stderr_thread.start()
 
-                # Snapshot the session-group id while the leader is alive
-                # (``start_new_session=True`` makes ``pgid == proc.pid``).  While
-                # any member survives, the group names only our own descendants;
-                # once they have all exited it is empty and the kill below is a
-                # harmless no-op.  (A pid-wraparound landing a fresh session
-                # leader on this exact id in the microseconds after a normal-exit
-                # reap is the standard accepted TOCTOU — negligible, and only when
-                # nothing needs killing anyway.)
-                try:
-                    pgid = os.getpgid(proc.pid)
-                except OSError:
-                    pgid = proc.pid
+                # ``pgid`` was snapshotted by ``spawn_group_leader`` while the
+                # leader was alive.  While any member survives, the group
+                # names only our own descendants; once they have all exited
+                # it is empty and the kill below is a harmless no-op (the
+                # accepted microseconds pid-wraparound TOCTOU).
 
                 # Wait for the tracked command, bounded by ``timeout`` and
                 # cooperatively cancellable.  Keyed on process exit, never pipe
@@ -14156,7 +14827,10 @@ class ChatSession:
                 if proc is not None:
                     with self._procs_lock:
                         self._active_procs.discard(proc)
-                os.unlink(script_path)
+                # ``spawn_group_leader`` already unlinked on a failed fork —
+                # ``script_path`` stays None on that path.
+                if script_path is not None:
+                    os.unlink(script_path)
 
             if timed_out.is_set():
                 raise subprocess.TimeoutExpired(cmd="bash", timeout=timeout)
@@ -14223,6 +14897,184 @@ class ChatSession:
             msg = f"Error executing command: {e}"
             self._report_tool_result(call_id, "bash", msg, is_error=True)
             return call_id, msg
+
+    def _exec_bash_background(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Start ``command`` as a detached background shell (#817).
+
+        Returns immediately with the ``bash_N`` handle — the shell's later
+        output/exit is a NEW event (a NudgeQueue notice at the next seam),
+        never a deferred resolution of this call_id, so the canonical
+        trajectory stays faithful on replay.
+        """
+        call_id, command = item["call_id"], item["command"]
+        from turnstone.core.env import scrubbed_env
+
+        try:
+            shell = self._background_shells.spawn(
+                command,
+                env=scrubbed_env(extra=self._skill_resource_env()),
+                owner=_active_shell_owner.get(),
+                stop_on_error=item.get("stop_on_error") is True,
+            )
+        except (RuntimeError, OSError) as e:
+            # TooManyShellsError / registry-closed / spawn failure — all
+            # actionable by the model (kill one, or just don't background).
+            msg = f"Error: {e}"
+            self._report_tool_result(call_id, "bash", msg, is_error=True)
+            return call_id, msg
+        msg = (
+            f"Started background shell {shell.shell_id} (pid {shell.pid}). "
+            f'Read new output with bash_output(id="{shell.shell_id}"); stop it with '
+            f'kill_shell(id="{shell.shell_id}").'
+        )
+        if shell.owner is None:
+            msg += " It runs until it exits or is killed; a system notice will announce its exit."
+        else:
+            # Sub-agent scope: the shell dies with this agent.  Said here so
+            # the agent doesn't promise its parent a server that will be
+            # reaped the moment it returns.
+            msg += (
+                " It is scoped to this agent and will be terminated when the "
+                "agent finishes — do not report it to your caller as still "
+                "running; read/verify what you need before returning."
+            )
+        self._report_tool_result(call_id, "bash", msg)
+        return call_id, msg
+
+    def _exec_bash_output(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Delta read of a background shell: only output since the last read."""
+        call_id, shell_id = item["call_id"], item["shell_id"]
+        filter_arg = item.get("filter")
+        try:
+            read = self._background_shells.read(
+                shell_id, owner=_active_shell_owner.get(), filter_pattern=filter_arg
+            )
+        except UnknownShellError as e:
+            msg = f"Error: {e}"
+            self._report_tool_result(call_id, "bash_output", msg, is_error=True)
+            return call_id, msg
+        except (FilterTimeoutError, FilterExecError) as e:
+            # A VALID pattern that blew the time bound, or a helper failure
+            # that wasn't the pattern's fault — either way nothing was
+            # consumed and the message says which and what to do.
+            msg = f"Error: {e}"
+            self._report_tool_result(call_id, "bash_output", msg, is_error=True)
+            return call_id, msg
+        except re.error as e:
+            msg = f"Error: invalid filter regex: {e}"
+            self._report_tool_result(call_id, "bash_output", msg, is_error=True)
+            return call_id, msg
+
+        # Exit code rides ANY exited state — the schema promises it "once
+        # the shell has exited", and a killed shell has one too (the signal
+        # number, negated).
+        if read.exit_code is not None:
+            state = f"{read.status}, exit code {read.exit_code}"
+        else:
+            state = read.status
+        parts = [f"{shell_id} ({state})"]
+        if read.dropped_lines:
+            parts.append(f"[{read.dropped_lines} earlier line(s) dropped from the buffer]")
+        if read.clipped_lines:
+            # A "none matching" answer over clipped evidence must never be
+            # silent — the model would report a clean run whose error sat
+            # past the match window.
+            parts.append(
+                f"[{read.clipped_lines} line(s) longer than {_FILTER_MAX_LINE_CHARS} "
+                "chars were only partially visible to the filter; matches beyond "
+                "that window are not detected — read without a filter to see them]"
+            )
+        if read.lines:
+            if filter_arg:
+                parts.append(
+                    f"{len(read.lines)} of {read.new_line_count} new line(s) match the filter:"
+                )
+            else:
+                parts.append(f"{read.new_line_count} new line(s):")
+            parts.append("".join(read.lines).rstrip("\n"))
+        elif read.new_line_count:
+            parts.append(f"{read.new_line_count} new line(s), none matching the filter.")
+        else:
+            parts.append("No new output since the last read.")
+        full = "\n".join(parts)
+        output = self._truncate_output(full)
+        if len(output) < len(full):
+            # Unlike foreground bash (re-run to re-see), the delta cursor has
+            # already consumed the elided middle — say so, or a "no new
+            # output" follow-up reads as "nothing was missed".
+            output += (
+                "\n[the truncated middle was consumed and cannot be re-read; "
+                "use filter to narrow future reads]"
+            )
+        self._report_tool_result(call_id, "bash_output", output)
+        return call_id, output
+
+    def _exec_kill_shell(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Kill a background shell's whole process group."""
+        call_id, shell_id = item["call_id"], item["shell_id"]
+        try:
+            shell = self._background_shells.kill(shell_id, owner=_active_shell_owner.get())
+        except UnknownShellError as e:
+            msg = f"Error: {e}"
+            self._report_tool_result(call_id, "kill_shell", msg, is_error=True)
+            return call_id, msg
+        if shell.status == "killed":
+            msg = (
+                f"Killed background shell {shell_id}. Output produced before the "
+                f'kill remains readable via bash_output(id="{shell_id}") until it '
+                "ages out of the recent-shells list."
+            )
+        elif shell.status == "running":
+            # SIGKILL was sent but the leader didn't exit within the join
+            # budget (uninterruptible sleep — NFS, a driver).  Outcome
+            # honesty: never tell the model a live process already exited.
+            msg = (
+                f"SIGKILL sent to background shell {shell_id}, but it has not "
+                "exited yet (possibly uninterruptible I/O). It may still die "
+                f'shortly — check bash_output(id="{shell_id}") before assuming '
+                "it is gone."
+            )
+        else:
+            msg = (
+                f"Background shell {shell_id} had already exited "
+                f"(status: {shell.status}, exit code {shell.exit_code}); nothing to kill."
+            )
+        self._report_tool_result(call_id, "kill_shell", msg)
+        return call_id, msg
+
+    def _on_background_shell_exit(self, shell: BackgroundShell) -> None:
+        """Waiter-thread callback: queue an exit notice for a detached shell.
+
+        Rides the watch rail: channel ``"any"`` (drains at whichever seam
+        fires first AND can wake an idle workstream — a ``"tool"`` entry
+        could do neither), an explicit wake for the already-idle case, and
+        a ``valid_until`` predicate so a notice whose shell is gone
+        (registry closed with the workstream) is dropped, not delivered.
+        Push the notice, let the model pull the detail via ``bash_output``
+        — bounds context.  Sub-agent shells get no notice: the sub-loop is
+        synchronous and polls; its shells die with it.
+        """
+        if shell.owner is not None:
+            return
+        cmd_excerpt = shell.command.split("\n")[0][:80]
+        unread = shell.unread_lines
+        registry = self._background_shells
+        shell_id = shell.shell_id
+        self._notify_external_event(
+            "background_shell_exit",
+            (
+                f"Background shell {shell_id} ({cmd_excerpt}) exited with code "
+                f"{shell.exit_code} — {unread} unread line(s); use "
+                f'bash_output(id="{shell_id}") to read them.'
+            ),
+            metadata={
+                "shell_id": shell_id,
+                "command": cmd_excerpt,
+                "exit_code": shell.exit_code,
+                "unread_lines": unread,
+            },
+            valid_until=lambda: registry.has(shell_id),
+        )
 
     @staticmethod
     def _read_text_lines(path: str) -> tuple[list[str], str, str | None]:
@@ -14625,10 +15477,14 @@ class ChatSession:
     ) -> Iterator[tuple[ToolCall, Turn | None]]:
         """Yield ``(tool_call, result_turn_or_None)`` for every sub-tool the
         sub-agent issued, in order, pairing each call to its result FIFO per
-        call_id — a queue per id consumed once, NOT a last-wins dict, so a local
-        provider that reuses ids across turns (``call_0`` …) can't collapse
-        distinct calls onto one result.  Shared by :meth:`_project_agent_steps`
-        (recall) and :meth:`_cancel_ledger` (cancel disposition)."""
+        call_id.  Parented runs mint session-unique ids
+        (``{parent}::r{run}s{step}::{provider_id}``, see :meth:`_run_agent`),
+        so for them this is a plain unique-key pairing; the FIFO queue stays as
+        honest pairing for id-colliding input a mint never touched (an
+        unparented run, or turns constructed directly), where last-wins would
+        collapse distinct calls onto one result.  Shared by
+        :meth:`_project_agent_steps` (recall) and :meth:`_cancel_ledger`
+        (cancel disposition)."""
         pending: dict[str, collections.deque[Turn]] = {}
         for t in agent_turns:
             if t.role is Role.TOOL and t.tool_call_id:
@@ -14780,49 +15636,70 @@ class ChatSession:
         if not agent_caps.supports_web_search and not self._resolve_search_client():
             tools = _without_tool(tools, "web_search")
 
-        # Build extra params for agent calls — resolve server compat from the
-        # agent's own model alias, not the session's primary model.
-        agent_extra = self._provider_extra_params(
-            provider=agent_provider,
-            model_alias=agent_alias,
+        # The agent's resolved lane.  Caps and extra_params are computed once
+        # per run (above, against the agent's own alias); the live per-call
+        # operator flags (replay-reasoning, Phase 5 vLLM attach) re-resolve
+        # inside ``model_turn`` through the carried registry, so mid-session
+        # admin toggles keep applying exactly as they did pre-extraction.
+        # Session-knob relay is SAME-LANE ONLY: on the fall-through (agent
+        # runs the session's own model) the workstream/user-resolved session
+        # temperature and effort apply to sub-agent calls exactly as they do
+        # to the main loop; on a distinct task alias neither relays — a
+        # relay there would make the task alias's own configured knobs
+        # unreachable (the model's configuration is the source of truth).
+        # Agent trajectories stay excluded from the persistence/replay
+        # contract — history is in-memory, rebuilt per ``_run_agent``
+        # invocation; the native lane carried here serves the WITHIN-RUN
+        # reasoning continuity of the agent's own tool loop.
+        same_lane = (agent_alias or "") == (self._model_alias or "")
+        lane = resolve_lane(
+            agent_provider,
+            agent_client,
+            agent_model,
+            alias=agent_alias or "",
+            registry=self._registry,
+            capabilities=agent_caps,
+            config_store=self._config_store,
         )
 
         def _api_call(
             turns: list[Turn],
             _tools: list[dict[str, Any]] | None = tools,
-        ) -> CompletionResult:
-            # NOTE: Phase 5 vLLM ``reasoning`` field replay is intentionally
-            # NOT wired here.  Agent assistant messages are built from
-            # ``CompletionResult.content + tool_calls`` only (no
-            # ``_provider_content`` carried), so the helper would no-op
-            # every turn anyway.  Task agents are excluded from the
-            # persistence/replay contract — their conversation history
-            # is in-memory and rebuilt per ``_run_agent`` invocation.
-            # Lower the trajectory once, not once per retry attempt — ``turns``
-            # is invariant across attempts (the retry path only sleeps and
-            # re-sends the same messages).
-            wire = dicts_from_turns(turns)
+        ) -> ModelTurnResult:
+            # One plant call per attempt through ``model_turn`` — the seam
+            # passes (sanitize, minted-id restore, Phase 5 reasoning attach)
+            # and the native-lane re-ingest live there now, shared with every
+            # lane (#827).  Retry policy at THIS layer stays here: the
+            # sub-harness owns its backoff and salvage semantics.
+            # ``model_turn`` itself re-issues only drain-time mid-stream
+            # deaths (2 attempts, its own short backoff — the request-level
+            # retry the SDK gave the retired non-streaming transport), so
+            # the two ladders stack multiplicatively on transient-shaped
+            # failures; both are short, and a deterministic failure (e.g. a
+            # server that never sends finish reasons) burns
+            # (_MAX_RETRIES+1) x (drain attempts) calls before the
+            # remediation error surfaces.  Re-lowering per attempt is fine —
+            # the passes are deterministic and ``turns``/``wire_id_map`` are
+            # invariant across attempts (the retry path only sleeps and
+            # re-sends).
             last_err: Exception | None = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:
-                    agent_result = agent_provider.create_completion(
-                        client=agent_client,
-                        model=agent_model,
-                        messages=wire,
+                    agent_result = model_turn(
+                        lane,
+                        turns,
                         tools=_tools,
                         max_tokens=self.max_tokens,
-                        temperature=self.temperature,
-                        reasoning_effort=reasoning_effort or self.reasoning_effort,
-                        extra_params=agent_extra,
-                        capabilities=agent_caps,
-                        replay_reasoning_to_model=self._resolve_replay_reasoning_to_model(
-                            agent_alias, caps=agent_caps
-                        ),
+                        temperature=self.temperature if same_lane else None,
+                        reasoning_effort=reasoning_effort
+                        or (self.reasoning_effort if same_lane else None),
+                        mint=mint,
+                        wire_id_map=wire_id_map,
                     )
                     # Sub-agent turns bypass on_status — record per-turn so
                     # task-agent spend is visible in the dashboard, attributed
                     # to the agent's own model.
-                    self._record_aux_usage(agent_result, model=agent_model)
+                    self._record_aux_usage(agent_result.usage, model=agent_model)
                     return agent_result
                 except Exception as e:
                     ename = type(e).__name__
@@ -14833,11 +15710,65 @@ class ChatSession:
                     last_err = e
                     delay = self._RETRY_BASE_DELAY * (2**attempt)
                     self.ui.on_info(f"[{label} retrying in {delay:.0f}s: {ename}]")
-                    time.sleep(delay)
+                    # Cancel-aware backoff: a Stop mid-agent-retry aborts
+                    # the run instead of burning the delay + one more call.
+                    self._backoff_or_cancelled(delay)
             assert last_err is not None  # unreachable
             raise last_err
 
         turn = 0
+        # Mint tags for sub-tool ids.  ``run_seq`` is session-unique per
+        # _run_agent invocation — the parent call id alone can repeat across
+        # runs when a local provider reuses per-response ids for the PARENT
+        # task_agent call too.  ``sub_step_seq`` is monotonic across the
+        # WHOLE run, so ids stay distinct across turns even when the provider
+        # reuses per-response ids ("call_0") for sub-tools.
+        # ``wire_id_map`` records minted → provider-original for every mint
+        # (written inside ``model_turn`` at re-ingest, read back by its
+        # restore pass on the next call).  The map is the recovery path —
+        # never string-split the mint suffix: the mint is not injective
+        # (parent and original are provider-controlled strings that may
+        # themselves contain ``::``-shaped substrings).
+        # LIFETIME INVARIANT: minted ids never outlive this invocation —
+        # the map is per-run, and with the native lane carried an unmapped
+        # minted id on the wire hard-orphans its tool_result (pinned by
+        # test_agent_native_lane_without_restore_map_orphans_the_result).
+        # If sub-turns ever become durable, persist the Turn-IR verbatim and
+        # RE-MINT at load (``run_seq`` is session-scoped, so stored tags
+        # can't be trusted across restarts), rebuilding this map from the
+        # native lane — its client tool blocks hold the provider originals,
+        # ordered 1:1 with the ``tool_calls`` mirror by construction (both
+        # are built from the same response in the same iteration on every
+        # lane).  Turns without native client tool blocks need no entries at
+        # all: wire ids only need intra-request consistency there.  Do NOT
+        # persist the map itself — it is derivable, and a second durable
+        # source of truth would have to be kept in lockstep with the turns.
+        with self._agent_run_seq_lock:
+            self._agent_run_seq += 1
+            run_seq = self._agent_run_seq
+        sub_step_seq = 0
+        wire_id_map: dict[str, str] = {}
+
+        def _mint_sub_id(original_id: str) -> str:
+            # ``{parent}::r{run}s{step}::{provider_id}``: the run tag
+            # de-collides RUNS (a reused parent id can't alias two agents'
+            # children); the step tag de-collides turns WITHIN one agent
+            # whose (local) provider reuses per-response sequential ids
+            # ("call_0") — pre-mint, that reuse collapsed the live card's
+            # DOM rows while FIFO recall kept them apart, so the two
+            # disagreed on identical input.  The parent segment keeps the
+            # id traceable and is what the frontend's "::" child checks
+            # key off.  Every downstream consumer (nesting registry,
+            # error-flags, DOM data-call-id, recall, cancel ledger) keys
+            # on this ONE id; the wire alone sees the provider's original
+            # ids restored from ``wire_id_map``.
+            nonlocal sub_step_seq
+            sub_step_seq += 1
+            return f"{parent_call_id}::r{run_seq}s{sub_step_seq}::{original_id}"
+
+        # Minting only nests sub-tools under a parent task_agent call — a
+        # top-level run (no parent → no nesting) keeps provider ids as-is.
+        mint: Callable[[str], str] | None = _mint_sub_id if parent_call_id else None
         while max_tool_turns < 0 or turn < max_tool_turns:
             self._check_cancelled()
             try:
@@ -14875,29 +15806,11 @@ class ChatSession:
                 return "(content filter)"
 
             # Append the assistant turn to the sub-harness trajectory.
-            agent_tool_calls: tuple[ToolCall, ...] = ()
-            if result.tool_calls:
-                self._ensure_tool_call_ids(result.tool_calls)
-                # Namespace sub-agent tool ids by the parent task_agent so the
-                # UI nesting registry can't collide across concurrent task
-                # agents whose (local) provider reuses sequential ids ("call_0").
-                # Tool-call ids are opaque correlation tokens — a provider
-                # validates only intra-request assistant/tool consistency on
-                # replay, never against its own prior generation — so rewriting
-                # them in this ephemeral sub-conversation is wire-safe.  Skipped
-                # for a top-level run (no parent → no nesting).
-                if parent_call_id:
-                    for tc in result.tool_calls:
-                        tc["id"] = f"{parent_call_id}::{tc['id']}"
-                agent_tool_calls = tuple(
-                    ToolCall(
-                        id=tc["id"],
-                        name=tc.get("function", {}).get("name", ""),
-                        arguments=tc.get("function", {}).get("arguments", ""),
-                    )
-                    for tc in result.tool_calls
-                )
-            agent_turns.append(Turn.assistant(result.content or "", tool_calls=agent_tool_calls))
+            # ``model_turn`` already ran the whole re-ingest: blank-id
+            # back-fill, the sub-tool mint (recorded in ``wire_id_map``),
+            # and the native-lane finalize via the shared builder
+            # (:func:`turnstone.core.model_turn.finalize_provider_blocks`).
+            agent_turns.append(result.turn)
 
             if not result.tool_calls:
                 content = result.content or "(no output)"
@@ -15040,7 +15953,7 @@ class ChatSession:
                 # it.  No consumer evaluates ``.text`` on a sub-agent tool turn
                 # today.  The proper by-reference representation needs the
                 # attachment resolver wired into this sub-agent's
-                # ``create_completion`` (it currently isn't) plus content-
+                # ``model_turn`` call (it currently isn't) plus content-
                 # addressed byte storage — deferred to the recall/persist work
                 # where that attachment path is already in scope.
                 agent_turns.append(Turn.tool(tc_dict["id"], output, is_error=is_tool_error))
@@ -15174,6 +16087,10 @@ class ChatSession:
         # sibling's reads can't suppress THIS agent's blind-overwrite guard.  The
         # agent's own reads merge back to the parent in ``finally``.
         read_token = _active_read_files.set(set(self._current_read_files))
+        # Background shells spawned by this sub-agent carry its call_id as
+        # owner: scoped lookup (parallel agents + parent can't touch them)
+        # and bound to the agent's lifetime — reaped in ``finally`` below.
+        shell_token = _active_shell_owner.set(call_id)
         try:
             result = self._run_agent(
                 agent_turns,
@@ -15228,6 +16145,8 @@ class ChatSession:
             _active_read_files.reset(read_token)
             if sub_reads:
                 self._current_read_files.update(sub_reads)
+            _active_shell_owner.reset(shell_token)
+            self._background_shells.reap(owner=call_id)
             self._end_agent_scope()
             self._clear_agent_children(call_id)
             try:
@@ -15251,9 +16170,10 @@ class ChatSession:
         unknown/none on a multi-call turn.) Shared by the disposition string and
         its typed status so the two can't disagree.
 
-        Pairs via :meth:`_iter_agent_tool_results` (FIFO per call_id), so on a
-        provider that reuses ids a half-answered colliding pair is correctly read
-        as one answered + one in-flight gap, not (set-membership) both answered.
+        Pairs via :meth:`_iter_agent_tool_results`: parented runs carry minted
+        unique ids, and on un-minted id-colliding input (unparented / direct
+        construction) the FIFO still reads a half-answered colliding pair as
+        one answered + one in-flight gap, not (set-membership) both answered.
         """
         issued = [
             ((tc.name or "tool").strip(), res is not None)
@@ -15754,7 +16674,10 @@ class ChatSession:
                         max_retries=self._NOTIFY_MAX_RETRIES,
                         retry_delay=delay,
                     )
-                    time.sleep(delay)
+                    # Cancel-aware: notify runs as an in-turn tool, so a
+                    # Stop aborts pending delivery retries with the turn
+                    # (the batch synthesizes the cancelled tool_result).
+                    self._backoff_or_cancelled(delay)
                     continue
                 log.warning("notify.no_services_exhausted")
                 msg = "Error: no channel gateway services available"
@@ -15803,7 +16726,8 @@ class ChatSession:
                     gateway_count=len(services),
                     retry_delay=delay,
                 )
-                time.sleep(delay)
+                # Same cancel-aware backoff as the no-services arm above.
+                self._backoff_or_cancelled(delay)
             else:
                 log.warning(
                     "notify.delivery_failed",
@@ -16263,24 +17187,18 @@ class ChatSession:
         try:
             result = self._utility_completion(
                 [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a web content extraction assistant. "
-                            "Answer the user's question using ONLY the "
-                            "provided page content. Be concise and factual. "
-                            "If the content doesn't contain the answer, say so."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Page URL: {url}\n"
-                            f"Page content ({original_len} chars):\n\n"
-                            f"{text}\n\n---\n"
-                            f"Question: {question}"
-                        ),
-                    },
+                    Turn.system(
+                        "You are a web content extraction assistant. "
+                        "Answer the user's question using ONLY the "
+                        "provided page content. Be concise and factual. "
+                        "If the content doesn't contain the answer, say so."
+                    ),
+                    Turn.user(
+                        f"Page URL: {url}\n"
+                        f"Page content ({original_len} chars):\n\n"
+                        f"{text}\n\n---\n"
+                        f"Question: {question}"
+                    ),
                 ],
                 max_tokens=min(self.max_tokens, self.context_window // 4),
                 reasoning_effort=self.reasoning_effort,
@@ -16505,6 +17423,7 @@ class ChatSession:
                 self.ui.on_info("Instructions updated.")
 
         elif cmd == "/skill":
+            previous_skill = self._skill_name or "defaults"
             if not arg:
                 if self._skill_name:
                     self.ui.on_info(f"Active skill: {self._skill_name}")
@@ -16512,11 +17431,19 @@ class ChatSession:
                     self.ui.on_info("Using defaults. Usage: /skill <name> or /skill clear")
             elif arg.strip().lower() == "clear":
                 self.set_skill(None)
+                self._append_system_turn(
+                    "skill_hint",
+                    f"Operator set the active skill from {previous_skill} to defaults.",
+                )
                 self.ui.on_info("Skill cleared; using defaults.")
             else:
                 tpl = get_skill_by_name(arg.strip())
                 if tpl:
                     self.set_skill(tpl["name"])
+                    self._append_system_turn(
+                        "skill_hint",
+                        f"Operator set the active skill from {previous_skill} to {tpl['name']}.",
+                    )
                     self.ui.on_info(f"Skill set: {tpl['name']}")
                 else:
                     self.ui.on_error(f"Skill not found: {arg.strip()}")
@@ -16533,6 +17460,13 @@ class ChatSession:
         elif cmd == "/new":
             from turnstone.core.memory import register_workstream
 
+            # Flush any stranded queued text BEFORE the identity swap so it
+            # is persisted into the workstream it was ADDRESSED to.  Sends
+            # during the command window itself defer in the /send route
+            # (ws._pending_sends) and never queue; this covers only a
+            # message stranded by a dying send worker's closing race
+            # before this command started.
+            self._flush_queued_messages()
             self.messages.clear()
             self._read_files.clear()
             self._repeat_detector.clear()
@@ -16595,6 +17529,10 @@ class ChatSession:
                 elif target_id == self._ws_id:
                     self.ui.on_info("Already in that workstream.")
                 else:
+                    # Same pre-swap flush as /new: stranded queued text is
+                    # persisted into the CURRENT workstream before resume()
+                    # swaps this session's identity to the target.
+                    self._flush_queued_messages()
                     try:
                         resumed: bool | None = self.resume(target_id)
                     except ValueError as exc:
@@ -16687,24 +17625,29 @@ class ChatSession:
                 self.context_window = cfg.context_window
                 if not self._manual_tool_truncation:
                     self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)
-                # Apply per-model sampling overrides, falling back to global
-                # defaults — mirrors session_factory() resolution logic so
-                # switching away from a model with overrides doesn't leak them.
+                # Re-resolve the sampling knobs for the new alias through the
+                # SAME shared resolvers session_factory uses, so switching
+                # away from a model with overrides doesn't leak them and
+                # every surface samples identically on the same alias.
+                # Unset resolves to None (wire omission), replacing any prior
+                # model's value.  STORE-LESS sessions (the CLI) are the
+                # exception: there the current knobs ARE the user's explicit
+                # flags (--temperature / /reason) — the only authority that
+                # exists — so the switch keeps them unless the new alias
+                # declares its own (mirrors the max_tokens fallback below).
                 cs = self._config_store
-                self.temperature = (
-                    cfg.temperature
-                    if cfg.temperature is not None
-                    else (cs.get("model.temperature") if cs else self.temperature)
-                )
+                if cs:
+                    self.temperature = resolve_temperature_setting(cfg, cs)
+                    self.reasoning_effort = resolve_effort_setting(cfg, cs)
+                else:
+                    if cfg.temperature is not None:
+                        self.temperature = cfg.temperature
+                    if cfg.reasoning_effort:
+                        self.reasoning_effort = cfg.reasoning_effort
                 self.max_tokens = (
                     cfg.max_tokens
                     if cfg.max_tokens is not None
                     else (cs.get("model.max_tokens") if cs else self.max_tokens)
-                )
-                self.reasoning_effort = (
-                    cfg.reasoning_effort
-                    if cfg.reasoning_effort is not None
-                    else (cs.get("model.reasoning_effort") if cs else self.reasoning_effort)
                 )
                 self._init_system_messages()
                 self._save_config()
@@ -16724,7 +17667,8 @@ class ChatSession:
             valid = ("low", "medium", "high")
             aliases = {"med": "medium", "lo": "low", "hi": "high"}
             if not arg:
-                self.ui.on_info(f"Reasoning effort: {cyan(self.reasoning_effort)}")
+                shown = self.reasoning_effort or "model default"
+                self.ui.on_info(f"Reasoning effort: {cyan(shown)}")
             else:
                 value = aliases.get(arg.lower(), arg.lower())
                 if value in valid:
@@ -16739,13 +17683,17 @@ class ChatSession:
                     self.ui.on_info(f"Invalid. Choose from: {', '.join(valid)}")
 
         elif cmd == "/compact":
-            try:
-                self._compact_messages()
-            except GenerationCancelled:
-                # Ctrl-C during a manual compaction aborts cleanly — the message
-                # swap never ran (the cancel-check precedes it), so history is
-                # intact, exactly like cancelling a send.
-                self.ui.on_info("Compaction cancelled.")
+            # Ctrl-C during a manual compaction aborts cleanly — the message
+            # swap never ran (the cancel-check precedes it), so history is
+            # intact, exactly like cancelling a send.  The lifecycle wrapper
+            # already emitted the cancelled end event, so every UI has been
+            # told; nothing more to print here.  Unexpected errors are also
+            # swallowed: the wrapper's manual-trigger backstop already fired
+            # on_error (the red row), and the CLI REPL calls handle_command
+            # with no try/except — re-raising would crash the whole REPL on
+            # a compaction failure (history is untouched on raising exits).
+            with contextlib.suppress(GenerationCancelled, Exception):
+                self.compact_now()
 
         elif cmd == "/creative":
             # Recognized but decommissioned: print a live migration pointer

@@ -14,6 +14,8 @@ import hashlib
 import os
 import re
 import secrets
+import threading
+import time
 import urllib.parse
 import uuid
 from dataclasses import dataclass, field
@@ -106,7 +108,8 @@ class OIDCConfig:
     Startup-config fields (set by :func:`load_oidc_config`):
         ``enabled``, ``issuer``, ``client_id``, ``client_secret``, ``scopes``,
         ``provider_name``, ``role_claim``, ``role_map``, ``password_enabled``,
-        ``redirect_base``, ``trusted_endpoint_hosts``, ``allow_private_network``.
+        ``redirect_base``, ``trusted_endpoint_hosts``, ``allow_private_network``,
+        ``capture_user_credential``, ``obo_grant_profile``.
 
     Discovery-derived fields (set by :func:`discover_oidc`; empty before
     discovery completes):
@@ -129,11 +132,28 @@ class OIDCConfig:
     # (and its same-origin discovered endpoints) to resolve to private
     # addresses. Link-local/multicast/reserved stay refused regardless.
     allow_private_network: bool = False
+    # Opt-in single-credential capture (issue #551): persist the user's IdP
+    # refresh token (encrypted) at login so `auth_type='oauth_obo'` MCP
+    # servers can mint per-server access tokens on demand.  Requires the
+    # [security] MCP token encryption key — enforced at startup.
+    capture_user_credential: bool = False
+    # Grant leg used to redeem the captured credential for per-server access
+    # tokens: "entra" (refresh-token redemption with scope=<audience>/.default)
+    # or "rfc8693" (refresh grant + standard token exchange).  The IdP
+    # determines the leg, so this is deployment-level, not per-server.
+    obo_grant_profile: str = "entra"
     # Discovered from .well-known/openid-configuration
     authorization_endpoint: str = ""
     token_endpoint: str = ""
     userinfo_endpoint: str = ""
     jwks_uri: str = ""
+    # True when ``enabled`` was forced False by a discovery failure that a
+    # later retry could clear (IdP unreachable / bad gateway page at boot),
+    # as opposed to operator config problems (bad issuer URL, SSRF-rejected
+    # endpoints) where retrying is pointless. Consumed by
+    # :func:`maybe_rediscover_oidc` — without it a node that boots during a
+    # transient IdP outage can never mint oauth_obo tokens until restarted.
+    discovery_retryable: bool = False
 
 
 def _parse_role_map(raw: str) -> dict[str, str]:
@@ -197,6 +217,32 @@ def load_oidc_config() -> OIDCConfig:
     allow_private_network = _env_or_cfg_bool(
         "TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK", cfg, "allow_private_network", False
     )
+    capture_user_credential = _env_or_cfg_bool(
+        "TURNSTONE_OIDC_CAPTURE_USER_CREDENTIAL", cfg, "capture_user_credential", False
+    )
+    obo_grant_profile = _env_or_cfg_str(
+        "TURNSTONE_OIDC_OBO_GRANT_PROFILE", cfg, "obo_grant_profile", "entra"
+    ).strip()
+    # Validate against the operative mint-leg registry (single source of truth,
+    # so a new leg needs no second edit here). Function-level import: oidc and
+    # mcp_oauth reference each other's runtime helpers (mcp_oauth's mint path
+    # imports this module's ``maybe_rediscover_oidc`` likewise lazily), so BOTH
+    # directions stay off the module-import graph to keep the cycle unrealised —
+    # neither module may import the other at module scope.
+    from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
+
+    if obo_grant_profile not in OBO_GRANT_PROFILES:
+        log.warning(
+            "oidc: unknown obo_grant_profile %r (expected one of %s) — "
+            "oauth_obo MCP servers will not mint until this is fixed",
+            obo_grant_profile,
+            ", ".join(sorted(OBO_GRANT_PROFILES)),
+        )
+    if capture_user_credential and "offline_access" not in scopes.split():
+        # The captured credential IS the offline_access refresh token; ask
+        # for it at login so operators don't have to edit two keys in step.
+        scopes = f"{scopes} offline_access".strip()
+        log.info("oidc.capture: appended offline_access to login scopes")
 
     # Role map: env var is "admin:builtin-admin,eng:builtin-operator"
     role_map_raw = os.environ.get("TURNSTONE_OIDC_ROLE_MAP", "").strip()
@@ -289,6 +335,8 @@ def load_oidc_config() -> OIDCConfig:
         redirect_base=redirect_base,
         trusted_endpoint_hosts=trusted_endpoint_hosts,
         allow_private_network=allow_private_network,
+        capture_user_credential=capture_user_credential,
+        obo_grant_profile=obo_grant_profile,
     )
 
 
@@ -401,8 +449,14 @@ async def discover_oidc(
     setup across calls; when ``None`` a transient client is used (the
     legacy shape, kept so tests don't need lifecycle management).
     """
+    # Config-error branches force ``discovery_retryable=False`` (terminal): they
+    # reflect a bad CONFIG (no issuer, an SSRF-rejected URL), not a transient IdP
+    # outage, so a runtime re-probe would only fail identically forever. This is
+    # explicit rather than preserved-from-input because ``maybe_rediscover_oidc``
+    # probes with the retryable boot config (``discovery_retryable=True``); left
+    # preserved, a config-invalid IdP would re-probe every cooldown window.
     if not config.issuer:
-        return dataclasses.replace(config, enabled=False)
+        return dataclasses.replace(config, enabled=False, discovery_retryable=False)
 
     try:
         issuer_parsed = _validate_url_no_ssrf(
@@ -410,7 +464,7 @@ async def discover_oidc(
         )
     except OIDCError as exc:
         log.warning("OIDC issuer URL rejected: %s", exc)
-        return dataclasses.replace(config, enabled=False)
+        return dataclasses.replace(config, enabled=False, discovery_retryable=False)
 
     url = config.issuer.rstrip("/") + "/.well-known/openid-configuration"
     try:
@@ -424,17 +478,19 @@ async def discover_oidc(
                 resp.raise_for_status()
                 doc = resp.json()
     except (httpx.HTTPError, ValueError, KeyError) as exc:
-        # ValueError covers json.JSONDecodeError (subclass).
+        # ValueError covers json.JSONDecodeError (subclass). Retryable: the
+        # IdP being unreachable at boot says nothing about the config.
         log.warning("OIDC discovery failed for %s: %s", config.issuer, exc, exc_info=True)
-        return dataclasses.replace(config, enabled=False)
+        return dataclasses.replace(config, enabled=False, discovery_retryable=True)
 
     if not isinstance(doc, dict):
+        # Retryable: a proxy/CDN error page in front of a healthy IdP.
         log.warning(
             "OIDC discovery document for %s is not a JSON object (got %s)",
             config.issuer,
             type(doc).__name__,
         )
-        return dataclasses.replace(config, enabled=False)
+        return dataclasses.replace(config, enabled=False, discovery_retryable=True)
 
     authorization_endpoint = str(doc.get("authorization_endpoint", ""))
     token_endpoint = str(doc.get("token_endpoint", ""))
@@ -442,11 +498,13 @@ async def discover_oidc(
     jwks_uri = str(doc.get("jwks_uri", ""))
 
     if not authorization_endpoint or not token_endpoint or not jwks_uri:
+        # Retryable: could equally be a degraded IdP serving a partial
+        # document; a genuinely misconfigured IdP just re-warns once per cooldown.
         log.warning(
             "OIDC discovery document missing required endpoints for %s",
             config.issuer,
         )
-        return dataclasses.replace(config, enabled=False)
+        return dataclasses.replace(config, enabled=False, discovery_retryable=True)
 
     allow_http = is_localhost(issuer_parsed.hostname or "")
     trusted_hosts = frozenset(h.lower() for h in config.trusted_endpoint_hosts)
@@ -465,8 +523,10 @@ async def discover_oidc(
                 allow_private=config.allow_private_network,
             )
         except OIDCError as exc:
+            # Config error (discovered endpoint fails SSRF/validation), not a
+            # transient outage — latch terminal so rediscovery stops re-probing.
             log.warning("OIDC discovered %s rejected (url=%s): %s", name, endpoint_url, exc)
-            return dataclasses.replace(config, enabled=False)
+            return dataclasses.replace(config, enabled=False, discovery_retryable=False)
 
     if userinfo_endpoint:
         try:
@@ -483,7 +543,8 @@ async def discover_oidc(
                 userinfo_endpoint,
                 exc,
             )
-            return dataclasses.replace(config, enabled=False)
+            # Config error — latch terminal (see the issuer-rejection branch).
+            return dataclasses.replace(config, enabled=False, discovery_retryable=False)
 
     log.info("OIDC discovery complete: %s", config.issuer)
     return dataclasses.replace(
@@ -578,7 +639,11 @@ async def initialize_oidc_state(app_state: Any) -> None:
             cfg = await discover_oidc(cfg, client=transient_client)
         except Exception:
             log.warning("OIDC discovery failed -- OIDC login disabled", exc_info=True)
-            app_state.oidc_config = dataclasses.replace(cfg, enabled=False)
+            # Unexpected failure — allow the runtime retry path to probe it
+            # (cooldown-gated), matching the in-band transient branches.
+            app_state.oidc_config = dataclasses.replace(
+                cfg, enabled=False, discovery_retryable=True
+            )
             app_state.jwks_data = None
             app_state.oidc_http_client = None
             return
@@ -618,6 +683,102 @@ async def initialize_oidc_state(app_state: Any) -> None:
     app_state.oidc_config = cfg
     app_state.jwks_data = jwks_data
     log.info("OIDC enabled: %s (%s)", cfg.provider_name, cfg.issuer)
+
+
+#: Minimum spacing between runtime discovery retries — one probe GET to the
+#: IdP per node per window while it stays down, however many callers ask.
+_REDISCOVER_COOLDOWN_SECONDS = 60.0
+
+#: Guards lazy creation of the per-app-state gate below.
+_rediscover_create_lock = threading.Lock()
+
+
+def _rediscover_gate(app_state: Any) -> threading.Lock:
+    """Single-flight gate for runtime re-discovery, lazily created per app state.
+
+    A ``threading.Lock`` (not ``asyncio.Lock``) on purpose: callers live on
+    different event loops — OIDC login on the uvicorn loop, oauth_obo minting
+    on the MCP loop thread — and asyncio primitives are bound to the loop
+    that created them.
+    """
+    with _rediscover_create_lock:
+        gate = getattr(app_state, "oidc_rediscover_gate", None)
+        if gate is None:
+            gate = threading.Lock()
+            app_state.oidc_rediscover_gate = gate
+        return gate
+
+
+async def maybe_rediscover_oidc(app_state: Any) -> None:
+    """Retry OIDC discovery at runtime after a retryable boot-time failure.
+
+    A node that boots while the IdP is briefly unreachable comes up with
+    ``oidc_config.enabled=False`` and would otherwise stay that way until an
+    operator restarts it — OIDC login stays dark on the node and every
+    ``oauth_obo`` mint fails "transient" forever. This helper re-runs
+    :func:`discover_oidc` (cooldown-gated, single-flight across threads) and
+    swaps the recovered config onto *app_state* on success.
+
+    No-op when OIDC is operator-disabled, already enabled, or discovery
+    failed for a non-retryable configuration reason (``discovery_retryable``
+    False). Uses a transient HTTP client so it is safe to call from any
+    event loop; the recovered config leaves ``jwks_data`` unset — the login
+    path's existing lazy JWKS refetch fills it on first use.
+    """
+    cfg = getattr(app_state, "oidc_config", None)
+    if (
+        cfg is None
+        or getattr(cfg, "enabled", False)
+        or not getattr(cfg, "discovery_retryable", False)
+    ):
+        return
+    gate = _rediscover_gate(app_state)
+    if not gate.acquire(blocking=False):
+        # Another caller (possibly on another loop) is already probing; this
+        # caller proceeds on the still-disabled config and heals next tick.
+        return
+    try:
+        now = time.monotonic()
+        # ``None`` (not 0.0) means "never probed" — otherwise the first probe
+        # within ~60s of the monotonic reference (host boot) would be suppressed
+        # by the cooldown against a phantom probe at time 0.
+        last = getattr(app_state, "oidc_rediscover_last", None)
+        if last is not None and now - float(last) < _REDISCOVER_COOLDOWN_SECONDS:
+            return
+        app_state.oidc_rediscover_last = now
+        # Probe with enabled=True FORCED ON: discover_oidc PRESERVES the input's
+        # ``enabled`` on success (only ``load_oidc_config`` ever sets it True) and
+        # sets it False on any failure. Passing the disabled boot config verbatim
+        # would make a SUCCESSFUL rediscovery still return enabled=False, so the
+        # swap below would be unreachable and the feature inert. Forcing it True
+        # up front makes ``fresh.enabled`` a reliable success signal (a real
+        # failure clears it back to False).
+        #
+        # Wrapped in ``except Exception`` exactly like the boot path
+        # (initialize_oidc_state): discover_oidc catches httpx/ValueError/OIDC
+        # errors, but the runtime SSRF/DNS validation can raise something outside
+        # that set, and this runs inside get_obo_access_token_classified — which
+        # promises a TokenLookupResult, never a raise. An unexpected failure just
+        # leaves OIDC disabled for this probe (retry next window); it must not
+        # escape into the caller's classified-result contract.
+        try:
+            fresh = await discover_oidc(dataclasses.replace(cfg, enabled=True))
+        except Exception:
+            log.warning("OIDC runtime rediscovery raised unexpectedly", exc_info=True)
+            return
+        if not fresh.enabled:
+            if not fresh.discovery_retryable:
+                # Discovery now fails for a CONFIG reason (bad issuer, an
+                # SSRF-rejected endpoint), not a transient outage — latch that
+                # terminal config onto app_state so this node stops re-probing
+                # every cooldown window. Without installing it, app_state would
+                # keep the retryable flag and re-probe an IdP that can never heal.
+                app_state.oidc_config = fresh
+            return  # still disabled (transient → retry next window; terminal → latched)
+        app_state.oidc_config = dataclasses.replace(fresh, discovery_retryable=False)
+        log.info("OIDC discovery recovered at runtime: %s", fresh.issuer)
+    finally:
+        gate.release()
 
 
 async def close_oidc_state(app_state: Any) -> None:

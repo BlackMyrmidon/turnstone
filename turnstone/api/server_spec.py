@@ -102,7 +102,9 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "Send a user message",
         request_model=SendRequest,
         response_model=SendResponse,
-        error_codes=[400, 404],
+        # 409: cross_user_interjection (shipped with the multi-user work;
+        # the spec had drifted behind the implementation).
+        error_codes=[400, 404, 409],
         tags=["Chat"],
     ),
     EndpointSpec(
@@ -134,7 +136,10 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "Execute a slash command",
         request_model=CommandRequest,
         response_model=StatusResponse,
-        error_codes=[400, 404],
+        # 409 = worker slot busy (deliberate loud refusal); 503 = the
+        # command worker could not be started (thread exhaustion — retry
+        # shortly; the command did NOT run).
+        error_codes=[400, 404, 409, 503],
         tags=["Chat"],
     ),
     EndpointSpec(

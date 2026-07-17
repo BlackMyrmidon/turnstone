@@ -8,6 +8,7 @@ on the HTTP handler logic, request/response wiring, and storage side-effects.
 from __future__ import annotations
 
 import urllib.parse
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
 
@@ -189,6 +190,23 @@ class TestOIDCAuthorize:
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.get("/v1/api/auth/oidc/authorize")
         assert resp.status_code == 404
+
+    def test_disabled_retryable_triggers_login_self_heal(self, storage: SQLiteBackend) -> None:
+        """Review finding: the LOGIN path must trigger runtime rediscovery too,
+        not just the obo mint path — otherwise a single-node install whose node
+        booted during a transient IdP outage stays login-dark forever. A
+        disabled+retryable config makes authorize call maybe_rediscover_oidc."""
+        from unittest.mock import AsyncMock, patch
+
+        app = Starlette(
+            routes=[Mount("/v1", routes=[Route("/api/auth/oidc/authorize", _oidc_authorize)])]
+        )
+        app.state.oidc_config = _make_oidc_config(enabled=False, discovery_retryable=True)
+        app.state.auth_storage = storage
+        client = TestClient(app, raise_server_exceptions=False)
+        with patch("turnstone.core.auth.maybe_rediscover_oidc", new=AsyncMock()) as heal:
+            client.get("/v1/api/auth/oidc/authorize")
+        heal.assert_awaited_once()
 
     def test_no_storage_returns_503(self) -> None:
         app = Starlette(
@@ -728,6 +746,323 @@ class TestOIDCCallback:
 
 
 # ---------------------------------------------------------------------------
+# Single-credential capture tests (issue #551)
+# ---------------------------------------------------------------------------
+
+
+class TestOIDCCallbackCapture:
+    """Capture of the IdP refresh token at login (``capture_user_credential``)."""
+
+    def _capture_client(
+        self,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+        *,
+        capture: bool = True,
+        with_store: bool = True,
+    ) -> tuple[TestClient, Any, OIDCConfig]:
+        """Client wired like ``authorize_client`` plus a real MCPTokenStore."""
+        import dataclasses
+
+        from tests.conftest import make_mcp_token_cipher
+        from turnstone.core.mcp_crypto import MCPTokenStore
+
+        cfg = dataclasses.replace(oidc_config, capture_user_credential=capture)
+        app = Starlette(
+            routes=[
+                Mount("/v1", routes=[Route("/api/auth/oidc/callback", _oidc_callback)]),
+            ],
+        )
+        app.state.oidc_config = cfg
+        app.state.auth_storage = storage
+        app.state.jwt_secret = "test-jwt-secret-key-padded-32b!!"
+        app.state.jwks_data = {"keys": []}
+        app.state.login_limiter = None
+        store = MCPTokenStore(storage, make_mcp_token_cipher()) if with_store else None
+        app.state.mcp_token_store = store
+        return TestClient(app, raise_server_exceptions=False), store, cfg
+
+    def _login(
+        self,
+        client: TestClient,
+        storage: SQLiteBackend,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        *,
+        tokens: dict[str, Any],
+        state: str = "valid-state",
+    ) -> Any:
+        storage.create_oidc_pending_state(state, "test-nonce", "test-verifier", "test-audience")
+        mock_exchange.return_value = tokens
+        mock_validate.return_value = {
+            "sub": "user123",
+            "email": "u@example.com",
+            "nonce": "test-nonce",
+        }
+        mock_provision.return_value = {"user_id": "test-admin", "username": "testadmin"}
+        return client.get(
+            f"/v1/api/auth/oidc/callback?code=authcode&state={state}",
+            follow_redirects=False,
+        )
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_capture_persists_credential(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        client, store, cfg = self._capture_client(storage, oidc_config)
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "fake.jwt.token", "access_token": "at", "refresh_token": "rt-1"},
+        )
+        assert resp.status_code == 302
+        assert "oidc_success=1" in resp.headers["location"]
+        assert store is not None
+        plain = store.get_oidc_credential("test-admin", cfg.issuer)
+        assert plain is not None
+        assert plain["refresh_token"] == "rt-1"
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_capture_success_primes_user_pools(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        """Re-login is the OBO restore moment (#836): a successful
+        credential capture for a user with a LIVE session schedules a
+        pool prime so a previously dropped obo catalog returns to their
+        open workstreams — obo has no consent flow, so nothing else
+        re-primes them after re-login."""
+        client, store, cfg = self._capture_client(storage, oidc_config)
+        primed: list[str] = []
+        client.app.state.mcp_client = SimpleNamespace(  # type: ignore[attr-defined]
+            prime_user_pools=primed.append,
+            has_live_session_listener=lambda _uid: True,
+        )
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "fake.jwt.token", "access_token": "at", "refresh_token": "rt-1"},
+        )
+        assert resp.status_code == 302
+        assert primed == ["test-admin"]
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_no_capture_no_prime(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        """No refresh token in the response → no capture → no prime
+        (the prime is gated on a persisted credential, not on login)."""
+        client, store, cfg = self._capture_client(storage, oidc_config)
+        primed: list[str] = []
+        client.app.state.mcp_client = SimpleNamespace(  # type: ignore[attr-defined]
+            prime_user_pools=primed.append,
+            has_live_session_listener=lambda _uid: True,
+        )
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "fake.jwt.token", "access_token": "at"},
+        )
+        assert resp.status_code == 302
+        assert primed == []
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_capture_without_live_session_does_not_prime(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        """Routine SSO re-login with nothing open must not fan out pool
+        warms — the prime exists to heal LIVE sessions only."""
+        client, store, cfg = self._capture_client(storage, oidc_config)
+        primed: list[str] = []
+        client.app.state.mcp_client = SimpleNamespace(  # type: ignore[attr-defined]
+            prime_user_pools=primed.append,
+            has_live_session_listener=lambda _uid: False,
+        )
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "fake.jwt.token", "access_token": "at", "refresh_token": "rt-1"},
+        )
+        assert resp.status_code == 302
+        # Credential captured, but no live session → no prime.
+        assert store is not None
+        assert store.get_oidc_credential("test-admin", cfg.issuer) is not None
+        assert primed == []
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_second_login_replaces_credential(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        client, store, cfg = self._capture_client(storage, oidc_config)
+        self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "t", "refresh_token": "rt-old"},
+            state="s1",
+        )
+        self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "t", "refresh_token": "rt-new"},
+            state="s2",
+        )
+        assert store is not None
+        plain = store.get_oidc_credential("test-admin", cfg.issuer)
+        assert plain is not None
+        assert plain["refresh_token"] == "rt-new"
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_no_refresh_token_logs_and_login_succeeds(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        client, store, cfg = self._capture_client(storage, oidc_config)
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "fake.jwt.token", "access_token": "at"},
+        )
+        assert resp.status_code == 302
+        assert "oidc_success=1" in resp.headers["location"]
+        assert store is not None
+        assert store.get_oidc_credential("test-admin", cfg.issuer) is None
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_capture_disabled_persists_nothing(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        client, store, cfg = self._capture_client(storage, oidc_config, capture=False)
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "t", "refresh_token": "rt-present"},
+        )
+        assert resp.status_code == 302
+        assert store is not None
+        assert store.get_oidc_credential("test-admin", cfg.issuer) is None
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_missing_store_login_still_succeeds(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        client, _store, _cfg = self._capture_client(storage, oidc_config, with_store=False)
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "t", "refresh_token": "rt-1"},
+        )
+        assert resp.status_code == 302
+        assert "oidc_success=1" in resp.headers["location"]
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_store_failure_does_not_block_login(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        client, store, _cfg = self._capture_client(storage, oidc_config)
+        assert store is not None
+        with patch.object(store, "upsert_oidc_credential", side_effect=RuntimeError("boom")):
+            resp = self._login(
+                client,
+                storage,
+                mock_exchange,
+                mock_validate,
+                mock_provision,
+                tokens={"id_token": "t", "refresh_token": "rt-1"},
+            )
+        assert resp.status_code == 302
+        assert "oidc_success=1" in resp.headers["location"]
+
+
+# ---------------------------------------------------------------------------
 # Admin OIDC identity endpoint tests
 # ---------------------------------------------------------------------------
 
@@ -779,6 +1114,67 @@ class TestAdminOIDCIdentities:
         assert resp.json()["status"] == "ok"
         # Verify it's gone
         assert storage.get_oidc_identity("https://idp.example.com", "sub-456") is None
+
+    def test_delete_identity_revokes_credential_and_purges_obo_cache(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """#551 follow-up: unlinking an identity must revoke the captured
+        credential AND purge the user's already-minted oauth_obo cache rows —
+        deleting only the credential leaves live cached bearers authorizing
+        dispatch until TTL. The response/audit report what was actually cut."""
+        from tests.conftest import make_mcp_token_cipher
+        from turnstone.core.mcp_crypto import MCPTokenStore
+
+        issuer = "https://idp.example.com"
+        store = MCPTokenStore(storage, make_mcp_token_cipher(), node_id="test")
+        app = Starlette(
+            routes=[
+                Mount(
+                    "/v1",
+                    routes=[
+                        Route(
+                            "/api/admin/oidc-identities",
+                            admin_delete_oidc_identity,
+                            methods=["DELETE"],
+                        )
+                    ],
+                )
+            ],
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        app.state.mcp_token_store = store
+        client = TestClient(app, raise_server_exceptions=False)
+
+        storage.create_oidc_identity(issuer, "sub-1", "user-x", "x@example.com")
+        store.upsert_oidc_credential("user-x", issuer, refresh_token="rt-live")
+        storage.create_mcp_server(
+            server_id="srv-obo",
+            name="obo-srv",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+        )
+        store.create_user_token(
+            "user-x",
+            "obo-srv",
+            access_token="minted-at",
+            refresh_token=None,
+            expires_at="2026-12-31T00:00:00",
+            scopes=None,
+            as_issuer=issuer,
+            audience="api://mcp-a",
+        )
+
+        resp = client.delete(f"/v1/api/admin/oidc-identities?issuer={issuer}&subject=sub-1")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["obo_credential_revoked"] is True
+        assert body["obo_cache_rows_purged"] == 1
+        # Credential gone → no future mints; cache row gone → no live cached bearer.
+        assert store.get_oidc_credential("user-x", issuer) is None
+        assert storage.get_mcp_user_token("user-x", "obo-srv") is None
 
     def test_delete_nonexistent_returns_404(self, admin_client: TestClient) -> None:
         resp = admin_client.delete(

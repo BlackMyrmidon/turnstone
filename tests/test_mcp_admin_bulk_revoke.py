@@ -157,6 +157,44 @@ def test_400_on_invalid_server_name(storage: SQLiteBackend) -> None:
     assert resp.status_code == 400
 
 
+def test_200_on_oauth_obo_server(storage: SQLiteBackend) -> None:
+    """#551: bulk-revoke serves oauth_obo too (it populates mcp_user_tokens with
+    minted cache rows) — the documented remediation for stale rows after an
+    oauth_user→oauth_obo flip."""
+    storage.create_mcp_server(
+        server_id="srv-obo-id",
+        name="srv-obo",
+        transport="streamable-http",
+        url="https://example.com/mcp",
+        auth_type="oauth_obo",
+    )
+    _seed_user_tokens(storage, "srv-obo", users=2)
+
+    client = TestClient(_build_app(storage))
+    resp = client.post("/v1/api/admin/mcp-servers/srv-obo/bulk-revoke")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["rows_deleted"] == 2
+    assert storage.count_mcp_consented_users_by_server("srv-obo") == 0
+    # Honest semantics: obo is a cache flush (re-mints), NOT a consent revoke.
+    assert body["effect"] == "cache_flush_remints"
+    events = storage.list_audit_events(action="mcp_server.oauth.obo_cache_flushed")
+    assert len(events) == 1
+    # The oauth_user revoke event must NOT be emitted for an obo flush.
+    assert storage.list_audit_events(action="mcp_server.oauth.bulk_revoked") == []
+
+
+def test_oauth_user_bulk_revoke_keeps_revoke_semantics(storage: SQLiteBackend) -> None:
+    """The oauth_user path is unchanged: durable revoke event + effect."""
+    _seed_oauth_server(storage)
+    _seed_user_tokens(storage, "srv-oauth", users=1)
+    client = TestClient(_build_app(storage))
+    resp = client.post("/v1/api/admin/mcp-servers/srv-oauth/bulk-revoke")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["effect"] == "revoked_until_reconsent"
+    assert len(storage.list_audit_events(action="mcp_server.oauth.bulk_revoked")) == 1
+
+
 def test_200_on_success_with_no_consented_users(storage: SQLiteBackend) -> None:
     _seed_oauth_server(storage)
     client = TestClient(_build_app(storage))

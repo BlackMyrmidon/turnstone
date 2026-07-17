@@ -18,7 +18,15 @@ This module owns the three provider-neutral lowering passes:
   ``deepseek_v4``, which ``json.loads`` the arguments at request-render time)
   can't reject the whole request.  Mutates the transient wire copy only — the
   canonical trajectory keeps the raw output.  See
-  :func:`sanitize_tool_call_arguments`.
+  :func:`sanitize_tool_call_arguments`.  The id sibling,
+  :func:`restore_provider_tool_ids`, maps session-minted sub-agent tool ids
+  (``{parent}::r{run}s{step}::{provider_id}``) back to the provider's OWN ids
+  on the wire copy, so the provider-native block lane — whose ``tool_use``
+  blocks carry the provider id verbatim, under a reasoning signature that must
+  never be touched — stays id-consistent with the top-level mirror and the
+  tool results.  It runs at the AGENT wire seam (``ChatSession._run_agent``'s
+  ``_api_call``) only — main-loop ids are provider-issued or uuid-filled and
+  already consistent with their native lane.
 * **repair** (validity) — synthesizing cancellation results for orphaned client
   tool calls.  See :func:`repair_wire_messages`.
 
@@ -224,7 +232,7 @@ def tool_args_preview(arguments: Any) -> str:
     return _ARGS_PREVIEW_CONTROL_RE.sub(" ", redact_credentials(text))[:120]
 
 
-def _legalized_arguments(arguments: Any) -> str | None:
+def legalized_arguments(arguments: Any) -> str | None:
     """A wire-valid replacement for *arguments*, or ``None`` if already valid.
 
     A raw ``dict`` (an internal shape that reached the wire seat) is serialized;
@@ -241,6 +249,33 @@ def _legalized_arguments(arguments: Any) -> str | None:
         except (TypeError, ValueError, RecursionError):
             return "{}"
     return "{}"
+
+
+def legalize_tool_call_entry(tc: dict[str, Any]) -> dict[str, Any] | None:
+    """A legalized copy of one wire tool-call entry, or ``None`` when its
+    ``arguments`` are already wire-valid — or its ``function`` is not a dict
+    (someone else's malformation to surface, not silently rename).
+
+    Emits the standard ``wire.tool_args_legalized`` breadcrumb when it fixes
+    an entry.  The ONE per-entry legalizer: shared by
+    :func:`sanitize_tool_call_arguments` and the Google fidelity swap
+    (``providers/_google.py``), which re-applies the same floor to the raw
+    provider dicts it swaps over the sanitized mirror — so the two seats
+    cannot drift on what "wire-valid" means or on the diagnosis trail.
+    """
+    fn = tc.get("function")
+    if not isinstance(fn, dict):
+        return None
+    replacement = legalized_arguments(fn.get("arguments"))
+    if replacement is None:
+        return None  # already wire-valid — leave byte-for-byte untouched
+    log.debug(
+        "wire.tool_args_legalized",
+        tool=fn.get("name", "?"),
+        call_id=tc.get("id", ""),
+        raw_preview=tool_args_preview(fn.get("arguments")),
+    )
+    return {**tc, "function": {**fn, "arguments": replacement}}
 
 
 def sanitize_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -265,25 +300,77 @@ def sanitize_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[st
             continue
         repaired: list[dict[str, Any]] | None = None
         for ci, tc in enumerate(msg["tool_calls"]):
-            fn = tc.get("function")
-            if not isinstance(fn, dict):
+            fixed = legalize_tool_call_entry(tc)
+            if fixed is None:
                 continue
-            replacement = _legalized_arguments(fn.get("arguments"))
-            if replacement is None:
-                continue  # already wire-valid — leave byte-for-byte untouched
             if repaired is None:
                 repaired = list(msg["tool_calls"])
-            log.debug(
-                "wire.tool_args_legalized",
-                tool=fn.get("name", "?"),
-                call_id=tc.get("id", ""),
-                raw_preview=tool_args_preview(fn.get("arguments")),
-            )
-            repaired[ci] = {**tc, "function": {**fn, "arguments": replacement}}
+            repaired[ci] = fixed
         if repaired is not None:
             if out is None:
                 out = list(messages)
             out[idx] = {**msg, "tool_calls": repaired}
+    return messages if out is None else out
+
+
+def restore_provider_tool_ids(
+    messages: list[dict[str, Any]], id_map: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Return *messages* with session-minted sub-agent tool ids mapped back to
+    the provider's own ids — the id half of the legalize pass, applied at the
+    AGENT wire seam.
+
+    *id_map* is the per-``_run_agent`` ``{minted_id: provider_original_id}``
+    record built at the mint site.  Rewriting assistant ``tool_calls[*].id``
+    and tool ``tool_call_id`` back to the provider originals makes every wire
+    representation agree: the provider-native ``tool_use`` block (which holds
+    the provider id verbatim and must never be rewritten — its bytes sit under
+    the turn's reasoning signature), the top-level ``tool_calls`` mirror, and
+    the ``tool_result``.  A translator that replays the native lane and one
+    that rebuilds from ``tool_calls`` therefore emit the same ids, so the
+    pairing holds on both paths.  The minted id stays the internal key
+    (registry / DOM / recall / cancel ledger) untouched — only the transient
+    wire copy is mapped.
+
+    Replaying the provider's own ids to the producing provider is the proven
+    prior behaviour, including the duplicate-ish ids a local server that
+    reissues per-response ids ("call_0") produces — an agent run is pinned to
+    one provider, so the ids always return to the backend that issued them.
+    Ids not in the map (uuid back-fills, an unparented run that never minted)
+    pass through untouched; recovery is by MAP ONLY, never by string-splitting
+    the mint suffix (provider ids can contain surprising characters,
+    including the mint's own delimiter).
+
+    Copy-on-write + identity-preserving, exactly like
+    :func:`sanitize_tool_call_arguments`: an empty map or a conversation with
+    no minted id returns the same object.
+    """
+    if not id_map:
+        return messages
+    out: list[dict[str, Any]] | None = None  # copy-on-write: None until first fix
+    for idx, msg in enumerate(messages):
+        role = msg.get("role")
+        if role == "assistant" and msg.get("tool_calls"):
+            repaired: list[dict[str, Any]] | None = None
+            for ci, tc in enumerate(msg["tool_calls"]):
+                tc_id = tc.get("id")
+                original = id_map.get(tc_id) if isinstance(tc_id, str) else None
+                if original is None or original == tc_id:
+                    continue
+                if repaired is None:
+                    repaired = list(msg["tool_calls"])
+                repaired[ci] = {**tc, "id": original}
+            if repaired is not None:
+                if out is None:
+                    out = list(messages)
+                out[idx] = {**msg, "tool_calls": repaired}
+        elif role == "tool":
+            tc_id = msg.get("tool_call_id")
+            original = id_map.get(tc_id) if isinstance(tc_id, str) else None
+            if original is not None and original != tc_id:
+                if out is None:
+                    out = list(messages)
+                out[idx] = {**msg, "tool_call_id": original}
     return messages if out is None else out
 
 

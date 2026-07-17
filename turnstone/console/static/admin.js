@@ -22,7 +22,11 @@ const ALIAS_SETTING_KEYS = [
 // opposed to "no value" — distinct from the literal "none" choice (e.g.
 // reasoning_effort="none" actually disables reasoning, very different
 // from leaving it unset).
-const INHERIT_EMPTY_LABEL_KEYS = ["model.task_effort"];
+const INHERIT_EMPTY_LABEL_KEYS = [
+  "model.task_effort",
+  "model.reasoning_effort",
+  "coordinator.reasoning_effort",
+];
 
 // ---------------------------------------------------------------------------
 // Admin information architecture — the single source of truth for the rail's
@@ -4274,6 +4278,13 @@ function _renderSettingRow(item) {
       item.max_value !== null && item.max_value !== undefined
         ? ' max="' + item.max_value + '"'
         : "";
+    // A null registry default means "unset = inherit" (e.g.
+    // model.temperature): blank is a saveable state, not a validation
+    // error — the save handler maps it to reset-to-default.
+    const nullableAttr =
+      item.default_value === null
+        ? ' data-nullable="1" placeholder="(inherit model default)"'
+        : "";
     html +=
       '<input type="number" data-setting-key="' +
       escapedKey +
@@ -4286,6 +4297,7 @@ function _renderSettingRow(item) {
       '"' +
       minAttr +
       maxAttr +
+      nullableAttr +
       ">";
   } else {
     // str
@@ -4423,8 +4435,13 @@ function _onSettingChange(inp) {
     dirty = String(current) !== String(orig);
   }
 
-  // Disable save for empty number fields (server will reject)
-  const emptyNumber = inp.type === "number" && current === "";
+  // Disable save for empty number fields (server will reject) — EXCEPT
+  // nullable-default settings, where blank is a saveable state meaning
+  // "inherit" (the save handler maps it to reset-to-default).
+  const emptyNumber =
+    inp.type === "number" &&
+    current === "" &&
+    inp.getAttribute("data-nullable") !== "1";
   if (dirty && !emptyNumber) {
     saveBtn.classList.add("visible");
   } else {
@@ -4448,6 +4465,16 @@ function _saveSettingValue(key) {
     value = inp.checked;
   } else if (inp.type === "number") {
     if (inp.value === "") {
+      if (inp.getAttribute("data-nullable") === "1") {
+        // Blank on a nullable-default setting means "inherit": clear any
+        // stored override (reset), or nothing to do if already default.
+        if (document.querySelector('[data-reset-key="' + key + '"]')) {
+          _resetSetting(key);
+        } else if (saveBtn) {
+          saveBtn.classList.remove("visible");
+        }
+        return;
+      }
       showToast("Value is required");
       return;
     }
@@ -4652,6 +4679,43 @@ function loadAdminMcp() {
     });
 }
 
+function _wireMcpTokenDropButtons(el, attr, opts) {
+  // Shared binder for the two per-server token-drop list actions —
+  // "Bulk-revoke" (oauth_user consents) and "Flush cache" (oauth_obo minted
+  // tokens). Both post to the same bulk-revoke endpoint; only the operator-
+  // facing copy differs, so the confirm/fetch/toast/reload flow lives once.
+  el.querySelectorAll("[" + attr + "]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      const name = this.getAttribute(attr);
+      const count = this.getAttribute("data-mcp-consent-count") || "?";
+      showConfirmModal(
+        opts.title,
+        opts.message(name, count),
+        opts.confirmLabel,
+        function () {
+          authFetch(
+            "/v1/api/admin/mcp-servers/" +
+              encodeURIComponent(name) +
+              "/bulk-revoke",
+            { method: "POST" },
+          )
+            .then(function (r) {
+              if (!r.ok) throw new Error();
+              return r.json();
+            })
+            .then(function (j) {
+              showToast(opts.successToast(name, j.rows_deleted || 0));
+              loadAdminMcp();
+            })
+            .catch(function () {
+              showToast(opts.failToast(name));
+            });
+        },
+      );
+    });
+  });
+}
+
 function _renderMcpServers(items) {
   const el = document.getElementById("admin-mcp-table");
   if (!items.length) {
@@ -4701,6 +4765,10 @@ function _renderMcpServers(items) {
     let dotClass = "mcp-status-dot disabled";
     let rowClass = "mcp-row-disabled";
     let statusText = "disabled";
+    // Pool-backed (oauth_user/oauth_obo) servers hold NO cluster-level session —
+    // they connect per-user on demand — so "connecting"/"idle" reads as broken
+    // when the resting state (zero warm users) is normal.
+    const isPool = s.auth_type === "oauth_user" || s.auth_type === "oauth_obo";
     if (!s.enabled) {
       statusText = "disabled";
     } else if (anyConnected) {
@@ -4711,6 +4779,10 @@ function _renderMcpServers(items) {
       dotClass = "mcp-status-dot error";
       rowClass = "mcp-row-error";
       statusText = "error";
+    } else if (isPool) {
+      dotClass = "mcp-status-dot disabled";
+      rowClass = "mcp-row-disabled";
+      statusText = "per-user";
     } else if (s.enabled && s.source !== "config" && nodeIds.length === 0) {
       dotClass = "mcp-status-dot connecting";
       rowClass = "mcp-row-disabled";
@@ -4781,7 +4853,11 @@ function _renderMcpServers(items) {
       : 'data-mcp-detail="' + escapeHtml(s.server_id) + '"';
     // Phase 9: surface the connect/bulk-revoke affordances only for
     // user-OAuth servers, and bulk-revoke only once a user has consented.
+    // oauth_obo has NO per-server connect (it uses the org sign-in); its
+    // "flush cache" drops minted tokens so users re-mint (honest label — it is
+    // not a durable revoke; that is governed by the identity provider).
     const isOauth = s.auth_type === "oauth_user";
+    const isObo = s.auth_type === "oauth_obo";
     const consentCount =
       typeof s.consented_users_count === "number" ? s.consented_users_count : 0;
     const actions = _kebabMenu([
@@ -4798,6 +4874,20 @@ function _renderMcpServers(items) {
               "Drop all " + consentCount + " user consents for this server",
             attrs: {
               "data-mcp-bulk-revoke": s.name,
+              "data-mcp-consent-count": consentCount,
+            },
+          }
+        : null,
+      isObo && consentCount > 0
+        ? {
+            label: "flush cache (" + consentCount + ")",
+            kind: "danger",
+            title:
+              "Drop " +
+              consentCount +
+              " users' minted tokens; they re-mint on next use unless access is removed at your identity provider",
+            attrs: {
+              "data-mcp-cache-flush": s.name,
               "data-mcp-consent-count": consentCount,
             },
           }
@@ -4928,41 +5018,43 @@ function _renderMcpServers(items) {
       window.open(url, "_blank", "noopener");
     });
   });
-  el.querySelectorAll("[data-mcp-bulk-revoke]").forEach(function (btn) {
-    btn.addEventListener("click", function () {
-      const name = this.getAttribute("data-mcp-bulk-revoke");
-      const count = this.getAttribute("data-mcp-consent-count") || "?";
-      showConfirmModal(
-        "Bulk-revoke MCP consents",
+  _wireMcpTokenDropButtons(el, "data-mcp-bulk-revoke", {
+    title: "Bulk-revoke MCP consents",
+    message: function (name, count) {
+      return (
         "Drop all " +
-          count +
-          ' user consents for server "' +
-          name +
-          '"? Users will need to re-consent on next use. Upstream revoke is not attempted in bulk; tokens at the authorization server will expire naturally.',
-        "Bulk-revoke",
-        function () {
-          authFetch(
-            "/v1/api/admin/mcp-servers/" +
-              encodeURIComponent(name) +
-              "/bulk-revoke",
-            { method: "POST" },
-          )
-            .then(function (r) {
-              if (!r.ok) throw new Error();
-              return r.json();
-            })
-            .then(function (j) {
-              showToast(
-                "Bulk-revoked " + (j.rows_deleted || 0) + " row(s) for " + name,
-              );
-              loadAdminMcp();
-            })
-            .catch(function () {
-              showToast("Failed to bulk-revoke " + name);
-            });
-        },
+        count +
+        ' user consents for server "' +
+        name +
+        '"? Users will need to re-consent on next use. Upstream revoke is not attempted in bulk; tokens at the authorization server will expire naturally.'
       );
-    });
+    },
+    confirmLabel: "Bulk-revoke",
+    successToast: function (name, n) {
+      return "Bulk-revoked " + n + " row(s) for " + name;
+    },
+    failToast: function (name) {
+      return "Failed to bulk-revoke " + name;
+    },
+  });
+  _wireMcpTokenDropButtons(el, "data-mcp-cache-flush", {
+    title: "Flush minted tokens",
+    message: function (name, count) {
+      return (
+        "Drop " +
+        count +
+        ' users’ minted tokens for server "' +
+        name +
+        '"? This forces a fresh mint on next use (e.g. after changing the audience). It does NOT cut off access — users re-mint from their org sign-in; to revoke a user, remove their access at your identity provider or unlink their identity.'
+      );
+    },
+    confirmLabel: "Flush cache",
+    successToast: function (name, n) {
+      return "Flushed " + n + " token(s) for " + name;
+    },
+    failToast: function (name) {
+      return "Failed to flush cache for " + name;
+    },
   });
   el.querySelectorAll("[data-mcp-delete]").forEach(function (btn) {
     btn.addEventListener("click", function () {
@@ -5011,13 +5103,31 @@ function _selectedMcpAuthType() {
 
 function toggleMcpAuthFields() {
   const authType = _selectedMcpAuthType();
+  const isOauthUser = authType === "oauth_user";
+  const isObo = authType === "oauth_obo";
+  // The OAuth fields block is shared by oauth_user and oauth_obo; obo shows
+  // only the audience (+ scopes for the rfc8693 profile), hiding the
+  // oauth_user-only client/registration inputs it does not use.
   const oauthDiv = document.getElementById("mcp-oauth-fields");
-  if (oauthDiv) {
-    oauthDiv.hidden = authType !== "oauth_user";
-  }
+  if (oauthDiv) oauthDiv.hidden = !(isOauthUser || isObo);
+  const userOnly = document.getElementById("mcp-oauth-user-only");
+  if (userOnly) userOnly.hidden = !isOauthUser;
+  const oboNote = document.getElementById("mcp-obo-note");
+  if (oboNote) oboNote.hidden = !isObo;
+  // For obo the audience is required (the mint engine hard-requires it) and
+  // scopes apply only under the rfc8693 grant profile; retitle the hints so
+  // the operator isn't misled (no impl vocabulary in the copy).
+  const audHint = document.getElementById("mcp-oauth-audience-hint");
+  if (audHint)
+    audHint.textContent = isObo ? "required" : "auto-populated from URL";
+  const scopesHint = document.getElementById("mcp-oauth-scopes-hint");
+  if (scopesHint)
+    scopesHint.textContent = isObo
+      ? "only used by the rfc8693 sign-in profile"
+      : "space-separated";
   // The "Headers" textarea (inside mcp-http-fields) is only meaningful
-  // for static auth; hide it for 'none' / 'oauth_user' so operators
-  // don't accidentally configure stale credentials.
+  // for static auth; hide it for 'none' / 'oauth_user' / 'oauth_obo' so
+  // operators don't accidentally configure stale credentials.
   const headersInput = document.getElementById("mcp-headers");
   if (headersInput) {
     const headersLabel = document.querySelector('label[for="mcp-headers"]');
@@ -5033,9 +5143,30 @@ function _wireMcpAudienceAutofill() {
   if (!urlInput || urlInput.dataset.audAutofill === "1") return;
   urlInput.dataset.audAutofill = "1";
   urlInput.addEventListener("blur", function () {
+    // oauth_user only: there the audience IS the server URL (resource
+    // indicator). For sign-in passthrough the audience is the identity-
+    // provider-side application identifier — prefilling the MCP URL there
+    // passes every validation layer and then fails every token mint, so
+    // the autofill stays off.
+    if (_selectedMcpAuthType() === "oauth_obo") return;
     const aud = document.getElementById("mcp-oauth-audience");
     if (aud && !aud.value.trim()) aud.value = urlInput.value.trim();
   });
+}
+
+function _onMcpAuthTypeChange() {
+  // Audience and Scopes are auth-type-specific: for oauth_user the audience is
+  // an RFC 8707 resource indicator (~ the MCP URL) and scopes are AS-consent
+  // scopes; for sign-in passthrough the audience is the identity-provider-side
+  // application identifier and scopes (rfc8693 only) are the token-exchange
+  // scope. Carrying one type's value into the other passes validation and then
+  // fails every mint/consent, so clear both when the auth type changes — the
+  // operator re-enters the correct values for the new mode (the backend
+  // likewise refuses to carry these columns across a flip). A same-type edit
+  // never fires this (the radio didn't change), so pre-filled values are kept.
+  document.getElementById("mcp-oauth-audience").value = "";
+  document.getElementById("mcp-oauth-scopes").value = "";
+  toggleMcpAuthFields();
 }
 
 function _mcpWire() {
@@ -5046,7 +5177,7 @@ function _mcpWire() {
     .addEventListener("change", toggleMcpTransport);
   const authRadios = document.getElementsByName("mcp-auth-type");
   for (let i = 0; i < authRadios.length; i++) {
-    authRadios[i].addEventListener("change", toggleMcpAuthFields);
+    authRadios[i].addEventListener("change", _onMcpAuthTypeChange);
   }
   document
     .getElementById("mcp-create-submit")
@@ -5079,6 +5210,7 @@ function _mcpResetForm() {
   document.getElementById("mcp-auth-static").checked = true;
   document.getElementById("mcp-auth-none").checked = false;
   document.getElementById("mcp-auth-oauth").checked = false;
+  document.getElementById("mcp-auth-obo").checked = false;
   document.getElementById("mcp-oauth-as-url").value = "";
   document.getElementById("mcp-oauth-registration").value = "preregistered";
   document.getElementById("mcp-oauth-client-id").value = "";
@@ -5146,6 +5278,8 @@ function showEditMcpModal(serverId) {
         authType === "static";
       document.getElementById("mcp-auth-oauth").checked =
         authType === "oauth_user";
+      document.getElementById("mcp-auth-obo").checked =
+        authType === "oauth_obo";
       document.getElementById("mcp-oauth-as-url").value =
         s.oauth_authorization_server_url || "";
       document.getElementById("mcp-oauth-registration").value =
@@ -5224,7 +5358,7 @@ function _parseMcpForm() {
       }
       payload.headers = hdrObj;
     } else {
-      // 'none' / 'oauth_user' — clear server-side static headers state.
+      // 'none' / 'oauth_user' / 'oauth_obo' — clear static headers state.
       payload.headers = {};
     }
   }
@@ -5248,6 +5382,22 @@ function _parseMcpForm() {
     const secret = document.getElementById("mcp-oauth-client-secret").value;
     // Submit only when the operator typed a value; redacted in audit log.
     if (secret) payload.oauth_client_secret = secret;
+  } else if (authType === "oauth_obo") {
+    // Sign-in passthrough uses only the audience (+ optional rfc8693 scopes);
+    // the client/registration/secret columns are oauth_user-only and cleared
+    // server-side. Audience is required — catch it here for an inline error
+    // rather than a round-trip 400.
+    const audience = document.getElementById("mcp-oauth-audience").value.trim();
+    if (!audience)
+      return { error: "Audience is required for sign-in passthrough servers" };
+    payload.oauth_audience = audience;
+    // Always send the visible Scopes value — the backend distinguishes a
+    // same-type no-op re-send (dropped) from a genuine change / flip on its
+    // side, so the form doesn't need omit-when-unchanged logic (which used to
+    // collide with the backend's flip handling and silently drop scopes).
+    payload.oauth_scopes = document
+      .getElementById("mcp-oauth-scopes")
+      .value.trim();
   }
 
   return payload;
@@ -6185,18 +6335,19 @@ let _modelDefaultAlias = "";
 // and are re-merged on save. Reset per modal open.
 let _rerankCalFields = {};
 
-// Capability tile matrix — sparse-override semantics. The 9 tiles display
+// Capability tile matrix — sparse-override semantics. The tiles display
 // merge(dataclass defaults, known-model table baseline, explicit overrides);
 // only EXPLICIT keys persist (saved keys + tiles the user toggled), so a
 // known model keeps tracking future table updates instead of being pinned.
 const _MODEL_CAP_KEYS = [
   "supports_tools",
-  "supports_streaming",
   "supports_vision",
   "supports_pdf",
   "supports_web_search",
   "supports_temperature",
   "supports_effort",
+  "supports_verbosity",
+  "supports_pro_mode",
   "supports_transcription",
   "supports_speech_synthesis",
   "supports_audio_input",
@@ -6204,12 +6355,13 @@ const _MODEL_CAP_KEYS = [
 ];
 const _MODEL_CAP_DEFAULTS = {
   supports_tools: true,
-  supports_streaming: true,
   supports_vision: false,
   supports_pdf: false,
   supports_web_search: false,
   supports_temperature: true,
   supports_effort: false,
+  supports_verbosity: false,
+  supports_pro_mode: false,
   supports_transcription: false,
   supports_speech_synthesis: false,
   supports_audio_input: false,
@@ -6233,6 +6385,152 @@ function _modelRenderTiles() {
     else if (k in _modelCapsBaseline) el.checked = !!_modelCapsBaseline[k];
     else el.checked = _MODEL_CAP_DEFAULTS[k];
   });
+  _updateModelResponseControls();
+}
+
+const _MODEL_RESPONSE_CONTROLS = [
+  {
+    key: "verbosity",
+    supportKey: "supports_verbosity",
+    elementId: "model-output-verbosity",
+    fieldId: "model-output-verbosity-field",
+    values: ["low", "medium", "high"],
+  },
+  {
+    key: "reasoning_mode",
+    supportKey: "supports_pro_mode",
+    elementId: "model-reasoning-mode",
+    fieldId: "model-reasoning-mode-field",
+    values: ["standard", "pro"],
+  },
+];
+let _modelResponseInitialIdentity = "";
+let _modelResponseCurrentIdentity = "";
+let _modelResponseCaptured = {};
+let _modelResponseDirty = {};
+
+function _modelIdentity() {
+  const provider = document.getElementById("model-provider").value;
+  const model = document.getElementById("model-name").value.trim();
+  const surface =
+    provider === "openai-compatible"
+      ? document.getElementById("model-api-surface").value
+      : "";
+  return provider + "\n" + model + "\n" + surface;
+}
+
+function _modelUsesResponsesSurface() {
+  const provider = document.getElementById("model-provider").value;
+  if (provider === "openai") return true;
+  return (
+    provider === "openai-compatible" &&
+    document.getElementById("model-api-surface").value === "responses"
+  );
+}
+
+function _modelResponseValueValid(spec, value) {
+  return typeof value === "string" && spec.values.indexOf(value) !== -1;
+}
+
+function _updateModelResponseControls() {
+  const group = document.getElementById("model-response-controls");
+  if (!group) return;
+  const responseSurface = _modelUsesResponsesSurface();
+  const sameIdentity =
+    _modelResponseInitialIdentity &&
+    _modelIdentity() === _modelResponseInitialIdentity;
+  let anyVisible = false;
+  _MODEL_RESPONSE_CONTROLS.forEach(function (spec) {
+    const field = document.getElementById(spec.fieldId);
+    const select = document.getElementById(spec.elementId);
+    if (!field || !select) return;
+    // A value _captureModelResponseControls lifted out of the row's JSON
+    // stays visible (and re-saveable) while the identity still matches the
+    // row being edited, deliberately NOT consulting the capability
+    // baseline: the baseline arrives async (or never, on the compat lane),
+    // and yielding to it would hide the pinned value and silently drop it
+    // on save — the same lift-then-restore contract as server_compat,
+    // rerank calibration, and thinking_param. Wire safety is server-side:
+    // emission gates on the merged supports_* flag, so a pinned value on
+    // an unsupported model is inert; "Provider default" explicitly clears
+    // it. An explicit tile override (either polarity) supersedes the
+    // fallback — unchecking the tile is the operator's way to retire it.
+    const capturedFallback =
+      sameIdentity &&
+      !(spec.supportKey in _modelCapsExplicit) &&
+      _modelResponseValueValid(spec, select.value);
+    const visible =
+      responseSurface && (_modelGetTile(spec.supportKey) || capturedFallback);
+    field.hidden = !visible;
+    anyVisible = anyVisible || visible;
+  });
+  group.hidden = !anyVisible;
+}
+
+function _resetModelResponseControls() {
+  _MODEL_RESPONSE_CONTROLS.forEach(function (spec) {
+    const select = document.getElementById(spec.elementId);
+    if (select) select.value = "";
+  });
+  _modelResponseInitialIdentity = "";
+  _modelResponseCurrentIdentity = _modelIdentity();
+  _modelResponseCaptured = {};
+  _modelResponseDirty = {};
+  _updateModelResponseControls();
+}
+
+function _captureModelResponseControls(capsObj) {
+  if (!_modelUsesResponsesSurface()) return;
+  _MODEL_RESPONSE_CONTROLS.forEach(function (spec) {
+    const select = document.getElementById(spec.elementId);
+    if (!select) return;
+    const explicitlyUnsupported =
+      spec.supportKey in _modelCapsExplicit &&
+      !_modelCapsExplicit[spec.supportKey];
+    const value = capsObj[spec.key];
+    if (!explicitlyUnsupported && _modelResponseValueValid(spec, value)) {
+      select.value = value;
+      _modelResponseCaptured[spec.key] = value;
+      delete capsObj[spec.key];
+    }
+  });
+}
+
+function _mergeModelResponseControls(caps) {
+  if (!_modelUsesResponsesSurface()) return;
+  const sameIdentity =
+    _modelResponseInitialIdentity &&
+    _modelIdentity() === _modelResponseInitialIdentity;
+  _MODEL_RESPONSE_CONTROLS.forEach(function (spec) {
+    // Dirty (select touched this session) lets the select override a
+    // stale JSON key, but only for the identity that made it dirty —
+    // after a model/provider/surface change the flag describes the OLD
+    // row, and honoring it would delete a key hand-typed into the
+    // Advanced JSON for the new one.
+    if (_modelResponseDirty[spec.key] && sameIdentity) delete caps[spec.key];
+    else if (spec.key in caps) return; // Advanced JSON wins.
+    const select = document.getElementById(spec.elementId);
+    if (!select || !_modelResponseValueValid(spec, select.value)) return;
+    // Same capturedFallback contract as _updateModelResponseControls
+    // (rationale there): a lifted same-identity value must re-save, or an
+    // unrelated edit silently drops it from the row.
+    const capturedFallback =
+      sameIdentity && !(spec.supportKey in _modelCapsExplicit);
+    if (_modelGetTile(spec.supportKey) || capturedFallback) {
+      caps[spec.key] = select.value;
+    }
+  });
+}
+
+function _rememberModelResponseControl(spec) {
+  _modelResponseDirty[spec.key] = true;
+  if (_modelIdentity() !== _modelResponseInitialIdentity) return;
+  const select = document.getElementById(spec.elementId);
+  if (select && _modelResponseValueValid(spec, select.value)) {
+    _modelResponseCaptured[spec.key] = select.value;
+  } else {
+    delete _modelResponseCaptured[spec.key];
+  }
 }
 
 // Roles surfaced in the Models → Roles sub-tab.  Each entry maps a
@@ -6768,6 +7066,25 @@ function _renderModels(items) {
     if (m.max_tokens != null) overrides.push("max_tok=" + m.max_tokens);
     if (m.reasoning_effort != null)
       overrides.push("effort=" + m.reasoning_effort);
+    let displayCaps = m.capabilities;
+    if (typeof displayCaps === "string") {
+      try {
+        displayCaps = JSON.parse(displayCaps || "{}");
+      } catch (e) {
+        displayCaps = {};
+      }
+    }
+    if (!_isPlainObject(displayCaps)) displayCaps = {};
+    if (
+      displayCaps.supports_verbosity !== false &&
+      ["low", "medium", "high"].indexOf(displayCaps.verbosity) !== -1
+    )
+      overrides.push("verbosity=" + displayCaps.verbosity);
+    if (
+      displayCaps.supports_pro_mode !== false &&
+      ["standard", "pro"].indexOf(displayCaps.reasoning_mode) !== -1
+    )
+      overrides.push("mode=" + displayCaps.reasoning_mode);
     // Reasoning persistence flags surface only when non-default
     // (persist=False is the operator opt-out; replay=True is the
     // operator opt-in). Default values are silent.
@@ -6985,8 +7302,10 @@ function showCreateModelModal() {
   if (_calChip) _calChip.style.display = "none";
   const _recalBtn = document.getElementById("model-recalibrate-btn");
   if (_recalBtn) _recalBtn.hidden = true;
+  _modelCapsSeq++; // invalidate lookups from a prior shelf lifecycle
   _modelCapsBaseline = {};
   _modelCapsExplicit = {};
+  _resetModelResponseControls();
   _modelRenderTiles();
   document.getElementById("model-autofill").hidden = true;
   _refreshModelSuggestions();
@@ -7082,7 +7401,7 @@ function showEditModelModal(definitionId) {
           }
         },
       );
-      // Lift the 9 matrix keys out of the JSON into the tiles — they are
+      // Lift the capability keys out of the JSON into the tiles — they are
       // the row's explicit overrides and the textarea holds the remainder.
       _modelCapsExplicit = {};
       _MODEL_CAP_KEYS.forEach(function (k) {
@@ -7091,6 +7410,9 @@ function showEditModelModal(definitionId) {
           delete capsObj[k];
         }
       });
+      _modelResponseInitialIdentity = _modelIdentity();
+      _modelResponseCurrentIdentity = _modelResponseInitialIdentity;
+      _captureModelResponseControls(capsObj);
       _modelRenderTiles();
       _modelCapsRefreshBaseline();
       _scheduleEffortLadder();
@@ -7259,6 +7581,7 @@ function submitCreateModel() {
   Object.keys(_modelCapsExplicit).forEach(function (k) {
     if (!(k in caps)) caps[k] = _modelGetTile(k);
   });
+  _mergeModelResponseControls(caps);
 
   // Re-merge reranker calibration fields extracted on edit so an unrelated edit
   // doesn't silently drop the calibration. A field typed directly into the
@@ -7688,12 +8011,34 @@ function recalibrateModel() {
 }
 
 /* Capability auto-fill: when the user types a known model name or
-   changes the provider, look up static capabilities and pre-fill
-   context_window and the capabilities textarea. */
+   changes the provider, look up static capabilities and refresh the
+   context window, capability tiles, and conditional response controls. */
 let _capsTimer = null;
 let _modelCapsSeq = 0;
 function _onModelFieldChange() {
   clearTimeout(_capsTimer);
+  const nextIdentity = _modelIdentity();
+  if (
+    _modelResponseCurrentIdentity &&
+    nextIdentity !== _modelResponseCurrentIdentity
+  ) {
+    _MODEL_RESPONSE_CONTROLS.forEach(function (spec) {
+      const select = document.getElementById(spec.elementId);
+      if (!select) return;
+      const captured = _modelResponseCaptured[spec.key];
+      select.value =
+        nextIdentity === _modelResponseInitialIdentity &&
+        _modelResponseValueValid(spec, captured)
+          ? captured
+          : "";
+    });
+  }
+  _modelResponseCurrentIdentity = nextIdentity;
+  _modelCapsSeq++; // invalidate any capability lookup already in flight
+  _modelCapsBaseline = {};
+  const banner = document.getElementById("model-autofill");
+  if (banner) banner.hidden = true;
+  _modelRenderTiles();
   _capsTimer = setTimeout(_modelCapsRefreshBaseline, 500);
   _scheduleEffortLadder();
 }
@@ -7822,6 +8167,7 @@ function _modelCapsRefreshBaseline() {
   const provider = document.getElementById("model-provider").value;
   const modelName = document.getElementById("model-name").value.trim();
   const banner = document.getElementById("model-autofill");
+  const seq = ++_modelCapsSeq;
   if (
     !modelName ||
     provider === "openai-compatible" ||
@@ -7834,7 +8180,6 @@ function _modelCapsRefreshBaseline() {
   }
   // Two type-then-pause cycles can have both fetches in flight; a reordered
   // older response must not clobber the tiles (the _schPreviewSeq pattern).
-  const seq = ++_modelCapsSeq;
   authFetch(
     "/v1/api/admin/model-capabilities?provider=" +
       encodeURIComponent(provider) +
@@ -7918,6 +8263,7 @@ function _applyProviderDefaults() {
   if (serverFieldsRow) {
     serverFieldsRow.hidden = provider === "anthropic-compatible";
   }
+  _updateModelResponseControls();
 }
 
 /* Populate the model name datalist with known model prefixes for the
@@ -7957,14 +8303,26 @@ function _refreshModelSuggestions() {
   const tmEl = document.getElementById("model-thinking-mode");
   if (tmEl) tmEl.addEventListener("change", _toggleThinkingParam);
   if (tmEl) tmEl.addEventListener("change", _scheduleEffortLadder);
+  _MODEL_RESPONSE_CONTROLS.forEach(function (spec) {
+    const select = document.getElementById(spec.elementId);
+    if (select)
+      select.addEventListener("change", function () {
+        _rememberModelResponseControl(spec);
+      });
+  });
   ["model-thinking-param", "model-effort-param", "model-capabilities"].forEach(
     function (id) {
       const el = document.getElementById(id);
       if (el) el.addEventListener("input", _scheduleEffortLadder);
     },
   );
+  const rawCapsEl = document.getElementById("model-capabilities");
+  if (rawCapsEl)
+    rawCapsEl.addEventListener("input", function () {
+      _modelResponseDirty = {};
+    });
   const apiSurfEl = document.getElementById("model-api-surface");
-  if (apiSurfEl) apiSurfEl.addEventListener("change", _scheduleEffortLadder);
+  if (apiSurfEl) apiSurfEl.addEventListener("change", _onModelFieldChange);
   const grid = document.getElementById("model-capgrid");
   if (grid) {
     grid.addEventListener("change", function (e) {
@@ -7972,6 +8330,17 @@ function _refreshModelSuggestions() {
       if (!cap) return;
       // a toggle IS the override decision — the key persists from here on
       _modelCapsExplicit[cap] = e.target.checked;
+      if (cap === "supports_verbosity" || cap === "supports_pro_mode") {
+        const spec = _MODEL_RESPONSE_CONTROLS.find(function (item) {
+          return item.supportKey === cap;
+        });
+        if (spec && !e.target.checked) {
+          const select = document.getElementById(spec.elementId);
+          if (select) select.value = "";
+          delete _modelResponseCaptured[spec.key];
+        }
+        _updateModelResponseControls();
+      }
       if (cap === "supports_rerank") {
         const recalBtn = document.getElementById("model-recalibrate-btn");
         if (recalBtn)
