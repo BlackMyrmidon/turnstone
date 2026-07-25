@@ -57,7 +57,7 @@ from turnstone.core.background_shells import (
     drain_pipe_lines,
     spawn_group_leader,
 )
-from turnstone.core.config import get_searxng_engines, get_searxng_url
+from turnstone.core.config import get_searxng_engines, get_searxng_url, get_workspace_dir
 from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
@@ -189,6 +189,7 @@ from turnstone.core.tools import (
     TASK_AGENT_TOOLS,
     TASK_AUTO_TOOLS,
     TOOLS,
+    apply_cwd_context,
     merge_mcp_tools,
 )
 from turnstone.core.trajectory import (
@@ -469,6 +470,47 @@ _active_shell_owner: contextvars.ContextVar[str | None] = contextvars.ContextVar
 # Tools exempt from consecutive-identical-call repeat detection: delta-cursor
 # readers whose repeated identical call is the documented polling pattern.
 _REPEAT_EXEMPT_TOOLS: frozenset[str] = frozenset({"bash_output"})
+
+
+# Tools whose results are orchestration *handles* — control-determining state
+# (a spawned child's ws_id, the task scratchpad, wait resolutions) the model
+# cannot re-derive once dropped.  At an exhausted context budget these cross
+# truncation with a guaranteed floor instead of the zero-budget drop: losing
+# tens of bytes of handle wedges the whole orchestration loop (#883 — a
+# coordinator can never ``wait_for_workstream`` a child whose ws_id it never
+# saw), while admitting a floored result costs at most
+# ``_TRUNCATION_FLOOR_CHARS`` against a safety margin the pre-send
+# ``_over_hard`` guard enforces anyway.  Only builtin names belong here: MCP
+# tools are namespaced ``mcp__{server}__{tool}`` and can never collide.
+# Background-bash spawn acks carry a shell_id handle too, but share the
+# "bash" name with foreground bash (whose huge outputs MUST stay
+# budget-truncated); they are covered by the drain's per-batch zero-budget
+# grace pool instead — see #891 before widening this set.
+_STRUCTURAL_FLOOR_TOOLS: frozenset[str] = frozenset(
+    {"spawn_workstream", "spawn_batch", "wait_for_workstream", "tasks"}
+)
+# The guaranteed admission size (chars, ~512 tokens at 4 chars/token): the
+# floor granted to structural-tool and error results, and the per-result
+# ceiling on the zero-budget verbatim grace pool below.
+# docs/architecture.md ("Tool Output Truncation") enumerates the floor
+# tools and these sizes in prose — keep it in sync when either changes.
+_TRUNCATION_FLOOR_CHARS: int = 2048
+# Per-BATCH grace pool (chars) funding verbatim admission of small
+# NON-structural results at zero budget (denial notices, spawn acks —
+# destroying a result smaller than the ~310-char drop notice is a net
+# loss).  Bounded so a wide batch of small results cannot collectively
+# bypass the per-output budget bookkeeping: once the pool is spent,
+# further results get the honest drop notice (~6x smaller than the
+# floor).  Structural/error floors do not draw from it.
+_ZERO_BUDGET_VERBATIM_POOL_CHARS: int = 2 * _TRUNCATION_FLOOR_CHARS
+# Hard cap on zero-budget mid-turn compaction attempts per send().  An
+# UNPRODUCTIVE attempt (budget still exhausted after) jumps straight to
+# the cap; productive attempts increment toward it, so a session whose
+# post-compact fixed overhead (system prompt + tool defs + summary)
+# hovers just under the zero line cannot pay an LLM summary call on
+# every tool batch — the marginal-recovery thrash regime.  2 = one
+# genuine recover-then-re-exhaust cycle per send.
+_ZERO_BUDGET_COMPACT_CAP_PER_SEND: int = 2
 
 
 # ONE source of truth for recognized boolean-arg strings — both coercers
@@ -1437,7 +1479,10 @@ class ChatSession:
         self.model = model
         # Coordinator plumbing: populated by the console's session factory
         # only — ``kind == COORDINATOR`` sessions run COORDINATOR_TOOLS
-        # and dispatch tool execs through ``coord_client``.
+        # (plus a merged MCP surface when the factory passes an
+        # ``mcp_client``, #725) and dispatch their BUILTIN tool execs
+        # through ``coord_client``; MCP tools dispatch in-process via
+        # ``_prepare_mcp_tool``/``call_tool_sync`` like every other kind.
         self._kind = kind
         self._parent_ws_id = parent_ws_id if parent_ws_id else None
         self._coord_client: Any = coord_client
@@ -1616,6 +1661,9 @@ class ChatSession:
         self._persona_memory: bool
         self._apply_persona_snapshot(persona_snapshot)
         self._title_generated = False
+        # Monotonic truncation counter — folded into the /history
+        # single-flight key (see _persist_truncation).
+        self._history_generation = 0
         self._read_files: set[str] = set()
         # Session-monotonic run counter for sub-agent id minting (see
         # ``_run_agent``): the parent call id alone can repeat across runs (a
@@ -1767,17 +1815,16 @@ class ChatSession:
         self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
         self._mcp_resource_cb: Any = None
         self._mcp_prompt_cb: Any = None
-        # Tool-set selection is kind-aware:
-        #   * coordinator — fixed COORDINATOR_TOOLS, no MCP surface.
-        #     Coordinators are meta-orchestrators that spawn child
-        #     workstreams; MCP tools / resources / prompts live on the
-        #     children.  Giving the coordinator direct MCP access
-        #     defeats the child-spawning pattern, so we don't merge
-        #     MCP tools and don't register MCP listeners either.
-        #   * interactive + mcp — INTERACTIVE_TOOLS ∪ mcp tools; MCP
-        #     listeners register so tool/resource/prompt refreshes flow
-        #     through to this session.
-        #   * interactive (no mcp) — INTERACTIVE_TOOLS.
+        # Tool-set selection is kind-aware in the BASE only (see
+        # _set_session_tools):
+        #   * coordinator — COORDINATOR_TOOLS base; with an mcp_client
+        #     (the console factory passes the live console manager,
+        #     #725) the MCP surface merges additively and the SAME
+        #     listener/prime skeleton as interactive runs below.  Client
+        #     presence IS the session-level contract — the console
+        #     counterpart of a node session holding mcp_ref[0].
+        #   * interactive — INTERACTIVE_TOOLS ∪ mcp tools when a client
+        #     is present; plain INTERACTIVE_TOOLS otherwise.
         # Unconditional — every session kind carries the counter, so its
         # existence never encodes "MCP was wired at construction" (a
         # late-bound client or a directly-invoked callback must not
@@ -1788,17 +1835,15 @@ class ChatSession:
         # value at the authoritative merged read, compared once at the
         # end of tool setup. Only ``_mcp_tools_change_seq`` lives on.
         mcp_tools_seq_at_read = 0
-        if kind == WorkstreamKind.COORDINATOR:
-            self._tools = list(COORDINATOR_TOOLS)
-            self._task_tools = []
-        elif self._mcp_client:
+        if self._mcp_client:
             # ``self._mcp_client`` (not the raw kwarg) so an MCP-off persona
             # falls through to the no-MCP branch below.
             # Constants first — the attributes must exist for a listener
             # callback firing mid-construction; the ONE authoritative
-            # merged read runs after the registrations below.
-            self._tools = list(INTERACTIVE_TOOLS)
-            self._task_tools = list(TASK_AGENT_TOOLS)
+            # merged read runs after the registrations below.  (Also warms
+            # the get_workspace_dir config cache on the main thread, before
+            # any background-thread rebuild can race the first load.)
+            self._set_session_tools([])
             # Register for tool-change notifications from MCP servers.
             # ``user_id`` is the listener identity component — pool-only
             # changes for OTHER users must not fire this callback.
@@ -1827,8 +1872,7 @@ class ChatSession:
             # the tool-search construction below reading mixed state.
             mcp_tools_seq_at_read = self._mcp_tools_change_seq
             mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
-            self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
-            self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
+            self._set_session_tools(mcp_tools)
             # Proactively warm this user's per-user OAuth (oauth_user) pools so
             # their tools are present without a manual reconnect (e.g. after a
             # reboot/upgrade, or right after consent). Fire-and-forget — the
@@ -1837,8 +1881,7 @@ class ChatSession:
             # consented oauth_user servers.
             try_prime_user_pools(self._mcp_client, self._mcp_user_id, context="session-start")
         else:
-            self._tools = INTERACTIVE_TOOLS
-            self._task_tools = TASK_AGENT_TOOLS
+            self._set_session_tools([])
         # Inject the live alias list into the task_agent tool
         # description so the calling LLM sees its `model` parameter options.
         # Replaces affected tool dicts with deep copies — module-level
@@ -1890,11 +1933,7 @@ class ChatSession:
         # dependency now exists, so re-running the full callback is
         # safe — it rebuilds the merged lists, rendered descriptions,
         # and search index from the CURRENT maps.
-        if (
-            self._kind != WorkstreamKind.COORDINATOR
-            and self._mcp_client
-            and self._mcp_tools_change_seq != mcp_tools_seq_at_read
-        ):
+        if self._mcp_client and self._mcp_tools_change_seq != mcp_tools_seq_at_read:
             self._on_mcp_tools_changed()
         # Skill: explicit name overrides is_default skills.  ``skill_arguments``
         # carries the spec's $ARGUMENTS payload — set at create/load time,
@@ -2584,10 +2623,6 @@ class ChatSession:
         """
         if not self._mcp_client:
             return
-        # Coordinator sessions don't consume MCP tools — the tool set
-        # is fixed at COORDINATOR_TOOLS.  Ignore MCP server changes.
-        if self._kind == WorkstreamKind.COORDINATOR:
-            return
         # Monotonic change marker: the constructor snapshots this around
         # its authoritative post-registration read and re-runs this
         # callback if it advanced — otherwise a notification landing
@@ -2600,8 +2635,7 @@ class ChatSession:
         # regardless; ``user_id=None`` would silently drop pool tools
         # that the LLM is allowed to call.
         mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_effective_user_id)
-        self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
-        self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
+        self._set_session_tools(mcp_tools)
         self._render_agent_tool_descriptions()
         self._rebuild_tool_search()
 
@@ -2653,6 +2687,71 @@ class ChatSession:
                     entry += f" — {desc}"
             parts.append(entry)
         return "Available personas: " + "; ".join(parts) + "."
+
+    def _set_session_tools(self, mcp_tools: list[dict[str, Any]]) -> None:
+        """Build this session's tool lanes from pristine bases + MCP catalog.
+
+        THE single assignment path for every fresh build of ``self._tools``
+        AND ``self._task_tools`` — kind-aware in the BASE only, so every
+        rebuild site (construction pre-read, authoritative read, catalog
+        change, MCP drop) and any future one is kind-correct by
+        construction rather than by remembering a guard:
+
+        * coordinator — ``merge_mcp_tools(COORDINATOR_TOOLS, mcp_tools)``;
+          no cwd notes (no cwd-dependent tool in the base, and MCP tools
+          never carry one) and no task-agent lane.
+        * interactive — both lanes route through ``_apply_cwd_notes`` so a
+          rebuild cannot silently drop the working-dir/workspace notes by
+          assigning from the module constants directly.
+
+        Pass ``[]`` when there is no MCP surface (construction pre-read,
+        MCP-off, disconnect): ``merge_mcp_tools`` with an empty list is a
+        fresh copy of the builtin base, so the no-client and drop paths
+        reproduce the fixed kind base verbatim.
+        """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            self._tools = merge_mcp_tools(COORDINATOR_TOOLS, mcp_tools)
+            self._task_tools: list[dict[str, Any]] = []
+            return
+        self._tools = self._apply_cwd_notes(merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools))
+        self._task_tools = self._apply_cwd_notes(merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools))
+
+    def _apply_cwd_notes(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Render per-process working-dir/workspace notes into fs-tool descriptions.
+
+        Reached via ``_set_session_tools`` (interactive lane), which routes BOTH lanes
+        (``self._tools`` and the separate ``self._task_tools`` sub-agent
+        list) through here at every fresh interactive build.  Applied at
+        assignment time, so the copy cost is paid per rebuild (construction,
+        MCP catalog change, MCP disconnect), never per request, and the wire
+        tools block stays byte-stable for provider prompt caches (both
+        values are process-stable).  Input must be a pristine base (module
+        constants or ``merge_mcp_tools`` output) — never an already-noted
+        list; the append is not idempotent.  The
+        ``_render_agent_tool_descriptions`` re-derive is NOT a fresh build
+        and must not re-apply: it deep-copies only the persona/model
+        param-description tools, passing fs tools (and these notes) through
+        untouched.  Coordinator builds never reach here — their
+        ``_set_session_tools`` lane skips notes (COORDINATOR_TOOLS holds no
+        cwd-dependent tool, and MCP tools never carry one).
+
+        ``os.getcwd()`` is what a cwd-less Popen inherits (spawn_group_leader)
+        and what relative file-tool paths resolve against, so the note names
+        where tools actually run.  Guarded: the cwd can be deleted under us
+        (eval workdir teardown), and MCP rebuilds run on a background thread —
+        degrade to note-less descriptions rather than failing the rebuild.
+        The workspace hint drops when the directory is missing on this node
+        (stale config must not point the model at a phantom path) and when it
+        equals the working directory (one fact, not two copies of one path).
+        """
+        try:
+            working_dir = os.getcwd()
+        except OSError:
+            working_dir = ""
+        workspace_dir = get_workspace_dir() or ""
+        if workspace_dir and (workspace_dir == working_dir or not os.path.isdir(workspace_dir)):
+            workspace_dir = ""
+        return apply_cwd_context(tools, working_dir, workspace_dir)
 
     def _render_agent_tool_descriptions(self) -> None:
         """Inject live option lists into agent-tool parameter descriptions.
@@ -3102,8 +3201,10 @@ class ChatSession:
         adopting an MCP-off stamp.  Deregisters the three listeners (same
         ``_mcp_listener_user_id`` identity rule as ``close()``), drops the
         client reference, and resets both toolsets to the builtin lists.
-        Only reachable on interactive sessions — coordinators never hold a
-        client.  The caller rebuilds tool search and recomposes the prompt.
+        Reachable on BOTH kinds (#725): a coordinator resume() can adopt an
+        MCP-off stamp too — the kind-aware ``_set_session_tools`` resets it
+        to COORDINATOR_TOOLS, never the interactive lanes.  The caller
+        rebuilds tool search and recomposes the prompt.
         """
         if self._mcp_client is None:
             return
@@ -3123,8 +3224,7 @@ class ChatSession:
             )
             self._mcp_prompt_cb = None
         self._mcp_client = None
-        self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, [])
-        self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, [])
+        self._set_session_tools([])
         self._render_agent_tool_descriptions()
 
     def _handle_mcp_refresh(self, arg: str) -> None:
@@ -3360,22 +3460,66 @@ class ChatSession:
         self._print_status_line()
         return compacted
 
-    def _truncate_output(self, output: str, remaining_budget_tokens: int | None = None) -> str:
+    def _truncate_output(
+        self,
+        output: str,
+        remaining_budget_tokens: int | None = None,
+        floor_chars: int = 0,
+    ) -> str:
         """Truncate tool output, keeping head + tail.
 
         The effective limit is the *minimum* of:
         - ``self.tool_truncation`` (fixed cap, defaults to 50% of context)
         - ``remaining_budget_tokens`` converted to chars (if provided)
 
+        raised to at least ``floor_chars`` when given.  The floor is the
+        guaranteed admission size for results the orchestration cannot lose
+        (structural handles, error dispositions — the drain loop decides);
+        it deliberately wins over BOTH the budget and an operator-set cap,
+        because a lost ws_id or masked failure wedges the session outright
+        (#883) while an admitted floor costs ~512 tokens against a margin
+        the pre-send ``_over_hard`` guard enforces regardless.
+
         This ensures a single tool result cannot overflow the context window
         even when the conversation is already partially full.
+
+        A non-positive limit (context budget exhausted — reachable only via
+        the budget arm; ``tool_truncation`` is always positive) replaces the
+        output with an explicit drop notice.  Small results are usually
+        still admitted at zero budget, but that is the DRAIN's decision, not
+        this function's: the caller funds them through ``floor_chars`` from
+        a bounded per-batch grace pool, so collective verbatim admission
+        stays accounted (an unconditioned small-pass here let a wide batch
+        of small results bypass the per-output bookkeeping entirely).
+        The notice must never read as a
+        successful-but-trimmed call: the earlier placeholder did, and a
+        coordinator that "successfully" spawned a child while its ws_id was
+        silently destroyed stalled unrecoverably (#883).  It states what the
+        shell knows — the call ran; the output is gone — so the model
+        neither re-fires side-effecting calls nor waits on results it will
+        never see.  Full receipts are not preserved for re-derivation
+        (deliberate — see #883 discussion); re-running after compaction is
+        the recovery path for read-only calls.
         """
+        if not output:
+            # Nothing to truncate and nothing to account: an empty result
+            # always passes.  Without this, a zero-budget batch would
+            # replace a 0-char result with the ~310-char drop notice —
+            # false ("none of it could be added") and net-negative.
+            return output
         limit = self.tool_truncation
         if remaining_budget_tokens is not None:
             budget_chars = int(remaining_budget_tokens * self._chars_per_token)
             limit = min(limit, budget_chars)
+        limit = max(limit, floor_chars)
         if limit <= 0:
-            return f"[Output truncated — {len(output)} chars exceeded context budget]"
+            return (
+                f"Error: tool result dropped — context budget exhausted. The call ran "
+                f"and produced a {len(output)}-char result, but none of it could be "
+                f"added to the conversation. Do not assume the call failed and do not "
+                f"re-run side-effecting calls. Compact or wrap up; re-issue read-only "
+                f"calls afterwards if their output is still needed."
+            )
         if len(output) <= limit:
             return output
         half = limit // 2
@@ -4786,6 +4930,43 @@ class ChatSession:
         self._has_persisted_error = True
         self._emit_state("error")
 
+    def ensure_error_recorded(self, exc: BaseException) -> None:
+        """Idempotently route a fatal exception through :meth:`_record_fatal_error`.
+
+        FRESH-SESSION USE ONLY.  The sole caller is the initial-message worker
+        ``_run_initial`` (server.py), which runs on a factory-fresh session's
+        FIRST send.  The idempotency guard is ``_has_persisted_error``, which is
+        **session-lifetime** — cleared only by an ``idle``/``running`` state
+        emission, NOT per turn — so it distinguishes "send already recorded THIS
+        turn's error" from "not yet recorded" only when no prior turn could have
+        left it set.  On a **reused** session (a ``/retry``, main ``/send``, the
+        coordinator send, a wake) a pre-try raise after a prior errored turn
+        finds the flag stale-True and this no-ops — silently swallowing the fresh
+        error and surfacing the stale ``last_error``.  Those closures therefore
+        must NOT route through here until the per-turn error-recorded signal of
+        #865 lands; see ``_run`` for the deliberate non-use.
+
+        Two cases on the fresh-session path, one primitive:
+
+        * ``send`` already recorded this turn's fatal error in-line — the common
+          backend-boundary path, where its ``except`` arm ran
+          ``_record_fatal_error`` (setting ``_has_persisted_error``) before
+          re-raising.  Then this is a **no-op**: no second ``state=error``
+          emission, avoiding the duplicate ``state_change`` SSE / ``set_state``.
+        * the exception escaped ``send`` BEFORE its ``try`` — a pre-try failure
+          (model-registry refresh, user-turn append, system-message recompose)
+          that bypasses ``_record_fatal_error``.  Then this **records it now**,
+          so ``state==error ⇒ meaningful last_error`` holds on that path too.
+
+        Sanitizing lives inside ``_record_fatal_error``, so a worker closure must
+        route raw exceptions here rather than emitting ``str(exc)`` to a UI sink
+        itself: a credential-bearing ``base_url`` in the exception text would
+        otherwise cross the confidentiality floor into a dashboard SSE.
+        """
+        if self._has_persisted_error:
+            return
+        self._record_fatal_error(exc)
+
     def _format_backend_error(self, exc: BaseException) -> str | None:
         """Return an enriched message for known backend boundary errors.
 
@@ -4808,10 +4989,22 @@ class ChatSession:
         base URL are redacted before display / persist.
         """
         # Backend identity shared by every branch — model label + raw tail.
-        # Hoisted so the context-overflow branch and the class-name branches use
-        # one derivation.  self.model/_model_alias are plain __init__ attributes
+        # The model references models by ALIAS everywhere it acts (list_nodes
+        # advertises aliases, spawn takes an alias as model=), so lead with the
+        # alias here too: a coordinator reading this error can correlate the
+        # failed model with those surfaces without a lookup and route around it
+        # (respawn on another node/alias) instead of burning reasoning tokens
+        # reconciling the alias against a backend id it never sees elsewhere.
+        # The backend id (what the server was actually asked for) rides as a
+        # labeled annotation for the operator, collapsing to one token when the
+        # two coincide.  self.model/_model_alias are plain __init__ attributes
         # (always set), so reading them here can't raise on the fatal path.
-        model_label = self.model or self._model_alias or "?"
+        alias = self._model_alias or ""
+        backend_id = self.model or ""
+        if alias and backend_id and alias != backend_id:
+            model_label = f"{alias} (id={backend_id})"
+        else:
+            model_label = alias or backend_id or "?"
         raw_msg = str(exc).strip()
         raw_tail = f" raw={raw_msg!r}" if raw_msg else ""
 
@@ -5819,7 +6012,13 @@ class ChatSession:
             return
         self._acting_user_id = user_id
         mcp = self._mcp_client
-        if not mcp or self._kind == WorkstreamKind.COORDINATOR:
+        # Coordinators participate fully (#725): they are multi-sender by
+        # design (any admin.coordinator operator with project visibility
+        # may drive one — ownership is not enforced), so an acting-user
+        # change MUST re-scope the listeners and prime the new user's
+        # pools below; otherwise operator B would dispatch against
+        # operator A's primed pool catalog.
+        if not mcp:
             return
         old_listener_uid = self._mcp_listener_user_id
         new_listener_uid: str | None = self._mcp_effective_user_id
@@ -5839,10 +6038,17 @@ class ChatSession:
         # state under the new identity NOW — the prime above completes
         # asynchronously and only notifies on catalog changes, while
         # already-warm pool entries for this user produce no
-        # notification at all.
+        # notification at all.  ONE _init_system_messages() covers both
+        # the resource and prompt catalogs: the _on_mcp_resources_changed
+        # / _on_mcp_prompts_changed wrappers are pure passthroughs to it
+        # (they exist for the manager's separate notification channels,
+        # which still fire them independently), and it rebuilds the full
+        # system message copy-on-write — calling it twice per handoff was
+        # a redundant list_prompt_policies() read + compose per rebind.
+        # The persona-catalog read inside the tools rebuild stays as-is:
+        # sender-independent but handoff-frequency, not worth memoizing.
         self._on_mcp_tools_changed()
-        self._on_mcp_resources_changed()
-        self._on_mcp_prompts_changed()
+        self._init_system_messages()
 
     def send(
         self,
@@ -5998,6 +6204,23 @@ class ChatSession:
                 )
                 if self._generation != my_generation:
                     return
+            # Send-scoped attempt counter for the zero-budget compaction
+            # trigger in the tool-result drain below, capped at
+            # ``_ZERO_BUDGET_COMPACT_CAP_PER_SEND``.  Each drain pass resets
+            # ``pre_attempted_compact``, so without send-scoped state a
+            # wedged turn re-pays the LLM summary call every tool batch.
+            # An UNPRODUCTIVE attempt (budget still exhausted after) jumps
+            # straight to the cap; a productive one increments toward it,
+            # so a genuine recover-then-re-exhaust still earns one fresh
+            # attempt while the marginal-recovery thrash regime (fixed
+            # overhead hovering just under the zero line, every attempt
+            # "productive" by a hair) is bounded at the cap all the same.
+            # Deliberately a LOCAL, not an instance attribute: the
+            # generation-swap ``return``s inside the loop would skip any
+            # end-of-send clear, and stale instance state would suppress a
+            # legitimate compaction on the NEXT send.  Dying with the call
+            # frame is the reset.
+            zero_budget_compact_attempts = 0
             while True:
                 self._check_cancelled(my_generation)
                 msgs = self._prepare_wire_messages(self._full_messages())
@@ -6205,11 +6428,99 @@ class ChatSession:
                     self._do_auto_compact("mid-turn", preserve_tail=1, my_generation=my_generation)
                     pre_attempted_compact = True
                 truncation_budget = self._remaining_token_budget()
+                if (
+                    truncation_budget <= 0
+                    and not pre_attempted_compact
+                    and zero_budget_compact_attempts < _ZERO_BUDGET_COMPACT_CAP_PER_SEND
+                    and self._generation == my_generation
+                ):
+                    # Zero tool-result budget can wedge the loop BELOW the
+                    # owed thresholds: with max_tokens ≥ context_window/4
+                    # the response reserve zeroes the budget near 70%
+                    # fullness — under the DEFAULT auto_compact_pct, and
+                    # further under any raised one — while a stalled model
+                    # appends too little to ever cross it, so without this
+                    # trigger the session can sit in the zero band
+                    # indefinitely while every tool result is floored or
+                    # dropped (#883).  The predicate is the exhausted
+                    # budget itself, never a threshold, so it composes
+                    # with any operator-set auto_compact_pct: thresholds
+                    # below the zero point compact via the owed path
+                    # first, and this branch is its bail/insufficient
+                    # backstop.  Zero budget is itself
+                    # compaction-owed evidence.  ``auto=True`` WITHOUT
+                    # ``threshold_pct``, exactly like the ctx-overflow
+                    # retry: no threshold was evaluated, so the notice must
+                    # not claim one.  Bounded per send by the attempt
+                    # counter; if compaction cannot clear the band the
+                    # floor/drop-notice path below is the backstop.
+                    self._compact_messages(
+                        auto=True,
+                        preserve_tail=1,
+                        my_generation=my_generation,
+                        where="mid-turn, tool-result budget exhausted",
+                    )
+                    self._print_status_line()
+                    pre_attempted_compact = True
+                    zero_budget_compact_attempts += 1
+                    truncation_budget = self._remaining_token_budget()
+                    if truncation_budget <= 0:
+                        # The attempt didn't clear the band (bail, or the
+                        # post-compact floor of system prompt + summary +
+                        # tool defs alone exceeds the zero threshold on
+                        # this window) — retrying cannot help, so burn the
+                        # remaining attempts for this send.
+                        zero_budget_compact_attempts = _ZERO_BUDGET_COMPACT_CAP_PER_SEND
                 _truncated: dict[str, str] = {}
+                # Per-batch grace pool: small NON-structural results are
+                # admitted verbatim at zero budget by funding their own
+                # size as the floor, until the pool is spent — bounding
+                # THIS door's collective admission where an unconditioned
+                # small-pass would let N small results bypass the
+                # per-output bookkeeping below entirely.  The pool bounds
+                # only the small-result door; the structural/error floors
+                # below are per-result by design (ruling at their site).
+                zero_budget_verbatim_pool = _ZERO_BUDGET_VERBATIM_POOL_CHARS
                 for tc_id, output in results:
                     if isinstance(output, str):
+                        # Structural handles and error dispositions get the
+                        # guaranteed floor: neither may be zero-dropped (a
+                        # lost ws_id stalls orchestration, a masked failure
+                        # reads as success — #883).  ``_tool_error_flags``
+                        # is still populated here; the per-result loop
+                        # below pops it to build the persisted turn.
+                        # DELIBERATELY per-result, with NO aggregate cap
+                        # (unlike the grace pool): capping structural
+                        # floors would re-open #883 for wide fan-outs
+                        # (every parallel spawn's handle is needed or its
+                        # child orphans), and capping error floors would
+                        # mask failures behind a success-leaning notice —
+                        # inviting the blind re-runs #865/#866 exist to
+                        # prevent.  Worst case is bounded by the model's
+                        # own batch width and lands on the pre-send
+                        # ``_over_hard`` guard / ctx-overflow retry: one
+                        # extra compaction round-trip, traded for never
+                        # losing a handle or a disposition.
+                        _floor = (
+                            _TRUNCATION_FLOOR_CHARS
+                            if (
+                                _tc_names.get(tc_id, "") in _STRUCTURAL_FLOOR_TOOLS
+                                or self._tool_error_flags.get(tc_id, False)
+                            )
+                            else 0
+                        )
+                        if (
+                            _floor == 0
+                            and truncation_budget <= 0
+                            and len(output) <= _TRUNCATION_FLOOR_CHARS
+                            and zero_budget_verbatim_pool >= len(output)
+                        ):
+                            _floor = len(output)
+                            zero_budget_verbatim_pool -= len(output)
                         truncated = self._truncate_output(
-                            output, remaining_budget_tokens=truncation_budget
+                            output,
+                            remaining_budget_tokens=truncation_budget,
+                            floor_chars=_floor,
                         )
                         _truncated[tc_id] = truncated
                         truncation_budget = max(
@@ -6679,6 +6990,19 @@ class ChatSession:
             # summarized prefix — skip rather than risk it; resume reconciles.
             return
         delete_messages_after(self._ws_id, max(floor, total - removed_count))
+        # History generation (#894/#884 seam): every truncation bumps the
+        # counter the /history single-flight folds into its flight key, so
+        # a request dispatched AFTER a rewind/retry can never join a flight
+        # whose load_messages ran BEFORE it (a joined pre-rewind payload
+        # rendered as fresh truth on the coordinator and reopened the
+        # over-rewind window the #894 client latch closes).  Bumped AFTER
+        # the storage delete: flights rebuild from storage, so a flight
+        # keyed with the OLD generation that reads post-delete rows is the
+        # harmless spuriously-fresh direction, while a NEW-generation
+        # flight reading pre-delete rows would be the wrongly-joined one —
+        # and the early-return error paths above (count/floor unavailable,
+        # delete skipped) correctly leave the generation unbumped.
+        self._history_generation += 1
 
     def rewind(self, n: int) -> int:
         """Drop the last *n* complete turns from the conversation.
@@ -9796,6 +10120,10 @@ class ChatSession:
             "skills": self._prepare_skills,
             # Coordinator tools: only reachable when this session was
             # constructed with kind="coordinator" (COORDINATOR_TOOLS set).
+            # A new tool whose result is an orchestration HANDLE (ws_id,
+            # task scratchpad, wait resolution) must also join
+            # ``_STRUCTURAL_FLOOR_TOOLS`` or it loses its zero-budget
+            # truncation floor and re-opens the #883 wedge.
             "spawn_workstream": self._prepare_spawn_workstream,
             "spawn_batch": self._prepare_spawn_batch,
             "close_all_children": self._prepare_close_all_children,
@@ -14725,9 +15053,13 @@ class ChatSession:
         timeout = item.get("timeout") or self.tool_timeout
         try:
             # Pre-bind so the ``finally`` can't raise ``UnboundLocalError``
-            # and mask the real error if the spawn below fails.
+            # and mask the real error if the spawn below fails.  The chunk
+            # gate pre-binds with them — its .set() runs in the same
+            # finally, and setting it when no drain ever started is a
+            # harmless no-op.
             proc: subprocess.Popen[str] | None = None
             script_path: str | None = None
+            emit_done = threading.Event()
             try:
                 from turnstone.core.env import scrubbed_env
 
@@ -14756,8 +15088,30 @@ class ChatSession:
                 # ``drain_pipe_lines`` (the drain half of the recipe both
                 # bash variants share); only the sinks differ — stdout also
                 # streams to the UI.
+                #
+                # ``emit_done`` gates the UI half only: once set (after the
+                # join window, before ANY report path), the drain callback
+                # stops forwarding lines to the UI but keeps collecting
+                # ``stdout_parts`` so the pipe always drains and the child
+                # never blocks on a full pipe.  Without the gate, a drain
+                # thread that outlives its join (``bash.drain_leaked``
+                # below — a double-``setsid`` grandchild holding stdout
+                # open) keeps emitting into LATER turns: the UI batches
+                # chunks per call_id, some local providers REUSE call_ids
+                # across turns, and the client grafts stray chunks under
+                # the completed row.  The execution closure is the one
+                # identity that id reuse can't confuse, so the leak is
+                # closed here at the source rather than with a UI-side
+                # closed-call ledger (which per-turn resets or LRU churn
+                # would silently re-open).  Residual race: a line already
+                # past the check when the event sets — at most one line,
+                # equivalent to the pre-batching behaviour.  (The event is
+                # pre-bound next to ``proc`` above so the finally's .set()
+                # can't UnboundLocalError on a failed spawn.)
                 def _on_stdout(line: str) -> None:
                     stdout_parts.append(line)
+                    if emit_done.is_set():
+                        return
                     try:
                         self.ui.on_tool_output_chunk(call_id, line)
                     except Exception:
@@ -14824,6 +15178,17 @@ class ChatSession:
                 if stdout_thread.is_alive() or stderr_thread.is_alive():
                     log.warning("bash.drain_leaked", call_id=call_id, pid=proc.pid)
             finally:
+                # The gate sets in the FINALLY, not after the joins in the
+                # try body: every report path (normal / cancel / timeout /
+                # exception) runs after this block, and an exception thrown
+                # anywhere between thread start and the joins — a failed
+                # stderr_thread.start() under thread exhaustion, say —
+                # would otherwise reach the outer handlers' tool_result
+                # with the gate unset, killpg unreached, and a live drain
+                # still forwarding chunks past its own result (the exact
+                # cross-turn grafting the gate exists to prevent).  On the
+                # normal path this is the same post-join position.
+                emit_done.set()
                 if proc is not None:
                     with self._procs_lock:
                         self._active_procs.discard(proc)
