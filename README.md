@@ -18,8 +18,8 @@ Named after the [Ruddy Turnstone](https://en.wikipedia.org/wiki/Ruddy_turnstone)
 **What is a harness?**
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/turnstonelabs/turnstone/main/docs/diagrams/harness.png">
-    <img src="https://raw.githubusercontent.com/turnstonelabs/turnstone/main/docs/diagrams/harness.png" alt="ℋ : s_{n+1} ~ T(s_n) for n < τ_H — the whole controlled loop: π lowers state to context, M_W proposes a readout, γ authorizes it, Q_E acts on the world, ρ verifies and folds back" width="960"/>
+  <a href="https://media.githubusercontent.com/media/turnstonelabs/turnstone/main/docs/diagrams/harness.png">
+    <img src="https://media.githubusercontent.com/media/turnstonelabs/turnstone/main/docs/diagrams/harness.png" alt="ℋ : s_{n+1} ~ T(s_n) for n < τ_H — the whole controlled loop: π lowers state to context, M_W proposes a readout, γ authorizes it, Q_E acts on the world, ρ verifies and folds back" width="960"/>
   </a>
 </p>
 
