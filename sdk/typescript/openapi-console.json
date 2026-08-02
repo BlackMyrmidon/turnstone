@@ -10824,6 +10824,16 @@
             "title": "Replay Reasoning To Model",
             "type": "boolean"
           },
+          "auth_mode": {
+            "default": "static",
+            "title": "Auth Mode",
+            "type": "string"
+          },
+          "obo_audience": {
+            "default": "",
+            "title": "Obo Audience",
+            "type": "string"
+          },
           "source": {
             "default": "",
             "title": "Source",
@@ -10938,6 +10948,16 @@
             "default": false,
             "title": "Replay Reasoning To Model",
             "type": "boolean"
+          },
+          "auth_mode": {
+            "default": "static",
+            "title": "Auth Mode",
+            "type": "string"
+          },
+          "obo_audience": {
+            "default": "",
+            "title": "Obo Audience",
+            "type": "string"
           }
         },
         "required": [
@@ -11105,6 +11125,30 @@
             ],
             "default": null,
             "title": "Replay Reasoning To Model"
+          },
+          "auth_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Auth Mode"
+          },
+          "obo_audience": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Obo Audience"
           }
         },
         "title": "UpdateModelDefinitionRequest",
