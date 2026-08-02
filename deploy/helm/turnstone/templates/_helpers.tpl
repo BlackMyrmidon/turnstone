@@ -111,6 +111,31 @@ Determine the PostgreSQL username.
 {{- end }}
 
 {{/*
+The PostgreSQL password when the chart stores it itself, empty when it
+does not. Doubles as the predicate for "does <fullname>-secrets need to
+carry POSTGRES_PASSWORD", so an inline password is never written
+anywhere but <fullname>-secrets, and an operator-supplied Secret is
+never duplicated into it.
+
+An operator-supplied existingSecret wins outright: writing the value
+into a second Secret nothing reads would only duplicate a credential.
+
+Both branches need "default" because this is reached through include,
+which captures rendered text rather than a value: a key that is unset
+rather than empty — "password:" with nothing after it — renders as the
+literal "<no value>", and a ten-character string is truthy. Without the
+default that lands base64-encoded in POSTGRES_PASSWORD and the workloads
+authenticate with it.
+*/}}
+{{- define "turnstone.db.inlinePassword" -}}
+{{- if .Values.postgresql.enabled }}
+{{- .Values.postgresql.auth.password | default "" }}
+{{- else if not .Values.database.external.existingSecret }}
+{{- .Values.database.external.password | default "" }}
+{{- end }}
+{{- end }}
+
+{{/*
 Determine the secret holding the PostgreSQL password.
 
 An external database may point at a secret the chart does not own (a
@@ -118,17 +143,18 @@ CloudNativePG-generated secret, an External Secrets target, ...), in
 which case the key name is rarely "POSTGRES_PASSWORD" — hence the
 companion existingSecretPasswordKey.
 
-Otherwise fall back to the chart's application secret, which is
-llm.existingSecret when the operator supplies one. That fallback must
-not be hardcoded to "<fullname>-secrets": templates/secret.yaml is
-skipped entirely when llm.existingSecret is set, so hardcoding it would
-point every workload at a Secret that is never created.
+Otherwise the password is inline in values, and the chart writes it to
+its own <fullname>-secrets. Note this is deliberately not
+turnstone.llm.secretName: that resolves to llm.existingSecret when the
+operator supplies one, which holds LLM API keys and has no reason to
+carry a database password. templates/secret.yaml renders on exactly the
+condition above, so the two stay in agreement.
 */}}
 {{- define "turnstone.db.secretName" -}}
 {{- if and (not .Values.postgresql.enabled) .Values.database.external.existingSecret }}
 {{- .Values.database.external.existingSecret }}
 {{- else }}
-{{- include "turnstone.llm.secretName" . }}
+{{- printf "%s-secrets" (include "turnstone.fullname" .) }}
 {{- end }}
 {{- end }}
 
