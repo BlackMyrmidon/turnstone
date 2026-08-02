@@ -45,6 +45,22 @@ Shell harness (?split=): right (default) · down · three · none — boots the
   document.title stamps SPLIT-READY-<visible cells> on success and
   SPLIT-FAILED-<reason> when a driven split was denied — judge the focused
   cell's top accent bar, the separators, and the .shown tab marker.
+Proxy-brand harness (/proxybrand/livepass.html): back-to-console from a
+  PROXIED node view, driven end to end.  An iframe hosts a node page built
+  from the REAL shell.js rail plus the REAL _JS_PROXY_SHIM (read out of
+  turnstone/console/server.py by text, never imported -- scripts/ has no
+  sys.path guard, so an import would silently pick up site-packages).  The
+  host clicks the brand's child span and, because the shim navigates the
+  FRAME away, reads the frame's post-navigation location from the surviving
+  top page.  document.title stamps PROXYBRAND-READY, or
+  PROXYBRAND-FAILED-<reason>: sub-not-repointed-server (nothing wired),
+  showhome-also-ran (shell.js won the click), nav-<path> (went somewhere
+  other than the console root), sub-not-console-<text>, aria-not-repointed,
+  no-navigation, no-brand, no-sub.  Needs --virtual-time-budget=9000;
+  there is nothing to screenshot.  Read the verdict from <title> --
+  both literals also appear in the host page's inline script, so a bare
+  grep over --dump-dom output false-positives.
+
 Attachments harness (/attachments/livepass.html): the composer attachment
   chips + the sent-message attachment pills, both driven through the REAL
   code paths — createAttachmentController.rehydrate() builds the chips and
@@ -79,6 +95,30 @@ Task-agent harness (/taskagent/livepass.html): the task_agent card — a task
   success, TASKAGENT-FAILED-... / TASKAGENT-ERROR when routing breaks, so a
   broken card can't screenshot green.
 
+Copy harness (/copy/livepass.html): the copy-to-clipboard affordances — the
+  per-bubble copy button in .msg-actions and the floating block-copy button
+  over hovered fences / mermaid diagrams / tables (pointer-only; keyboard
+  copies with Enter on the focused block) — driven through the REAL
+  InteractivePane (replayHistory plus a live handleEvent stream turn, so the
+  retry-holder buttons coexist with the persistent copy buttons on the last
+  bubble; the turn ends idle, matching the affordances' idle-only gate).
+  navigator.clipboard is stubbed to a recorder, hover/focus/keys are
+  dispatched synthetically, and every copied payload is compared byte-exact
+  against the SOURCE (fences, pipes, mermaid text, the bubble's raw
+  markdown).  + &theme=light.  document.title stamps
+  COPY-READY-<bubbles>-<blocks> only when every probe copied exact source;
+  COPY-FAILED-<reason> otherwise.  &kbd=1 probes the KEYBOARD path: focus a
+  block, dispatch Enter — the block's source lands on the clipboard, the
+  block carries the outcome flash class, and the floating button stays out
+  of it — stamps COPY-KBD-READY / COPY-KBD-FAILED-<step>.
+  Screenshot states: &flash=1 (visual-only
+  run — no probes; floating button + ✓ state on the fence, holder bar
+  revealed via focus) and &bare=1 (single hover, no decoration).  Known
+  capture artifact: the DARK-theme &flash=1 shot can omit the floating
+  button's pixels (headless software compositor; the DOM state is correct
+  and light theme paints) — judge the dark floating button from &bare=1
+  and the ✓ state from the light shot.  &stepmax=N bisects a paint
+  regression to the interaction that triggers it.
 Perf harness (/perf/livepass.html): long-session performance baseline for the
   interactive pane — mounts the REAL InteractivePane at real scroll geometry
   (fixed-height mount, production CSS chain) and drives production-shaped
@@ -141,6 +181,24 @@ def extract_admin_fragment() -> str:
     start = html.index('<div id="admin-layout"')
     end = html.index("<!-- /admin-layout -->") + len("<!-- /admin-layout -->")
     return html[start:end]
+
+
+def extract_proxy_shim(prefix: str = "/node/livepass-node") -> str:
+    """Pull ``_JS_PROXY_SHIM`` out of console/server.py BY TEXT, not import.
+
+    ``scripts/`` has no ``sys.path`` guard, so ``import turnstone`` from here
+    resolves to whatever is installed in site-packages rather than this
+    checkout -- silently building the page from a DIFFERENT version of the
+    shim than the one you are trying to verify.  Read the source instead.
+    """
+    src = (ROOT / "turnstone/console/server.py").read_text(encoding="utf-8")
+    m = re.search(r'^_JS_PROXY_SHIM = """\\\n(.*?)^"""', src, re.S | re.M)
+    if not m:
+        raise SystemExit(
+            "livepass: could not find _JS_PROXY_SHIM in turnstone/console/server.py "
+            "-- the constant was renamed or reshaped; update extract_proxy_shim()."
+        )
+    return m.group(1).replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
 
 
 def inject(template: str, marker: str, payload: str) -> str:
@@ -658,6 +716,108 @@ SHELL_TEMPLATE = """<!doctype html>
 # call the same window.buildAttachmentPreview).  The page frame is harness-only
 # chrome and not under review; the chips row and the pill row are.
 # --------------------------------------------------------------------------
+
+# The PROXIED NODE page: the real L-shell (so the rail brand is the real
+# element, with the real shell.js click listener on it) plus the real proxy
+# shim injected exactly where proxy_index puts it -- first thing inside
+# <body>, ahead of the deferred shell.js module.  caps mirror a NODE, not
+# the console: brandSub "server" is what the shim has to overwrite, and
+# leaving it "console" would make the host's /console/i check vacuous.
+PROXYBRAND_FRAME_TEMPLATE = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>proxied node</title>
+    <link rel="stylesheet" href="shared/base.css" />
+    <link rel="stylesheet" href="shared/ui-base.css" />
+    <link rel="stylesheet" href="static/style.css" />
+    <link rel="stylesheet" href="shared/shell.css" />
+  </head>
+  <body>
+    <!-- SHIM:BEGIN -->
+    <!-- SHIM:END -->
+    <div id="header" style="display: none"><div id="status-bar"></div></div>
+    <div id="main" style="padding: 18px">
+      <h2 style="margin: 0 0 8px">Node dashboard</h2>
+    </div>
+    <div id="view-admin" style="display: none"></div>
+    <script>
+      window.TURNSTONE_SHELL_CAPS = { cluster: false, brandSub: "server" };
+      window.TS_APP = {
+        boot() {},
+        getClusterState() { return { nodes: {} }; },
+        onRender() {},
+      };
+      window.TS_ADMIN = {};
+      // Record on the PARENT, which survives the frame's navigation.
+      // A flag on the frame's own window dies with the document, so the
+      // host would read undefined and pass -- a check that cannot fail.
+      window.showHome = function () {
+        try { window.parent.__showHomeRan = true; } catch (e) {}
+      };
+    </script>
+    <script type="module" src="shared/shell.js"></script>
+  </body>
+</html>
+"""
+
+# The HOST page.  The shim navigates the FRAME to "/", which would destroy
+# any verdict stamped inside it -- so the surviving top page reads the
+# frame's post-navigation location and stamps its own title instead.  No
+# landing page at "/" is needed (the harness root serves a directory
+# listing) and no CDP client either.
+PROXYBRAND_HOST_TEMPLATE = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>proxybrand livepass</title>
+    <style>
+      html, body { margin: 0; height: 100%; }
+      iframe { width: 100%; height: 100%; border: 0; }
+    </style>
+  </head>
+  <body>
+    <iframe id="frame" src="frame.html"></iframe>
+    <script>
+      const frame = document.getElementById("frame");
+      let phase = 0;
+      const fail = (r) => { phase = 9; document.title = "PROXYBRAND-FAILED-" + r; };
+
+      frame.addEventListener("load", () => {
+        if (phase === 9) return;
+        if (phase === 0) {
+          const doc = frame.contentDocument;
+          const brand = doc.querySelector(".rail-brand .brand-home");
+          if (!brand) return fail("no-brand");
+          const sub = brand.querySelector(".brand-sub");
+          if (!sub) return fail("no-sub");
+          const text = sub.textContent.trim();
+          if (text === "server") return fail("sub-not-repointed-server");
+          if (!/console/i.test(text)) return fail("sub-not-console-" + text);
+          if (brand.getAttribute("aria-label") !== "Back to console")
+            return fail("aria-not-repointed");
+          phase = 1;
+          // Click the CHILD span, as a real user does: the shim must match
+          // via contains(), not target identity.
+          sub.click();
+          setTimeout(() => { if (phase === 1) fail("no-navigation"); }, 2000);
+          return;
+        }
+        const path = frame.contentWindow.location.pathname;
+        const ranShowHome = !!window.__showHomeRan;
+        phase = 2;
+        if (path !== "/") return fail("nav-" + path);
+        if (ranShowHome) return fail("showhome-also-ran");
+        // Sticky, mirroring fail(): a third load must not re-stamp.
+        phase = 9;
+        document.title = "PROXYBRAND-READY";
+      });
+    </script>
+  </body>
+</html>
+"""
+
+
 ATTACH_TEMPLATE = """<!doctype html>
 <html lang="en">
   <head>
@@ -821,7 +981,24 @@ ATTACH_TEMPLATE = """<!doctype html>
 # is exercised, not just the leaf builders.  The page frame is harness-only
 # chrome; the .conv-batch / task_agent card is what's under review.
 # --------------------------------------------------------------------------
-TASKAGENT_TEMPLATE = """<!doctype html>
+# The host seams a mounted InteractivePane provides, stubbed once for every
+# harness that drives the REAL pane (taskagent, copy).  A new required seam
+# gets added HERE — a harness left with a stale stub set does not fail at
+# review time, it throws HARNESS ERROR at run time.
+PANE_STUB_JS = """\
+        // Drive the REAL pane; stub only the host seams a mounted pane provides.
+        const pane = new InteractivePane("demo-ws");
+        pane.messagesEl = messages;
+        pane.inputEl = document.createElement("textarea");
+        pane.sendBtn = document.createElement("button");
+        pane.isNearBottom = () => false;
+        pane.scrollToBottom = () => {};
+        pane.removeEmptyState = () => {};
+        pane.removeThinkingIndicator = () => {};
+        pane.setBusy = () => {};"""
+
+TASKAGENT_TEMPLATE = (
+    """<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -871,16 +1048,9 @@ TASKAGENT_TEMPLATE = """<!doctype html>
 
       const messages = document.getElementById("messages");
       try {
-        // Drive the REAL pane; stub only the host seams a mounted pane provides.
-        const pane = new InteractivePane("demo-ws");
-        pane.messagesEl = messages;
-        pane.inputEl = document.createElement("textarea");
-        pane.sendBtn = document.createElement("button");
-        pane.isNearBottom = () => false;
-        pane.scrollToBottom = () => {};
-        pane.removeEmptyState = () => {};
-        pane.removeThinkingIndicator = () => {};
-        pane.setBusy = () => {};
+"""
+    + PANE_STUB_JS
+    + """
         const ev = (e) => pane.handleEvent(e);
 
         // ?recall=1: exercise the RECALL path — replayHistory rebuilding the
@@ -1029,6 +1199,266 @@ TASKAGENT_TEMPLATE = """<!doctype html>
   </body>
 </html>
 """
+)
+
+
+# --------------------------------------------------------------------------
+# Copy harness — the copy-to-clipboard affordances over the REAL pane.  The
+# bubbles come from the REAL replayHistory / handleEvent paths so the copy
+# sources are the ones production stashes (_copySource, the mermaid / table
+# data attributes), and the probes drive the REAL buttons and key path and
+# compare what landed on the (stubbed) clipboard byte-exact against the
+# source.
+# --------------------------------------------------------------------------
+COPY_TEMPLATE = (
+    """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>copy livepass</title>
+    <link rel="stylesheet" href="shared/base.css" />
+    <link rel="stylesheet" href="shared/ui-base.css" />
+    <link rel="stylesheet" href="shared/chat.css" />
+    <link rel="stylesheet" href="shared/conversation.css" />
+    <link rel="stylesheet" href="shared/cards.css" />
+    <link rel="stylesheet" href="shared/interactive.css" />
+    <style>
+      /* Harness-only framing (NOT under review) — a plausible pane context. */
+      body {
+        padding: 24px; margin: 0; background: var(--bg); color: var(--ink);
+        font-family: var(--font-sans, system-ui, sans-serif);
+      }
+      .demo-frame { max-width: 720px; margin: 0 auto; }
+      .demo-label {
+        font: 11px var(--font-mono, monospace); color: var(--ink-3);
+        text-transform: uppercase; letter-spacing: 0.08em; margin: 0 0 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="demo-frame">
+      <div class="demo-label">conversation — copy affordances (real InteractivePane)</div>
+      <div class="messages" id="messages"></div>
+    </div>
+    <script>
+      window.toast = { error: function (m) { console.log("toast:", m); } };
+      window.authFetch = function () {
+        return Promise.resolve({
+          ok: true,
+          json: function () { return Promise.resolve({}); },
+          text: function () { return Promise.resolve(""); },
+        });
+      };
+      // Deterministic clipboard: record instead of writing.  localhost is a
+      // secure context so copyTextToClipboard takes the async-API branch and
+      // hits this stub; force isSecureContext for any odd serving setup.
+      window.__copied = [];
+      try {
+        Object.defineProperty(window, "isSecureContext", { value: true });
+      } catch (e) { /* already true */ }
+      try {
+        Object.defineProperty(navigator, "clipboard", {
+          value: {
+            writeText: function (t) {
+              window.__copied.push(t);
+              return Promise.resolve();
+            },
+          },
+          configurable: true,
+        });
+      } catch (e) {
+        document.title = "COPY-FAILED-clipboard-stub";
+      }
+    </script>
+    <script type="module">
+      import { InteractivePane } from "./shared/interactive.js";
+      const q = new URLSearchParams(location.search);
+      if (q.get("theme") === "light")
+        document.documentElement.dataset.theme = "light";
+
+      const FENCE_SRC = 'def stash(depth):\\n    total = 0\\n    for k in range(depth):\\n        total += k\\n    return total';
+      const TABLE_SRC = '| node | state |\\n|---|:--:|\\n| flat | idle |\\n| blck | busy |';
+      const MERMAID_SRC = 'graph TD\\n  A --> B\\n  B --> C';
+      const MD_ONE =
+        'First reply with a fence and a table.\\n\\n' +
+        '```python\\n' + FENCE_SRC + '\\n```\\n\\n' +
+        TABLE_SRC + '\\n\\nTrailing prose under the table.';
+      const MD_TWO =
+        'Second reply with a diagram.\\n\\n' +
+        '```mermaid\\n' + MERMAID_SRC + '\\n```\\n\\n' +
+        'And `inline code` after it.';
+      const MD_LIVE =
+        'Streamed reply: the **live** turn, so the retry holder lands here.';
+
+      const messages = document.getElementById("messages");
+      const fail = (r) => { document.title = "COPY-FAILED-" + r; };
+      try {
+"""
+    + PANE_STUB_JS
+    + """
+
+        pane.replayHistory([
+          { role: "user", content: "Show me the stash helper and the node table." },
+          { role: "assistant", content: MD_ONE },
+          { role: "user", content: "Now the flow as a diagram, please." },
+          { role: "assistant", content: MD_TWO },
+        ]);
+        // A live streamed turn on top — the retry holder must land on this
+        // bubble WITHOUT stripping its (or any) copy button.
+        pane.handleEvent({ type: "state_change", state: "running" });
+        for (let k = 0; k < MD_LIVE.length; k += 16)
+          pane.handleEvent({ type: "content", text: MD_LIVE.slice(k, k + 16) });
+        pane.handleEvent({ type: "stream_end" });
+        pane.handleEvent({ type: "state_change", state: "idle" });
+
+        const hover = (el) =>
+          el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+        const fabEl = () => document.querySelector(".block-copy-btn");
+
+        // Let the streamed bubble's rAF render + retry attach settle.
+        setTimeout(async () => {
+          try {
+          const bubbles = messages.querySelectorAll(".msg.assistant");
+          const bars = messages.querySelectorAll(
+            ".msg.assistant .msg-actions .msg-copy-btn",
+          );
+          if (bubbles.length !== 3) return fail("bubbles" + bubbles.length);
+          if (bars.length !== 3) return fail("bars" + bars.length);
+          const last = bubbles[bubbles.length - 1];
+          if (!last.querySelector(".msg-retry-btn"))
+            return fail("no-retry-on-holder");
+          if (!last.querySelector(".msg-copy-btn"))
+            return fail("holder-lost-copy");
+
+          // Block probes: hover reveals the floating button; a click must
+          // land the byte-exact SOURCE on the clipboard.
+          const probes = [
+            [messages.querySelector(".msg.assistant pre"), FENCE_SRC, "fence"],
+            [messages.querySelector(".table-wrap"), TABLE_SRC, "table"],
+            [messages.querySelector(".mermaid-container"), MERMAID_SRC, "mermaid"],
+          ];
+          // &bare=1 — diagnostic state: no probe clicks, no repositioning;
+          // one hover on the fence and stop.  Splits "the probe cycle
+          // corrupts the button's paint" from "it never paints here".
+          if (q.get("bare") === "1") {
+            hover(probes[0][0]);
+            document.title = "COPY-BARE";
+            return;
+          }
+
+          // &kbd=1 — the keyboard path: Enter on a FOCUSED block copies
+          // that block's source directly.  Blocks are focusable (tabindex=0
+          // from the fence / table / mermaid renders), the outcome flashes
+          // on the block itself, and the floating button — pointer-only —
+          // must stay out of it entirely (never created, never revealed).
+          if (q.get("kbd") === "1") {
+            const tw = messages.querySelector(".table-wrap");
+            if (!tw) return fail("kbd-no-block");
+            tw.focus();
+            const focused = document.activeElement === tw;
+            tw.dispatchEvent(
+              new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+            );
+            await new Promise((r) => setTimeout(r, 0));
+            const copied =
+              window.__copied[window.__copied.length - 1] === TABLE_SRC;
+            const flashed = tw.classList.contains("is-copied");
+            const fabStaysOut =
+              !fabEl() || !fabEl().classList.contains("is-visible");
+            document.title =
+              focused && copied && flashed && fabStaysOut
+                ? "COPY-KBD-READY"
+                : "COPY-KBD-FAILED-" +
+                  [
+                    focused ? "" : "focus",
+                    copied ? "" : "copy",
+                    flashed ? "" : "flash",
+                    fabStaysOut ? "" : "fab",
+                  ]
+                    .filter(Boolean)
+                    .join("-");
+            return;
+          }
+
+          // &flash=1 — the VISUAL state, screenshot-only: skip the probes so
+          // the fence hover is the floating button's FIRST show.  Returning
+          // the button to an already-visited position stops it PAINTING in
+          // headless captures (visible + hit-testable, no pixels — a stale
+          // compositor tile; bisected via &stepmax).  Function and pixels
+          // are therefore split: the probe run (no flash) is the verdict,
+          // this state is the picture.
+          if (q.get("flash") === "1") {
+            bars[bars.length - 1].focus();
+            hover(probes[0][0]);
+            const fab = fabEl();
+            if (!fab) return fail("no-fab-visual");
+            fab.classList.add("is-copied");
+            fab.title = "Copied";
+            // Freeze: the capture pipeline synthesizes a pointer event
+            // outside the block at screenshot time, which would hide the
+            // button (correct in production).  Capture-phase stops starve
+            // the module's delegated listeners for the capture.
+            for (const t of ["mouseover", "scroll"])
+              document.addEventListener(t, (e) => e.stopPropagation(), true);
+            document.title = "COPY-VISUAL";
+            return;
+          }
+          // &stepmax=N — diagnostic: stop after the Nth interaction (hovers
+          // and clicks count) and stamp COPY-STEP-N, so a paint regression
+          // can be bisected to the interaction that triggers it.
+          let step = 0;
+          const stepMax = parseInt(q.get("stepmax") || "999", 10);
+          const gate = () => {
+            step += 1;
+            if (step > stepMax) {
+              document.title = "COPY-STEP-" + (step - 1);
+              throw { __stop: true };
+            }
+          };
+          let done = 0;
+          for (const [el, want, name] of probes) {
+            if (!el) return fail("no-" + name);
+            gate();
+            hover(el);
+            const fab = fabEl();
+            if (!fab || !fab.classList.contains("is-visible"))
+              return fail("fab-hidden-" + name);
+            gate();
+            fab.click();
+            await new Promise((r) => setTimeout(r, 0));
+            const got = window.__copied[window.__copied.length - 1];
+            if (got !== want) {
+              console.log("copy mismatch", name, JSON.stringify(got));
+              return fail("source-" + name);
+            }
+            done += 1;
+          }
+
+          // Bubble probe: the whole raw markdown, fences and pipes intact.
+          gate();
+          bars[0].click();
+          await new Promise((r) => setTimeout(r, 0));
+          if (window.__copied[window.__copied.length - 1] !== MD_ONE)
+            return fail("bubble-source");
+
+          document.title = "COPY-READY-" + bars.length + "-" + done;
+          } catch (e) {
+            if (!(e && e.__stop)) {
+              console.log("copy harness error", e);
+              fail("error");
+            }
+          }
+        }, 400);
+      } catch (e) {
+        messages.textContent = "HARNESS ERROR: " + e.message;
+        fail("error");
+      }
+    </script>
+  </body>
+</html>
+"""
+)
 
 
 # --------------------------------------------------------------------------
@@ -1476,12 +1906,29 @@ def build(out: Path) -> None:
     (ta / "livepass.html").write_text(TASKAGENT_TEMPLATE, encoding="utf-8")
     print(f"{ta}/livepass.html — task_agent card (real Pane.handleEvent routing)")
 
+    cp = out / "copy"
+    cp.mkdir(parents=True, exist_ok=True)
+    symlink(cp / "shared", ROOT / "turnstone/shared_static")
+    (cp / "livepass.html").write_text(COPY_TEMPLATE, encoding="utf-8")
+    print(f"{cp}/livepass.html — copy affordances (bubble bars + block button)")
+
     pf = out / "perf"
     pf.mkdir(parents=True, exist_ok=True)
     symlink(pf / "shared", ROOT / "turnstone/shared_static")
     symlink(pf / "static", ROOT / "turnstone/ui/static")
     (pf / "livepass.html").write_text(PERF_TEMPLATE, encoding="utf-8")
     print(f"{pf}/livepass.html — long-session perf baseline (real InteractivePane)")
+
+    pb = out / "proxybrand"
+    pb.mkdir(parents=True, exist_ok=True)
+    symlink(pb / "shared", ROOT / "turnstone/shared_static")
+    symlink(pb / "static", ROOT / "turnstone/ui/static")
+    shim = "<script>" + extract_proxy_shim() + "</script>"
+    (pb / "frame.html").write_text(
+        inject(PROXYBRAND_FRAME_TEMPLATE, "SHIM", shim), encoding="utf-8"
+    )
+    (pb / "livepass.html").write_text(PROXYBRAND_HOST_TEMPLATE, encoding="utf-8")
+    print(f"{pb}/livepass.html — back-to-console brand (real shell.js + real shim)")
 
 
 class _PerfStore:
