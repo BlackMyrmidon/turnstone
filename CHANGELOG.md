@@ -206,6 +206,30 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Fixed
 
+- **A cancelled judge, guard, or compaction call can now stop before its
+  request goes out (#972).** Previously it could not: `model_turn` refused
+  to *re-issue* an abandoned call after a mid-stream death, but nothing
+  checked before a first dispatch, so a call whose caller had already gone
+  away still sent — and the reply was discarded unread after the endpoint
+  had accepted the work. It now checks immediately before sending, so a
+  Stop observed by that point costs no request, and again on entry, so a
+  call already cancelled when it arrives also skips credential resolution.
+  Cancellation is cooperative, which bounds what that buys: a Stop only
+  saves the request if it lands before dispatch — sending is a moment, the
+  response streaming back is the rest of the call, and an abort arriving
+  then still meets a request in flight, closed in place exactly as before.
+  The window that did widen usefully is a delegated-auth alias whose token
+  mint blocks; a Stop during that mint now costs no request (though a mint
+  already under way still completes). What a stopped call saves is the
+  request, its prompt-side billing, and — on a capacity-bounded
+  self-hosted endpoint — a slot a live request wanted. Unchanged: the
+  interactive turn, which has its own pre-send cancellation check on a
+  different path, and the lanes that thread no cancellation handle
+  (attachment perception, title generation, web-fetch extraction,
+  sub-agents, optimizer, eval) — and web-fetch extraction deliberately
+  never will, since it runs on parallel tool threads where registering one
+  would clobber the main stream's.
+
 - **Inline `<think>`/`<reasoning>` blocks no longer leak into drained
   results (#965, #940).** On servers without a reasoning parser
   (parserless vLLM/llama.cpp, LM Studio, bare gateways), reasoning
@@ -220,6 +244,7 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   mismatched-vocabulary close tag (`<think>…</reasoning>`) now closes
   the block — matching the interactive lane's long-standing rule —
   where the old per-lane strips treated it as unterminated.
+
 - **A transport failure mid-generation no longer kills the interactive
   turn (#937).** A wire death during body streaming (TLS record failure,
   connection reset — `httpx.ReadError` and kin) surfaces after the
