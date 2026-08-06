@@ -5795,11 +5795,17 @@ class ChatSession:
         # the backend's.  Checked FIRST: the overflow text-match below must
         # not claim a lowering error whose message mentions token limits.
         if isinstance(exc, WirePreparationError):
+            # Exception TYPE only, never its message.  Every other branch
+            # tails the BACKEND's own diagnostic; this one would carry our
+            # lowering's message over the session's STORED HISTORY, and
+            # this string is both shown to the operator and persisted to
+            # ``last_error`` for a coordinating agent to read.  The debug
+            # traceback logged alongside localizes the raise site.
             prep_cause = exc.__cause__
-            detail = f"{type(prep_cause).__name__}: {prep_cause}" if prep_cause else raw_msg
+            detail = type(prep_cause).__name__ if prep_cause else type(exc).__name__
             return (
-                f"Preparing the request from this conversation's history failed: "
-                f"{detail}. This is a fault in the session's stored history, not "
+                f"Preparing the request from this conversation's history failed "
+                f"({detail}). This is a fault in the session's stored history, not "
                 f"in the {model_label} backend (backend health is unaffected). "
                 f"/compact may clear a malformed turn; please report this."
             )
@@ -6555,7 +6561,7 @@ class ChatSession:
         """
         if self._cancel_event.is_set():
             raise GenerationCancelled()
-        if my_generation and my_generation != self._generation:
+        if _generation_superseded(self, my_generation):
             raise GenerationCancelled()
 
     def _claim_generation(self) -> int:
@@ -7568,6 +7574,12 @@ class ChatSession:
                 # through (largely) untruncated instead of snipping them only to
                 # summarise them moments later.  Generation-guarded so an
                 # orphaned thread can't replace history under the active one.
+                # Positive equality, not ``_generation_superseded``: inside
+                # ``send`` my_generation is always a CLAIMED one (>= 1), and
+                # the two spellings agree there.  They part at generation 0,
+                # which the helper reads as unscoped-and-live — so if this
+                # guard is ever converted, keep the "am I still the active
+                # generation" reading rather than "was I superseded".
                 pre_attempted_compact = False
                 if self._generation == my_generation and self._compaction_owed():
                     self._do_auto_compact("mid-turn", preserve_tail=1, my_generation=my_generation)
@@ -9559,7 +9571,7 @@ class ChatSession:
         because nobody is waiting on a force-abandoned compaction and its
         notice mid-turn reads as the LIVE work being cancelled.
         """
-        stale = bool(my_generation and my_generation != self._generation)
+        stale = _generation_superseded(self, my_generation)
         event: dict[str, Any] = {"compaction_id": my_generation, "superseded": stale, **payload}
         if payload.get("phase") == "end" and not payload.get("ok"):
             event["notice"] = (
