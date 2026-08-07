@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 from tests._session_helpers import as_stream
 from tests._session_helpers import mock_completion_result as _mock_result
 from turnstone.core.judge import IntentJudge, IntentVerdict, JudgeConfig, evaluate_heuristic
+from turnstone.core.providers._protocol import ModelCapabilities
 from turnstone.core.trajectory import Role
 
 # ---------------------------------------------------------------------------
@@ -28,10 +29,13 @@ def _make_mock_provider(
     """Create a mock LLM provider that returns a fixed response."""
     provider = MagicMock()
     provider.provider_name = "openai"
-    caps = MagicMock()
-    caps.context_window = 100_000
-    caps.max_output_tokens = 4096
-    provider.get_capabilities.return_value = caps
+    # A REAL ModelCapabilities, never a MagicMock: every attribute of a
+    # mock is truthy, so any boolean capability the code consults (the
+    # drain's ``server_parses_reasoning`` scan gate, and whatever field
+    # lands next) would silently flip behavior for the whole suite.
+    provider.get_capabilities.return_value = ModelCapabilities(
+        context_window=100_000, max_output_tokens=4096
+    )
 
     if side_effect:
         provider.create_streaming.side_effect = side_effect
@@ -70,7 +74,9 @@ def _make_judge(
         session_provider=provider,
         session_client=client,
         session_model="test-model",
-        session_capabilities=MagicMock(context_window=100_000),
+        # Real caps for the same reason as in ``_make_mock_provider`` —
+        # the judge PREFERS session_capabilities over the provider's.
+        session_capabilities=ModelCapabilities(context_window=100_000),
     )
 
 
@@ -365,10 +371,9 @@ class TestMultiTurnToolUse:
         """Provider requests read_file, then returns verdict."""
         provider = MagicMock()
         provider.provider_name = "openai"
-        caps = MagicMock()
-        caps.context_window = 100_000
-        caps.max_output_tokens = 4096
-        provider.get_capabilities.return_value = caps
+        provider.get_capabilities.return_value = ModelCapabilities(
+            context_window=100_000, max_output_tokens=4096
+        )
         provider.convert_tools.side_effect = lambda tools, **kw: tools
 
         # Turn 1: tool call
@@ -405,10 +410,9 @@ class TestMultiTurnToolUse:
         """Provider keeps requesting tools — stops at _JUDGE_MAX_TURNS."""
         provider = MagicMock()
         provider.provider_name = "openai"
-        caps = MagicMock()
-        caps.context_window = 100_000
-        caps.max_output_tokens = 4096
-        provider.get_capabilities.return_value = caps
+        provider.get_capabilities.return_value = ModelCapabilities(
+            context_window=100_000, max_output_tokens=4096
+        )
         provider.convert_tools.side_effect = lambda tools, **kw: tools
 
         # Every turn returns a tool call
@@ -899,11 +903,18 @@ class TestModelAliasResolution:
         # resolution path is exercised, not a MagicMock leak.
         cfg.temperature = 0.3
         registry.has_alias.side_effect = lambda a: a == alias
-        registry.resolve.return_value = (alias_client, underlying_model, cfg)
+        # One locked snapshot: resolve_binding binds client + config +
+        # provider together, never a pair a reload could tear.
+        registry.resolve_binding.return_value = (
+            alias_client,
+            underlying_model,
+            cfg,
+            alias_provider,
+            0,
+        )
         # The unified lane resolver (model_turn.resolve_capabilities) fetches
-        # the config itself rather than taking resolve()'s copy.
+        # the config itself rather than taking the resolve copy.
         registry.get_config.return_value = cfg
-        registry.get_provider.return_value = alias_provider
         return registry
 
     def test_alias_capabilities_merged_and_threaded_to_wire(self):
@@ -930,7 +941,7 @@ class TestModelAliasResolution:
             session_provider=_make_mock_provider(),
             session_client=MagicMock(base_url="https://s/v1", api_key="s"),
             session_model="session-model",
-            session_capabilities=MagicMock(context_window=100_000),
+            session_capabilities=ModelCapabilities(context_window=100_000),
             model_registry=registry,
         )
         # Merged at construction: overrides applied, untouched fields survive.
@@ -968,7 +979,7 @@ class TestModelAliasResolution:
             session_provider=_make_mock_provider(),
             session_client=MagicMock(base_url="https://s/v1", api_key="s"),
             session_model="session-model",
-            session_capabilities=MagicMock(context_window=100_000),
+            session_capabilities=ModelCapabilities(context_window=100_000),
             model_registry=registry,
         )
         assert registry.get_config.call_count == 0
@@ -1067,14 +1078,19 @@ class TestModelAliasResolution:
         cfg.context_window = 0
         registry = MagicMock()
         registry.has_alias.side_effect = lambda a: a == "judge-mini"
-        registry.resolve.return_value = (MagicMock(base_url="http://a", api_key="k"), "m", cfg)
-        registry.get_provider.return_value = _make_mock_provider()
+        registry.resolve_binding.return_value = (
+            MagicMock(base_url="http://a", api_key="k"),
+            "m",
+            cfg,
+            _make_mock_provider(),
+            0,
+        )
         judge = IntentJudge(
             config=JudgeConfig(enabled=True, model="judge-mini"),
             session_provider=_make_mock_provider(),
             session_client=MagicMock(base_url="http://s", api_key="s"),
             session_model="session-model",
-            session_capabilities=MagicMock(context_window=100_000),
+            session_capabilities=ModelCapabilities(context_window=100_000),
             model_registry=registry,
         )
         assert judge._judge_context_window == 100_000  # session window, not 0
@@ -1102,7 +1118,7 @@ class TestModelAliasResolution:
             session_provider=session_provider,
             session_client=session_client,
             session_model="session-default-model",
-            session_capabilities=MagicMock(context_window=100_000),
+            session_capabilities=ModelCapabilities(context_window=100_000),
             model_registry=registry,
         )
 
@@ -1110,6 +1126,34 @@ class TestModelAliasResolution:
         assert judge._model == "session-default-model"
         # Context window mirrors the session, not the (uncalled) caps lookup.
         assert judge._judge_context_window == 100_000
+
+    def test_construction_failure_warns_with_cause_not_registration_advice(self, caplog):
+        """A REGISTERED alias whose binding cannot be built keeps the
+        session-model fallback, but the warning names the construction
+        cause — the register-the-alias advice would misdiagnose a row
+        that is already registered."""
+        from turnstone.core.model_registry import ModelClientConstructionError
+
+        registry = MagicMock()
+        registry.has_alias.side_effect = lambda a: a == "judge-mini"
+        registry.resolve_binding.side_effect = ModelClientConstructionError(
+            "provider 'openai' does not support api_surface 'messages'"
+        )
+
+        with caplog.at_level("WARNING", logger="turnstone.core.judge"):
+            judge = IntentJudge(
+                config=JudgeConfig(enabled=True, model="judge-mini"),
+                session_provider=_make_mock_provider(),
+                session_client=MagicMock(base_url="https://s/v1", api_key="s"),
+                session_model="session-model",
+                session_capabilities=ModelCapabilities(context_window=100_000),
+                model_registry=registry,
+            )
+
+        assert judge._model == "session-model"  # fallback behavior unchanged
+        warned = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        assert any("does not support api_surface" in m for m in warned)
+        assert not any("not a registered alias" in m for m in warned)
 
     def test_empty_model_inherits_session_model(self):
         """Empty ``config.model`` is the documented self-consistency path."""
@@ -1162,3 +1206,41 @@ class TestModelAliasResolution:
         assert callback_results[0].tier == "llm"
         assert callback_results[0].tier != "llm_fallback"
         assert "did not return a verdict" not in callback_results[0].reasoning
+
+
+class TestInlineReasoningSeam:
+    """#965 per-lane pins: judge content arrives IR-clean from the drain."""
+
+    def test_think_wrapped_verdict_parses_clean(self):
+        # Reasoning around the verdict JSON is segregated at the seam, so
+        # _parse_verdict reads pure JSON — a draft verdict INSIDE the think
+        # block can no longer shadow the real one.
+        content = (
+            '<think>draft: {"recommendation": "block", "risk_level": "critical"}</think>'
+            + _good_verdict_json()
+        )
+        provider = _make_mock_provider(response_content=content)
+        judge = _make_judge(provider)
+        result = judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "test"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+        assert result is not None
+        assert result.recommendation == "approve"
+        assert result.risk_level == "low"
+
+    def test_think_only_response_takes_empty_ladder(self):
+        # An all-reasoning judge turn drains to empty content and rides the
+        # SAME empty-response ladder as a genuinely empty turn — it never
+        # reaches _parse_verdict with tag text.
+        provider = _make_mock_provider(response_content="<think>only deliberation</think>")
+        judge = _make_judge(provider)
+        result = judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "test"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+        assert result is None

@@ -25,6 +25,7 @@ from turnstone.core.deadline import (
     run_abortable_with_deadline,
 )
 from turnstone.core.log import get_logger
+from turnstone.core.model_registry import ModelClientConstructionError
 from turnstone.core.model_turn import model_turn, resolve_capabilities, resolve_lane
 from turnstone.core.trajectory import Turn
 
@@ -979,6 +980,7 @@ class IntentJudge:
         model_registry: Any | None = None,
         session_model_alias: str = "",
         config_store: Any | None = None,
+        backend_auth_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self._config = config
         self._rule_registry = rule_registry
@@ -987,6 +989,7 @@ class IntentJudge:
         # global ``model.temperature``) resolve like every other lane.
         self._model_registry = model_registry
         self._config_store = config_store
+        self._backend_auth_resolver = backend_auth_resolver
         # The caller (ChatSession) resolves the session model's real caps from
         # _get_capabilities (config/registry-aware) and passes them in; they are
         # this judge's wire capabilities and window when it inherits the session
@@ -1009,11 +1012,17 @@ class IntentJudge:
         # instead; an unknown value here logs a warning and inherits the
         # session model.
         resolved = False
+        construction_error: ModelClientConstructionError | None = None
         if config.model and model_registry is not None:
             try:
                 if model_registry.has_alias(config.model):
-                    client, model_name, model_cfg = model_registry.resolve(config.model)
-                    self._provider = model_registry.get_provider(config.model)
+                    # One locked snapshot for client + provider — separate
+                    # resolve()/get_provider() calls could pair an old-map
+                    # client with a new-map provider (wrong SDK dialect).
+                    client, model_name, model_cfg, provider, _ = model_registry.resolve_binding(
+                        config.model
+                    )
+                    self._provider = provider
                     self._client_factory_args = self._extract_client_config(
                         client,
                         self._provider.provider_name,
@@ -1049,11 +1058,25 @@ class IntentJudge:
                         session_window,
                     )
                     resolved = True
+            except ModelClientConstructionError as exc:
+                construction_error = exc
             except Exception:
                 log.debug("Model alias resolution failed for %r, falling back", config.model)
 
         if not resolved:
-            if config.model:
+            if construction_error is not None:
+                # The alias IS registered; its binding could not be built.
+                # Same session-model fallback, but name the construction
+                # cause — the register-the-alias advice below would
+                # misdiagnose a row that is already registered.
+                log.warning(
+                    "judge.model=%r is registered but its client could not be "
+                    "constructed (%s) — falling back to session model %r.",
+                    config.model,
+                    construction_error,
+                    session_model,
+                )
+            elif config.model:
                 log.warning(
                     "judge.model=%r is not a registered alias — falling back to "
                     "session model %r.  Register the model in the Models tab and "
@@ -1353,6 +1376,7 @@ class IntentJudge:
             registry=self._model_registry,
             capabilities=self._capabilities,
             config_store=self._config_store,
+            backend_auth_resolver=self._backend_auth_resolver,
         )
 
         # Multi-turn judge loop

@@ -79,6 +79,9 @@ from turnstone.core.storage._schema import (
     prompt_policies as prompt_policies_t,
 )
 from turnstone.core.storage._utils import (
+    CAPS_COMPARE_UNSET as _CAPS_COMPARE_UNSET,
+)
+from turnstone.core.storage._utils import (
     COMPACTION_SOURCE as _COMPACTION_SOURCE,
 )
 from turnstone.core.storage._utils import (
@@ -4822,8 +4825,9 @@ class PostgreSQLBackend:
         token row — the freshness sweep's drive set + keepalive-refresh signal.
 
         Unfiltered by expiry: an expired access token with a live refresh token
-        is still a consented grant the sweep must keep hot. Only ``oauth_user``
-        servers write these rows; no ciphertext is projected.
+        is still a consented grant the sweep must keep hot. Joined to
+        ``mcp_servers`` so only ``oauth_user`` grants drive the sweep; synthetic
+        model mint-cache rows are excluded. No ciphertext is projected.
         """
         with self._conn() as conn:
             rows = conn.execute(
@@ -4832,6 +4836,13 @@ class PostgreSQLBackend:
                     mcp_user_tokens.c.server_name,
                     sa.func.coalesce(mcp_user_tokens.c.last_refreshed, mcp_user_tokens.c.created),
                 )
+                .select_from(
+                    mcp_user_tokens.join(
+                        mcp_servers,
+                        mcp_servers.c.name == mcp_user_tokens.c.server_name,
+                    )
+                )
+                .where(mcp_servers.c.auth_type == "oauth_user")
             ).fetchall()
         return [(row[0], row[1], row[2]) for row in rows]
 
@@ -5071,6 +5082,9 @@ class PostgreSQLBackend:
         reasoning_effort: str | None = None,
         surface_persisted_reasoning: bool = True,
         replay_reasoning_to_model: bool = False,
+        auth_mode: str = "static",
+        obo_audience: str = "",
+        obo_scopes: str = "",
     ) -> None:
         from sqlalchemy.dialects import postgresql
 
@@ -5093,6 +5107,9 @@ class PostgreSQLBackend:
                     reasoning_effort=reasoning_effort,
                     surface_persisted_reasoning=1 if surface_persisted_reasoning else 0,
                     replay_reasoning_to_model=1 if replay_reasoning_to_model else 0,
+                    auth_mode=auth_mode,
+                    obo_audience=obo_audience,
+                    obo_scopes=obo_scopes,
                     created_by=created_by,
                     created=now,
                     updated=now,
@@ -5141,7 +5158,13 @@ class PostgreSQLBackend:
                 for r in rows
             ]
 
-    def update_model_definition(self, definition_id: str, **fields: Any) -> bool:
+    def update_model_definition(
+        self,
+        definition_id: str,
+        *,
+        expected_capabilities: Any = _CAPS_COMPARE_UNSET,
+        **fields: Any,
+    ) -> bool:
 
         fields = {k: v for k, v in fields.items() if k in _MODEL_DEF_MUTABLE}
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -5154,11 +5177,18 @@ class PostgreSQLBackend:
         if "replay_reasoning_to_model" in fields:
             fields["replay_reasoning_to_model"] = 1 if fields["replay_reasoning_to_model"] else 0
         with self._conn() as conn:
-            result = conn.execute(
-                sa.update(model_definitions)
-                .where(model_definitions.c.definition_id == definition_id)
-                .values(**fields)
+            stmt = sa.update(model_definitions).where(
+                model_definitions.c.definition_id == definition_id
             )
+            if expected_capabilities is not _CAPS_COMPARE_UNSET:
+                # Conditional write: apply only while capabilities still
+                # equal the caller's re-read value, so a concurrent write is
+                # a rowcount-0 miss to re-merge onto, not a silent revert.
+                if expected_capabilities is None:
+                    stmt = stmt.where(model_definitions.c.capabilities.is_(None))
+                else:
+                    stmt = stmt.where(model_definitions.c.capabilities == expected_capabilities)
+            result = conn.execute(stmt.values(**fields))
             conn.commit()
             return result.rowcount > 0
 

@@ -41,6 +41,10 @@ def _stub(
         _provider=SimpleNamespace(provider_name=provider_name),
         model=model,
         _model_alias=model_alias,
+        # Dead-binding latches, clear: the formatter checks them first and
+        # short-circuits when both are unset, like a healthy session.
+        _registry_alias_removed=None,
+        _rebind_failed_key=None,
     )
 
 
@@ -99,6 +103,14 @@ class PermissionDeniedError(Exception):
 
 
 class RateLimitError(Exception):
+    pass
+
+
+class ReadError(Exception):  # noqa: N818
+    pass
+
+
+class RemoteProtocolError(Exception):  # noqa: N818
     pass
 
 
@@ -197,6 +209,87 @@ def test_rate_limit_with_overflow_phrasing_is_not_mislabeled_overflow():
 
 
 # ---------------------------------------------------------------------------
+# Stream-death branch — the mid-response wire-failure wording (#937)
+# ---------------------------------------------------------------------------
+
+
+def _stream_death_exemplars() -> list[BaseException]:
+    """One realistic instance per name in ``_BACKEND_STREAM_EXC_NAMES``:
+    the normalized shape the guarded iterators raise, plus the raw httpx
+    names for any future unguarded path."""
+    from turnstone.core.providers import IncompleteStreamError
+
+    return [
+        IncompleteStreamError(
+            "stream transport failed mid-response "
+            "(ReadError: [SSL] record layer failure (_ssl.c:2590))"
+        ),
+        ReadError("[SSL] record layer failure (_ssl.c:2590)"),
+        RemoteProtocolError("peer closed connection without sending complete message body"),
+    ]
+
+
+@pytest.mark.parametrize("exc", _stream_death_exemplars(), ids=lambda e: type(e).__name__)
+def test_stream_death_names_backend_and_model(exc):
+    msg = _format(_stub(), exc)
+    assert msg is not None
+    assert "Backend stream died mid-response" in msg
+    assert type(exc).__name__ in msg
+    assert "openai-compatible" in msg
+    assert "http://192.168.0.5:8000/v1" in msg
+    assert "model=flatspark" in msg
+    assert "retries did not recover it" in msg
+    # Raw exception text is preserved as a tail for grep-correlation.
+    assert str(exc) in msg
+
+
+def test_stream_death_first_sentence_survives_discord_cut():
+    """Discord truncates ``on_error`` text to 500 chars — the identity-bearing
+    first sentence must fit even with realistic-length alias/URL inputs."""
+    msg = _format(
+        _stub(
+            base_url="https://inference-gateway.internal.example-corp.net:8443/serving/v1",
+            provider_name="openai-compatible",
+            model="deepseek-r2-awq-128k-instruct-20260115",
+            model_alias="prod-reasoning-primary",
+        ),
+        ReadError("[SSL] record layer failure (_ssl.c:2590)"),
+    )
+    assert msg is not None
+    first_sentence = msg[: msg.index(". ") + 1]
+    assert "Backend stream died mid-response" in first_sentence
+    assert len(first_sentence) < 500
+
+
+def test_registry_diagnosed_binding_outranks_stream_death():
+    """An alias the per-send refresh diagnosed dead outranks the raw stream
+    symptom: the rebind wording points at the admin action, the transport
+    wording at network health — the former is the actionable one."""
+    from turnstone.core.providers import IncompleteStreamError
+
+    stub = _stub()
+    stub._registry_alias_removed = "flatspark"
+    stub._registry = None
+    stub._kind = None
+    msg = _format(stub, IncompleteStreamError("stream transport failed mid-response"))
+    assert msg is not None
+    assert "has been removed from the registry" in msg
+    assert "Backend stream died" not in msg
+
+
+def test_stream_death_with_overflow_phrasing_stays_stream_death():
+    """Joining the stream names into ``_BACKEND_KNOWN_EXC_NAMES`` removes them
+    from ``_is_ctx_overflow``'s text-detection eligibility (its class
+    self-gate) — deliberate: transport/SSL texts never carry real overflow
+    phrases, and a stream death must never be misfiled as a deterministic
+    overflow (which callers route to a non-retryable compaction path)."""
+    msg = _format(_stub(), ReadError("proxy said: maximum context length hint in banner"))
+    assert msg is not None
+    assert "Backend stream died mid-response" in msg
+    assert "Context window exceeded" not in msg
+
+
+# ---------------------------------------------------------------------------
 # Fall-through + degradation behaviour
 # ---------------------------------------------------------------------------
 
@@ -244,6 +337,8 @@ def test_client_base_url_raises_degrades_gracefully():
         _provider=SimpleNamespace(provider_name="openai-compatible"),
         model="flatspark",
         _model_alias="flatspark",
+        _registry_alias_removed=None,
+        _rebind_failed_key=None,
     )
     msg = _format(stub, ReadTimeout())
     assert msg is not None
@@ -282,6 +377,8 @@ def _record_fatal_stub(ui: Any, captured: dict[str, str]) -> Any:
         _provider=SimpleNamespace(provider_name="openai-compatible"),
         model="flatspark",
         _model_alias="flatspark",
+        _registry_alias_removed=None,
+        _rebind_failed_key=None,
         _ws_id="ws-test",
         _has_persisted_error=False,
         ui=ui,
@@ -364,3 +461,60 @@ def test_record_fatal_falls_back_for_unknown(monkeypatch):
 
     assert ui.errors == ["ValueError: plain old error"]
     assert captured["persist"] == "ValueError: plain old error"
+
+
+@pytest.mark.parametrize(
+    ("exc", "expect_error_level", "message_substring"),
+    [
+        pytest.param(ReadTimeout("timed out"), True, "ReadTimeout", id="fault-at-error"),
+        pytest.param(KeyboardInterrupt(), False, None, id="ctrl-c-at-info"),
+    ],
+)
+def test_record_fatal_log_level_contract(
+    monkeypatch, caplog, exc, expect_error_level, message_substring
+):
+    """The one journal trace of a fatal turn emits ``session.fatal.recorded``
+    with the sanitized text — at ERROR for genuine faults; a Ctrl-C routes
+    through the same chokepoint but is a user action, not a fault, and must
+    not add an ERROR-level line per CLI interrupt."""
+    import logging
+
+    import turnstone.core.memory as memory_mod
+
+    monkeypatch.setattr(memory_mod, "persist_last_error", lambda ws_id, msg: None)
+    monkeypatch.setattr(memory_mod, "sanitize_error_text", lambda text, **kw: text)
+
+    class _UI:
+        def on_error(self, msg: str) -> None:
+            pass
+
+    stub = _record_fatal_stub(_UI(), {})
+    with caplog.at_level(logging.INFO, logger="turnstone.core.session"):
+        ChatSession._record_fatal_error(stub, exc)  # type: ignore[arg-type]
+
+    recorded = [r for r in caplog.records if "session.fatal.recorded" in r.message]
+    assert recorded
+    if expect_error_level:
+        assert any(r.levelno == logging.ERROR for r in recorded)
+    else:
+        assert all(r.levelno < logging.ERROR for r in recorded)
+        assert any(r.levelno == logging.INFO for r in recorded)
+    if message_substring:
+        assert any(message_substring in r.message for r in recorded)
+
+
+def test_backend_auth_unavailable_names_the_mint_not_the_key():
+    """The prefix here IS the exception text, so no ``raw_tail`` is appended,
+    and the hint points at the mint configuration, not the static key."""
+    from turnstone.core.session import BackendAuthUnavailableError
+
+    exc = BackendAuthUnavailableError(
+        "Delegated backend authentication unavailable for model alias 'gw'"
+    )
+    msg = _format(_stub(), exc)
+    assert msg is not None
+    assert "model alias 'gw'" in msg
+    assert "check its auth mode and gateway audience" in msg
+    assert "NOT the alias's static API key" in msg
+    assert "raw=" not in msg
+    assert msg.count("unavailable for model alias 'gw'") == 1

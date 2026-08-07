@@ -100,7 +100,7 @@ from turnstone.core.session_ui_base import (
     fire_judge_verdict_metric,
 )
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
-from turnstone.core.trajectory import turn_to_dict
+from turnstone.core.trajectory import final_assistant_text
 from turnstone.core.web_helpers import version_html as _version_html
 from turnstone.core.workstream import (
     Workstream,
@@ -814,6 +814,30 @@ def _watch_fire_wake_fn(ws: Workstream) -> Callable[[], object]:
     CLI ``--resume``) so they can't drift on that subtlety.
     """
     return lambda: wake_workstream_if_pending(ws, trigger="watch-fire")
+
+
+def _watch_restore_owner(storage: Any, ws_id: str) -> str:
+    """Resolve the principal an unattended watch restore must execute as.
+
+    ``None`` means the target workstream no longer exists and ``""`` means a
+    legacy/unowned row. Neither may be turned into an anonymous, auto-approved
+    model call. Storage errors deliberately propagate so the restore caller can
+    retry them as transient failures.
+    """
+    from turnstone.core.watch import WatchWorkstreamUnrestorable
+
+    owner = storage.get_workstream_owner(ws_id)
+    if owner is None:
+        log.warning("watch_restore: ws %s no longer exists", ws_id)
+        raise WatchWorkstreamUnrestorable(ws_id)
+    resolved = str(owner).strip()
+    if not resolved:
+        log.error(
+            "watch_restore: refusing unattended restore for unowned ws %s",
+            ws_id,
+        )
+        raise WatchWorkstreamUnrestorable(ws_id)
+    return resolved
 
 
 def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
@@ -2200,25 +2224,6 @@ def _validate_notify_targets(raw: Any) -> tuple[str, str]:
     return json.dumps(normalized), ""
 
 
-def _extract_last_assistant_content(session: Any) -> str:
-    """Return the text content of the last assistant message."""
-    for turn in reversed(session.messages):
-        msg = turn_to_dict(turn)
-        if msg.get("role") == "assistant":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                parts = []
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = block.get("text")
-                        if isinstance(text, str) and text:
-                            parts.append(text)
-                return "\n".join(parts)
-    return ""
-
-
 def _fire_notify_targets(ws: Any, content: str) -> None:
     """Send completion notifications to all configured targets."""
     if not ws.notify_targets:
@@ -2801,7 +2806,10 @@ async def _interactive_create_post_install(
                 # empty-content "(Task completed)" fallback, not "Failed:" —
                 # is deferred to #865.
                 try:
-                    last_content = _extract_last_assistant_content(session)
+                    # THE final-say read: no walk-back, whitespace-only
+                    # says report empty — so the notify fallback fires
+                    # instead of sending raw whitespace.
+                    last_content = final_assistant_text(session.messages)
                     _fire_notify_targets(ws, last_content)
                 except Exception:
                     log.warning("notify_completion.hook_error", ws_id=ws.id, exc_info=True)
@@ -3841,6 +3849,21 @@ async def update_interface_setting(request: Request, key: str = "") -> JSONRespo
     return JSONResponse({"status": "ok", "key": key, "value": typed_value})
 
 
+def _model_auth_key_refusal_response(exc: Exception) -> JSONResponse:
+    """The node's uniform answer to the reload chokepoint's key refusal.
+
+    Shared by every node-lane ``ModelRegistry.reload`` caller so the same
+    keyless deployment state cannot report through two diverging arms: keep
+    serving the old registry, emit the one grep signature, answer a
+    structured 503 (deployment fault — install the key and retry), never 422
+    (the bad-arguments exit). The console-lane sibling is
+    ``_record_coord_key_refusal``; the boot-time twin is
+    ``initialize_mcp_crypto_state``'s SystemExit.
+    """
+    log.error("node.model_auth_key_missing: %s", exc)
+    return JSONResponse({"status": "error", "reason": str(exc)}, status_code=503)
+
+
 def config_reload(request: Request) -> JSONResponse:
     """POST /v1/api/_internal/config-reload — invalidate config cache."""
     cs = getattr(request.app.state, "config_store", None)
@@ -3853,7 +3876,16 @@ def config_reload(request: Request) -> JSONResponse:
     # routing until a model-reload or restart.
     registry = getattr(request.app.state, "registry", None)
     if registry is not None:
-        _apply_routing_overrides(registry, cs)
+        from turnstone.core.model_registry import DynamicAuthKeyError
+
+        try:
+            _apply_routing_overrides(registry, cs, request.app.state)
+        except DynamicAuthKeyError as exc:
+            # Latent today — a live registry with dynamic aliases implies the
+            # key was present at install — but this endpoint reaches
+            # ModelRegistry.reload with real app state, and complete
+            # mediation is only complete if every caller handles the refusal.
+            return _model_auth_key_refusal_response(exc)
     # Broadcast settings_changed event to all connected clients
     if gq is not None:
         with contextlib.suppress(queue.Full):
@@ -4067,12 +4099,19 @@ def _broadcast_agent_tool_schema_refresh(app_state: Any) -> None:
             refresh()
 
 
-def _apply_routing_overrides(registry: Any, cs: Any) -> bool:
+def _apply_routing_overrides(registry: Any, cs: Any, app_state: Any) -> bool:
     """Apply ConfigStore routing overrides to a live *registry* in place.
 
     Used by the startup path and by ``config_reload`` (admin settings
     update fan-out) — both keep the existing model definitions and only
     rewrite routing fields.  Returns True when a reload happened.
+
+    ``app_state`` feeds the swap chokepoint in ``ModelRegistry.reload``: the
+    startup caller runs before the app exists and passes
+    ``KEY_GUARD_DEFERRED_TO_LIFESPAN``, the endpoint caller passes the real
+    state. Same-models swaps make the guard vacuous, but routing every swap
+    through the chokepoint means no site needs that reasoning (complete
+    mediation).
     """
     if not registry.models:
         # Degraded (empty) registry — no aliases to route to yet. Routing
@@ -4095,6 +4134,7 @@ def _apply_routing_overrides(registry: Any, cs: Any) -> bool:
             eff[0],
             registry.fallback,
             registry.agent_model,
+            app_state=app_state,
             task_model=eff[1],
             task_effort=eff[2],
         )
@@ -4104,7 +4144,11 @@ def _apply_routing_overrides(registry: Any, cs: Any) -> bool:
 
 def internal_model_reload(request: Request) -> JSONResponse:
     """POST /v1/api/_internal/model-reload — rebuild registry from DB + config."""
-    from turnstone.core.model_registry import load_model_registry
+    from turnstone.core.model_registry import (
+        DynamicAuthKeyError,
+        ModelAuthConfigError,
+        load_model_registry,
+    )
     from turnstone.core.storage._registry import get_storage
 
     registry = getattr(request.app.state, "registry", None)
@@ -4113,14 +4157,23 @@ def internal_model_reload(request: Request) -> JSONResponse:
         return JSONResponse({"status": "error", "reason": "no registry"}, status_code=503)
 
     storage = get_storage()
-    new_registry = load_model_registry(
-        base_url=cli_args["base_url"],
-        api_key=cli_args["api_key"],
-        model=cli_args["model"],
-        context_window=cli_args["context_window"],
-        provider=cli_args["provider"],
-        storage=storage,
-    )
+    try:
+        new_registry = load_model_registry(
+            base_url=cli_args["base_url"],
+            api_key=cli_args["api_key"],
+            model=cli_args["model"],
+            context_window=cli_args["context_window"],
+            provider=cli_args["provider"],
+            storage=storage,
+        )
+    except ModelAuthConfigError as exc:
+        # A row whose auth fields violate _normalize_auth_mode, reachable via
+        # direct SQL, a migration mishap, or console version skew (console
+        # writes are validated). The loader deliberately propagates it; this
+        # arm keeps the node from answering a bare 500 where the console's
+        # refresh path catches the same row. Same structured 422 contract as
+        # the bad-arguments arm below: the reason names the row and field.
+        return JSONResponse({"status": "error", "reason": str(exc)}, status_code=422)
     cs = getattr(request.app.state, "config_store", None)
     if cs is not None:
         cs.reload()  # Ensure latest settings from DB
@@ -4158,13 +4211,40 @@ def internal_model_reload(request: Request) -> JSONResponse:
             eff_default,
             new_registry.fallback,
             new_registry.agent_model,
+            app_state=request.app.state,
             task_model=eff_task_model,
             task_effort=eff_task_effort,
         )
+    except DynamicAuthKeyError as exc:
+        # Matches the console write validator's classification of the
+        # identical state; see the shared helper for the full policy.
+        return _model_auth_key_refusal_response(exc)
     except ValueError as exc:
         return JSONResponse({"status": "error", "reason": str(exc)}, status_code=422)
     finally:
         new_registry.shutdown()
+
+    # A model may switch from static to dynamic auth while the node has no MCP
+    # servers. Ensure the dedicated mint loop exists after the registry reload;
+    # model auth must not depend on an unrelated MCP catalog being configured.
+    if registry.has_dynamic_auth() and getattr(request.app.state, "mcp_client", None) is None:
+        from turnstone.core.mcp_client import MCPClientManager
+
+        mcp_mgr = MCPClientManager({})
+        mcp_mgr.start()
+        mcp_mgr.set_storage(storage)
+        mcp_mgr.set_app_state(request.app.state)
+        request.app.state.mcp_client = mcp_mgr
+        mcp_ref = getattr(request.app.state, "mcp_ref", None)
+        if mcp_ref is not None:
+            mcp_ref[0] = mcp_mgr
+        workstreams = getattr(request.app.state, "workstreams", None)
+        if workstreams is not None:
+            with contextlib.suppress(Exception):
+                for ws in workstreams.list_all():
+                    session = getattr(ws, "session", None)
+                    if session is not None:
+                        session.set_model_mint_client(mcp_mgr)
 
     # Ensure health trackers exist for any newly-added backends
     health_reg = getattr(request.app.state, "health_registry", None)
@@ -4188,7 +4268,13 @@ def internal_model_reload(request: Request) -> JSONResponse:
 
 
 def internal_model_status(request: Request) -> JSONResponse:
-    """GET /v1/api/_internal/model-status — return this node's model aliases."""
+    """GET /v1/api/_internal/model-status — return this node's model aliases.
+
+    Classified ``approve`` in :func:`turnstone.core.auth.required_scope`, not
+    the read default: the payload carries per-alias backend-auth
+    configuration (mode, audience, scopes) that the console serves only
+    behind admin permissions.
+    """
     registry = getattr(request.app.state, "registry", None)
     if registry is None:
         return JSONResponse({"models": {}})
@@ -4205,8 +4291,49 @@ def internal_model_status(request: Request) -> JSONResponse:
             "temperature": cfg.temperature,
             "max_tokens": cfg.max_tokens,
             "reasoning_effort": cfg.reasoning_effort,
+            "auth_mode": cfg.auth_mode,
+            "obo_audience": cfg.obo_audience,
+            "obo_scopes": cfg.obo_scopes,
         }
     return JSONResponse({"models": models})
+
+
+async def internal_model_auth_cache_invalidate(request: Request) -> JSONResponse:
+    """Evict one user's delegated model-token memo from this node.
+
+    Identity unlink deletes the authoritative cache rows in shared storage, then
+    the console fans this service-only request to every node.  Without the
+    in-process eviction, a warm node could keep using the deleted bearer until
+    its access-token expiry.
+    """
+    auth_result = getattr(getattr(request, "state", None), "auth_result", None)
+    if auth_result is None or not auth_result.has_scope("service"):
+        return JSONResponse({"error": "Service scope required"}, status_code=403)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+    user_id = body.get("user_id") if isinstance(body, dict) else None
+    if (
+        not isinstance(user_id, str)
+        or not user_id
+        or len(user_id) > 512
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in user_id)
+    ):
+        return JSONResponse({"error": "Invalid user_id"}, status_code=400)
+
+    mcp_mgr = getattr(request.app.state, "mcp_client", None)
+    if mcp_mgr is None:
+        return JSONResponse({"status": "noop", "evicted": 0})
+
+    from turnstone.core.mcp_oauth import MODEL_OBO_CACHE_PREFIX
+
+    evicted = mcp_mgr.invalidate_model_mint_memo_sync(
+        user_id=user_id,
+        server_prefix=MODEL_OBO_CACHE_PREFIX,
+    )
+    return JSONResponse({"status": "ok", "evicted": evicted})
 
 
 def _collect_node_models_metadata(app_state: Any) -> tuple[str, str, str] | None:
@@ -4556,6 +4683,15 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     from turnstone.core.oidc import initialize_oidc_state
 
     await initialize_oidc_state(app.state)
+
+    # One boot-time visibility pass over the live registry: every dynamic
+    # alias whose mode names the other grant dialect gets the same
+    # will-not-mint warning ModelRegistry.reload emits on later swaps.
+    from turnstone.core.model_registry import warn_profile_mismatched_aliases
+
+    boot_registry = getattr(app.state, "registry", None)
+    if boot_registry is not None:
+        warn_profile_mismatched_aliases(boot_registry.models, app.state)
 
     # MCP-OAuth token-at-rest encryption — fail-loud on misconfiguration
     # when any mcp_servers row has auth_type='oauth_user'.
@@ -5131,6 +5267,11 @@ def create_app(
                         methods=["POST"],
                     ),
                     Route("/api/_internal/model-status", internal_model_status),
+                    Route(
+                        "/api/_internal/model-auth-cache-invalidate",
+                        internal_model_auth_cache_invalidate,
+                        methods=["POST"],
+                    ),
                 ],
             ),
             Route("/health", health),
@@ -5422,7 +5563,12 @@ def main() -> None:
     # ConfigStore returns the SettingDef default ("" for these keys) when
     # unset — distinct from the registry's None for unconfigured fields.
     config_store.reload()  # symmetry with internal_model_reload's cs.reload()
-    _apply_routing_overrides(registry, config_store)
+    # Pre-lifespan: no app.state exists yet, so there is no token store to
+    # check. initialize_mcp_crypto_state owns the dynamic-auth key
+    # requirement for this boot phase — see the sentinel's definition.
+    from turnstone.core.model_registry import KEY_GUARD_DEFERRED_TO_LIFESPAN
+
+    _apply_routing_overrides(registry, config_store, KEY_GUARD_DEFERRED_TO_LIFESPAN)
 
     # Initialize MCP client (connects to configured MCP servers, if any)
     from turnstone.core.mcp_client import create_mcp_client
@@ -5431,6 +5577,7 @@ def main() -> None:
     mcp_client = create_mcp_client(
         mcp_config_cli or config_store.get("mcp.config_path") or None,
         storage=_get_storage(),
+        required=registry.has_dynamic_auth(),
     )
     # Mutable ref so session_factory always sees the latest MCP client,
     # including ones created by internal_mcp_reload after startup.
@@ -5549,7 +5696,9 @@ def main() -> None:
         # loud; the manager filters those out via its model_validator
         # before the alias reaches this factory.
         model_alias = model_alias or _effective_default_alias()
-        r_client, r_model, r_cfg = registry.resolve(model_alias)
+        # The generation comes back from resolve()'s own lock hold, exactly
+        # paired with the client it vouches for; hand it to the constructor.
+        r_client, r_model, r_cfg, registry_generation = registry.resolve(model_alias)
         # Read MCP client from shared ref — may have been replaced after startup
         # by internal_mcp_reload (Sync to Nodes) when no --mcp-config was passed.
         live_mcp_client = _mcp_ref[0]
@@ -5622,6 +5771,7 @@ def main() -> None:
             mcp_client=live_mcp_client,
             registry=registry,
             model_alias=model_alias,
+            registry_generation=registry_generation,
             health_registry=health_registry,
             node_id=_node_id,
             ws_id=ws_id,
@@ -5731,7 +5881,21 @@ def main() -> None:
             raise WatchWorkstreamUnrestorable(ws_id) from exc
 
         try:
-            ws = manager.create(user_id="", name="watch-restore", **persona_kwargs)
+            owner_id = _watch_restore_owner(_get_storage(), ws_id)
+        except WatchWorkstreamUnrestorable:
+            raise
+        except Exception:
+            # An owner read is authoritative for the execution principal. A
+            # storage blip is retryable; anonymous execution is not.
+            log.warning(
+                "watch_restore: owner lookup failed for ws %s (treating as transient)",
+                ws_id,
+                exc_info=True,
+            )
+            return None
+
+        try:
+            ws = manager.create(user_id=owner_id, name="watch-restore", **persona_kwargs)
         except RuntimeError:
             # TRANSIENT: all restore slots active right now.  Return None so
             # the runner holds the reminder and retries on a later tick.
@@ -5828,7 +5992,19 @@ def main() -> None:
         if not target_id:
             log.error("Workstream not found: %s", args.resume)
             sys.exit(1)
-        ws = manager.create(user_id="", name="resumed", **_resume_persona_kwargs(target_id))
+        try:
+            resume_owner = _watch_restore_owner(_get_storage(), target_id)
+        except WatchWorkstreamUnrestorable:
+            log.error("Cannot resume unowned workstream: %s", target_id)
+            sys.exit(1)
+        except Exception:
+            log.exception("Cannot resolve owner for workstream: %s", target_id)
+            sys.exit(1)
+        ws = manager.create(
+            user_id=resume_owner,
+            name="resumed",
+            **_resume_persona_kwargs(target_id),
+        )
         if not isinstance(ws.ui, WebUI):
             raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
         if args.skip_permissions or config_store.get("tools.skip_permissions"):

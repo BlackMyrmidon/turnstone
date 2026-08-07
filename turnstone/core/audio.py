@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
+from turnstone.core.providers import thinking_off_template_kwargs
 from turnstone.core.server_compat import merge_server_compat
 
 if TYPE_CHECKING:
@@ -260,17 +261,21 @@ def _omni_chat_extra_body(cfg: Any) -> dict[str, Any]:
 
     The STT path calls the raw client, so it bypasses the provider's request
     shaping.  Reuse ``merge_server_compat`` to forward any operator-stored
-    ``server_compat["extra_body"]``, then force **thinking OFF** via the model's
-    own ``thinking_param``: transcription needs no reasoning, and leaving it on
-    multiplies latency ~10x and (on some chat templates) empties the content.
-    The override is applied last so it wins over any operator thinking flag.
+    ``server_compat["extra_body"]``, then force **thinking OFF** via
+    :func:`thinking_off_template_kwargs` — THE shared spelling of "this lane
+    needs no reasoning", also used by the drained utility completions:
+    transcription needs no reasoning, and leaving it on multiplies latency
+    ~10x and (on some chat templates) empties the content.  The override is
+    applied last so it wins over any operator thinking flag.
     """
     server_compat = getattr(cfg, "server_compat", None)
     extra = merge_server_compat(None, server_compat) if isinstance(server_compat, dict) else {}
     caps = getattr(cfg, "capabilities", None) or {}
-    thinking_param = caps.get("thinking_param")
-    if thinking_param and caps.get("thinking_mode") in ("manual", "adaptive"):
-        extra.setdefault("chat_template_kwargs", {})[thinking_param] = False
+    off = thinking_off_template_kwargs(
+        str(caps.get("thinking_mode") or ""), str(caps.get("thinking_param") or "")
+    )
+    if off:
+        extra.setdefault("chat_template_kwargs", {}).update(off)
     return extra
 
 
@@ -337,7 +342,7 @@ def transcribe(
     emits a clean transcript rather than a conversational reply.
     """
     try:
-        client, model, cfg = registry.resolve(alias)
+        client, model, cfg, _ = registry.resolve(alias)
     except Exception as exc:  # unknown/removed alias
         raise AudioUnavailableError(f"STT model alias {alias!r} is not available") from exc
     # Defence in depth: resolve_role_alias already gates this, but a stale
@@ -411,7 +416,7 @@ def transcribe_stream(*, registry: Any, alias: str, data: bytes, prompt: str = "
     transcript as a single chunk.
     """
     try:
-        client, model, cfg = registry.resolve(alias)
+        client, model, cfg, _ = registry.resolve(alias)
     except Exception as exc:  # unknown/removed alias
         raise AudioUnavailableError(f"STT model alias {alias!r} is not available") from exc
     if not _provider_carries_audio(cfg):
@@ -492,7 +497,7 @@ def synthesize(
 ) -> SpeechResult:
     """Synthesize ``text`` to speech using the TTS role alias's audio backend."""
     try:
-        client, model, _cfg = registry.resolve(alias)
+        client, model, _cfg, _ = registry.resolve(alias)
     except Exception as exc:
         raise AudioUnavailableError(f"TTS model alias {alias!r} is not available") from exc
     try:

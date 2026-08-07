@@ -54,6 +54,91 @@ When a per-model override is `NULL` (empty in the UI), the global default is
 used. Switching models via `/model <alias>` re-resolves sampling parameters
 from the new model's overrides or global defaults.
 
+### Model backend authentication
+
+Model definitions support four backend credential modes:
+
+| `auth_mode` | Identity sent to the model gateway |
+|-------------|------------------------------------|
+| `static` | The definition's stored `api_key`. |
+| `entra_obo` | A caller-delegated Entra access token minted from that user's captured OIDC credential. |
+| `entra_app` | A shared app-identity token minted with Turnstone's OIDC client credentials. |
+| `rfc8693_obo` | A caller-delegated access token minted from the captured credential via RFC 8693 token exchange, requesting the definition's `obo_scopes`. |
+
+Dynamic modes require an exact `obo_audience` resource identifier. Before an
+admin can save one, an operator must add that literal audience to
+`model.auth_audience_allowlist` (comma- or newline-separated). Wildcards and
+base-URL host matching are intentionally unsupported, and a row whose
+effective mode is `static` refuses to store a new non-empty `obo_audience` on
+either create or update — an audience cannot be staged for a later flip
+(clearing a stale value, or re-saving it unchanged, stays allowed).
+`obo_scopes` follows the same staging rule with the mode set inverted: only
+`rfc8693_obo` reads it, so every other effective mode refuses to store a new
+non-empty value, while clearing or re-saving one unchanged stays open. The
+value itself is optional and shape-checked only — whether it satisfies the
+IdP is decided at mint time. On a row that is (or becomes) dynamic, every
+change except the tuning fields — context window, temperature, max tokens,
+reasoning effort, and the two reasoning-persistence toggles — also requires
+`admin.mcp`; service tokens do not bypass this capability-escalation gate.
+The one exception is de-escalation: a save whose only gated change is
+switching `enabled` off is a pure disable, needs only `admin.models`, and
+skips validation — a de-listed audience must never block disarming its own
+row. The gate is deny-by-default: a field counts as auth-relevant unless it
+is provably neutral, so re-enabling a disabled dynamic row, re-pointing its
+`base_url`, or swapping its provider or alias all escalate.
+
+Validation runs in two tiers, matching the MCP `oauth_obo` write rules. Row
+validity — the audience is allow-listed — applies to every gated write that
+touches a dynamic configuration, so a revoked audience can be neither silently
+re-pointed at a new `base_url` nor re-armed by an enable flip. Deployment
+posture — the token encryption key installed, single sign-on configured, and
+the grant profile valid and able to carry the mode — is checked when a write
+*chooses* the mode/audience pair and when it re-enables a disabled dynamic
+row (arming is the flip that resumes minting, so it must meet what minting
+needs); other edits to an existing row stay open if the deployment's posture
+changed after it was saved (its mints warn at runtime instead). Refusals name
+their cause and echo the configured value.
+
+One asymmetry to be aware of: the write path counts a transient discovery
+outage (`enabled=false`, retryable) as configured, but the mints themselves
+require discovery to have completed — a config saved during an outage starts
+minting only once any authenticated request heals discovery. Until then calls
+warn and follow the fail-open/fail-closed policy above.
+
+Every dynamic mode pairs with exactly one grant profile: `entra_obo` and
+`entra_app` require `[oidc] obo_grant_profile = "entra"`, and `rfc8693_obo`
+requires `"rfc8693"`. The pairing is enforced at the posture tier, so a row
+saved before the rule existed keeps accepting same-pair edits; its mints
+refuse at runtime with `cause=grant_profile_mismatch` and no IdP traffic.
+Judge, output-guard, perception, utility, and sub-agent lanes inherit the
+session's effective user for the delegated modes. The perception memo is
+partitioned by that principal as well as alias and content hash, so a result
+authorized as one user cannot be served to another. Scheduled and wake-driven
+work retains the workstream owner even when no user is connected. Eval and
+optimizer lanes are registry-less development tools and therefore do not use
+dynamic model authentication.
+
+`entra_app` is an explicit model-definition choice; Turnstone never changes a
+failed or ownerless delegated call into a client-credentials grant. A
+delegated-mode call with no effective user always refuses. A dynamic alias
+without a real static key also always refuses instead of issuing its
+SDK-construction placeholder. When a real static key is explicitly configured,
+mint failures may use it by default; set `model.auth_fail_closed = true` to
+prohibit even that fallback. A refusal is not routed through the model
+fallback chain.
+
+Dynamic token caches are encrypted in `mcp_user_tokens`, shared across nodes,
+and memoized on each host. Unlinking a user's OIDC identity purges their
+delegated-mode rows and memo entries. `entra_app` rows belong to the shared
+`__app__` identity and are not user-deprovisioned; after client-credential
+revocation, an already-minted app bearer remains usable until its recorded
+expiry.
+
+`obo_audience` and `obo_scopes` are literal and capped at 2048 characters
+each. Environment-variable expansion is deliberately not applied, so the
+allow-list decision cannot vary by node or expand beyond the persisted
+boundary.
+
 ### Responses output controls (per-model)
 
 Models whose capability table declares Responses output controls expose two
@@ -124,7 +209,7 @@ initialization:
 
 | Section | Settings |
 |---------|----------|
-| `model` | default_alias, temperature, max_tokens, reasoning_effort, task_alias, task_effort |
+| `model` | default_alias, auth_audience_allowlist, auth_fail_closed, temperature, max_tokens, reasoning_effort, task_alias, task_effort |
 | `session` | instructions, retention_days, compact_max_tokens, auto_compact_pct |
 | `tools` | timeout, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
 | `server` | workstream_idle_timeout, max_workstreams |

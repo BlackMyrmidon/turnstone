@@ -2257,9 +2257,11 @@ class StorageBackend(Protocol):
         an *idle* refresh token can't expire one between a user's real sessions.
         Deliberately UNFILTERED by ``expires_at``: an expired access token backed
         by a live refresh token is still a consented, reconcilable grant. Only
-        ``auth_type='oauth_user'`` servers ever write these rows, so a static /
-        no-auth server is structurally absent; ciphertext columns are never
-        touched — only the identity + timestamp cross the wire.
+        The storage query joins ``mcp_servers`` and keeps only
+        ``auth_type='oauth_user'`` rows. Other auth paths also use the token
+        table as a mint cache, but they are not refresh-grant sweep targets.
+        Ciphertext columns are never touched — only identity + timestamp cross
+        the wire.
         """
         ...
 
@@ -2417,6 +2419,9 @@ class StorageBackend(Protocol):
         reasoning_effort: str | None = None,
         surface_persisted_reasoning: bool = True,
         replay_reasoning_to_model: bool = False,
+        auth_mode: str = "static",
+        obo_audience: str = "",
+        obo_scopes: str = "",
     ) -> None:
         """Create a model definition. No-op if definition_id already exists."""
         ...
@@ -2433,8 +2438,18 @@ class StorageBackend(Protocol):
         """Return model definitions ordered by alias."""
         ...
 
-    def update_model_definition(self, definition_id: str, **fields: Any) -> bool:
-        """Update specified fields on a model definition. Returns True if found."""
+    def update_model_definition(
+        self, definition_id: str, *, expected_capabilities: Any = ..., **fields: Any
+    ) -> bool:
+        """Update specified fields on a model definition.
+
+        Returns True when a row was updated. When ``expected_capabilities``
+        is passed, the update applies only while the row's ``capabilities``
+        column still equals it: a concurrent write turns the call into a
+        False miss the caller re-reads and re-merges onto, never a silent
+        last-writer-wins revert. Omitted, the update is unconditional and
+        False means the row was not found.
+        """
         ...
 
     def delete_model_definition(self, definition_id: str) -> bool:

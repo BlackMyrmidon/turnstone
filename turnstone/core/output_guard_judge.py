@@ -53,11 +53,13 @@ from turnstone.core.judge import (
     _positive_window,
 )
 from turnstone.core.log import get_logger
+from turnstone.core.model_registry import ModelClientConstructionError
 from turnstone.core.model_turn import model_turn, resolve_capabilities, resolve_lane
 from turnstone.core.trajectory import Turn
 
 if TYPE_CHECKING:
     import threading
+    from collections.abc import Callable
 
     from turnstone.core.judge import JudgeConfig
     from turnstone.core.providers._protocol import LLMProvider, ModelCapabilities
@@ -271,6 +273,7 @@ class OutputGuardJudge:
         session_capabilities: ModelCapabilities | None = None,
         session_model_alias: str = "",
         config_store: Any | None = None,
+        backend_auth_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self._config = config
         # Carried into the per-evaluation ModelLane so extra_params, the
@@ -278,6 +281,7 @@ class OutputGuardJudge:
         # registry like every other lane.
         self._model_registry = model_registry
         self._config_store = config_store
+        self._backend_auth_resolver = backend_auth_resolver
         # Caller's resolved session-model caps (config/registry-aware): the wire
         # capabilities + window when this judge inherits the session model, and
         # the alias path's window fallback.  The window comes ONLY from these
@@ -299,13 +303,17 @@ class OutputGuardJudge:
         # defensively coerces any non-positive window (which would zero out the
         # guard) to the session window, then a floor.
         resolved = False
+        construction_error: ModelClientConstructionError | None = None
         if config.output_guard_model and model_registry is not None:
             try:
                 if model_registry.has_alias(config.output_guard_model):
-                    client, model_name, model_cfg = model_registry.resolve(
+                    # One locked snapshot for client + provider — separate
+                    # resolve()/get_provider() calls could pair an old-map
+                    # client with a new-map provider (wrong SDK dialect).
+                    client, model_name, model_cfg, provider, _ = model_registry.resolve_binding(
                         config.output_guard_model
                     )
-                    self._provider = model_registry.get_provider(config.output_guard_model)
+                    self._provider = provider
                     self._client_factory_args = self._extract_client_config(
                         client, self._provider.provider_name
                     )
@@ -328,6 +336,8 @@ class OutputGuardJudge:
                         session_window,
                     )
                     resolved = True
+            except ModelClientConstructionError as exc:
+                construction_error = exc
             except Exception:
                 log.debug(
                     "output_guard_judge.alias_resolution_failed",
@@ -335,7 +345,20 @@ class OutputGuardJudge:
                 )
 
         if not resolved:
-            if config.output_guard_model:
+            if construction_error is not None:
+                # The alias IS registered; its binding could not be built.
+                # Same session-model fallback, but name the construction
+                # cause — the register-the-alias advice below would
+                # misdiagnose a row that is already registered.
+                log.warning(
+                    "judge.output_guard_model=%r is registered but its client "
+                    "could not be constructed (%s) — falling back to session "
+                    "model %r.",
+                    config.output_guard_model,
+                    construction_error,
+                    session_model,
+                )
+            elif config.output_guard_model:
                 log.warning(
                     "judge.output_guard_model=%r is not a registered alias — "
                     "falling back to session model %r.  Register the model in "
@@ -538,6 +561,7 @@ class OutputGuardJudge:
             registry=self._model_registry,
             capabilities=self._capabilities,
             config_store=self._config_store,
+            backend_auth_resolver=self._backend_auth_resolver,
         )
         # Sampling deliberately not pinned (house rule) — the lane inherits
         # the guard model's full assignment scheme, effort included: a
@@ -572,7 +596,7 @@ class OutputGuardJudge:
                 verdict_id, call_id, start, f"provider_error: {type(e).__name__}"
             )
 
-        content = (getattr(result, "content", "") or "").strip()
+        content = (result.content or "").strip()
         if not content:
             return self._error_verdict(verdict_id, call_id, start, "empty_response")
 

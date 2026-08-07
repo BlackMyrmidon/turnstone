@@ -6246,3 +6246,52 @@ class TestTransportRetryability:
 
         provider = create_provider(provider_name)
         assert "IncompleteStreamError" in provider.retryable_error_names
+
+
+def test_sanitize_keeps_empty_content_assistant_turn_with_tool_calls():
+    # A think-only assistant turn drains to empty content beside its tool
+    # calls — the exact shape every prose-less tool-call turn already has.
+    # The chat-lane sanitizer must pass it through unmangled.
+    msgs = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "out"},
+    ]
+    out = sanitize_messages(msgs)
+    assert out[1]["content"] == ""
+    assert out[1]["tool_calls"][0]["id"] == "c1"
+    assert out[2]["tool_call_id"] == "c1"
+
+
+def test_commercial_lanes_declare_server_parses_reasoning():
+    """Finding-of-record for the scan-off capability: every REAL commercial
+    lane segregates reasoning natively (thinking blocks / reasoning items /
+    ``reasoning_content``), so its static caps declare the flag — known
+    models and table-miss defaults alike — while the local compat lanes
+    keep the passthrough default the tag scan exists for."""
+    from turnstone.core.providers import create_provider
+
+    for name, model in [
+        ("anthropic", "claude-opus-5"),
+        ("anthropic", "claude-unknown-future"),
+        ("openai", "gpt-5.4"),
+        ("openai", "some-unknown-model"),
+        ("google", "gemini-3-pro"),
+        ("xai", "grok-4"),
+        ("xai", "grok-unknown"),
+    ]:
+        caps = create_provider(name).get_capabilities(model)
+        assert caps.server_parses_reasoning is True, (name, model)
+    for name, model in [
+        ("anthropic-compatible", "qwen3.6-27b"),
+        ("openai-compatible", "qwen3.6-27b"),
+        ("openai-compatible", "gpt-5.4-my-finetune"),
+    ]:
+        caps = create_provider(name).get_capabilities(model)
+        assert caps.server_parses_reasoning is False, (name, model)

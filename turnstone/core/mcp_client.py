@@ -53,11 +53,15 @@ from turnstone.core.mcp_http_parsers import (
     parse_www_authenticate_scope,
 )
 from turnstone.core.mcp_oauth import (
+    MintDispatchContractError,
     TokenLookupResult,
     emit_oauth_failure_audit,
     get_obo_access_token_classified,
     get_user_access_token_classified,
+    invalidate_model_mint_memo,
     is_user_scoped_auth,
+    mint_app_access_token,
+    mint_obo_access_token,
 )
 
 if TYPE_CHECKING:
@@ -881,6 +885,10 @@ class MCPClientManager:
         # asserts non-None when it actually runs, so static-only callers
         # never hit it.
         self._app_state: Any = None
+        # Long-lived HTTP client created and closed on the mcp-loop. Model-token
+        # mints run on that loop and must not borrow the lifespan-loop OAuth
+        # client or pay a DNS/TLS setup on every turn.
+        self._model_auth_http_client: httpx.AsyncClient | None = None
 
         # In-memory cache of server names whose ``auth_type='oauth_user'``.
         # ``_db_servers_to_config`` strips oauth_user rows on the way into
@@ -1008,6 +1016,147 @@ class MCPClientManager:
         deployments may leave it unset.
         """
         self._app_state = app_state
+        if self._model_auth_http_client is not None:
+            app_state.obo_http_client = self._model_auth_http_client
+
+    def mint_model_obo_token_sync(
+        self,
+        *,
+        user_id: str,
+        alias: str,
+        audience: str,
+        scopes: str = "",
+        grant_leg: str | None = None,
+        timeout: float = 20.0,
+    ) -> str | None:
+        """Resolve a per-user model-provider OBO access token synchronously.
+
+        Bridges the sync agent/model loop to :func:`mint_obo_access_token` on
+        the mcp-loop (same thread that owns the token store's asyncio locks),
+        mirroring ``call_tool_sync``.  ``alias`` is the owning model
+        definition — the mint's cache and cause records key on it — while
+        ``scopes`` and ``grant_leg`` pass through untouched: the
+        mode-specific exchange-scope request and the leg the caller's auth
+        mode pins.  Returns ``None`` on any failure — no credential, mint
+        rejected, OAuth unwired, timeout — so the model call falls back to
+        the backend's static credential.
+        """
+        if not user_id or not alias or not audience:
+            return None
+        loop = self._loop
+        if loop is None or self._app_state is None:
+            return None
+        future = asyncio.run_coroutine_threadsafe(
+            mint_obo_access_token(
+                app_state=self._app_state,
+                user_id=user_id,
+                alias=alias,
+                audience=audience,
+                scopes=scopes,
+                grant_leg=grant_leg,
+            ),
+            loop,
+        )
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            log.warning(
+                "model obo token mint timed out user=%s alias=%s audience=%s",
+                user_id,
+                alias,
+                audience,
+            )
+            return None
+        except MintDispatchContractError:
+            # The mint's dedicated caller-contract type (scopes without the
+            # exchange leg pinned, over-length scopes) — a programming error
+            # at the dispatch site that must not be demoted to debug. Any
+            # OTHER ValueError is an ordinary mint failure and falls through
+            # to the blanket arm below.
+            log.error(
+                "model obo token mint contract violation user=%s alias=%s audience=%s",
+                user_id,
+                alias,
+                audience,
+                exc_info=True,
+            )
+            return None
+        except Exception:
+            log.debug(
+                "model obo token mint failed user=%s alias=%s audience=%s",
+                user_id,
+                alias,
+                audience,
+                exc_info=True,
+            )
+            return None
+
+    def mint_app_token_sync(
+        self, *, alias: str, audience: str, timeout: float = 20.0
+    ) -> str | None:
+        """Resolve an app-identity (client-credentials) model token synchronously.
+
+        The ``auth_mode='entra_app'`` sibling of ``mint_model_obo_token_sync``:
+        bridges to :func:`mint_app_access_token` on the mcp-loop. No user needed
+        — Turnstone's own SSO app registration is the identity; ``alias`` is
+        the owning model definition the cache and cause records key on.
+        Returns ``None`` on any failure so the model call falls back to the
+        static credential.
+        """
+        if not alias or not audience:
+            return None
+        loop = self._loop
+        if loop is None or self._app_state is None:
+            return None
+        future = asyncio.run_coroutine_threadsafe(
+            mint_app_access_token(app_state=self._app_state, alias=alias, audience=audience),
+            loop,
+        )
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            log.warning("model app token mint timed out alias=%s audience=%s", alias, audience)
+            return None
+        except Exception:
+            log.debug(
+                "model app token mint failed alias=%s audience=%s",
+                alias,
+                audience,
+                exc_info=True,
+            )
+            return None
+
+    def invalidate_model_mint_memo_sync(
+        self,
+        *,
+        user_id: str,
+        server_prefix: str,
+        timeout: float = 5.0,
+    ) -> int:
+        """Invalidate model-token memo entries on their owning MCP loop."""
+        loop = self._loop
+        if loop is None or self._app_state is None:
+            return 0
+
+        async def _invalidate() -> int:
+            return invalidate_model_mint_memo(
+                self._app_state,
+                user_id=user_id,
+                server_prefix=server_prefix,
+            )
+
+        future = asyncio.run_coroutine_threadsafe(_invalidate(), loop)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            log.warning("model token memo invalidation timed out user=%s", user_id)
+            return 0
+        except Exception:
+            log.warning("model token memo invalidation failed user=%s", user_id, exc_info=True)
+            return 0
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -1028,6 +1177,9 @@ class MCPClientManager:
 
     async def _connect_all(self) -> None:
         """Connect to every configured server (runs on the background loop)."""
+        self._model_auth_http_client = httpx.AsyncClient(timeout=10.0)
+        if self._app_state is not None:
+            self._app_state.obo_http_client = self._model_auth_http_client
         self._exit_stack = AsyncExitStack()
         await self._exit_stack.__aenter__()
 
@@ -5421,6 +5573,20 @@ class MCPClientManager:
             except Exception:
                 log.debug("Error closing MCP exit stack", exc_info=True)
 
+        if self._loop and self._model_auth_http_client is not None:
+            mint_client = self._model_auth_http_client
+            future = asyncio.run_coroutine_threadsafe(mint_client.aclose(), self._loop)
+            try:
+                future.result(timeout=10)
+            except Exception:
+                log.debug("Error closing model-auth HTTP client", exc_info=True)
+            if (
+                self._app_state is not None
+                and getattr(self._app_state, "obo_http_client", None) is mint_client
+            ):
+                self._app_state.obo_http_client = None
+            self._model_auth_http_client = None
+
         if self._loop:
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread:
@@ -9213,11 +9379,14 @@ def create_mcp_client(
     config_path: str | None = None,
     *,
     storage: Any = None,
+    required: bool = False,
 ) -> MCPClientManager | None:
     """Create and start an MCP client manager.
 
     Returns *None* if nothing is configured — no static servers from any
-    source AND no pool-backed (``oauth_user``/``oauth_obo``) DB rows.
+    source AND no pool-backed (``oauth_user``/``oauth_obo``) DB rows — unless
+    ``required`` is true. Dynamic model authentication uses an empty-config
+    manager solely for its mint loop and therefore sets ``required``.
     Pool-backed rows alone construct an empty-config manager: their
     connections form lazily per user, so they contribute nothing to the
     static *servers* dict, but the host still needs a running manager
@@ -9243,7 +9412,7 @@ def create_mcp_client(
             log.warning("Failed to load DB-managed MCP servers", exc_info=True)
 
     servers = load_mcp_config(config_path, storage=storage)
-    if not servers and not oauth_user_names and not obo_names:
+    if not required and not servers and not oauth_user_names and not obo_names:
         return None
 
     mgr = MCPClientManager(servers)

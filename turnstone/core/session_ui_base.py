@@ -635,6 +635,10 @@ class SessionUIBase:
         # turns within one user-facing send.
         self._ws_turn_content: list[str] = []
         self._ws_turn_content_size: int = 0
+        # Segment watermark for :meth:`on_stream_discarded` — (list length,
+        # size) of ``_ws_turn_content`` at the current stream segment's
+        # start, snapshotted in :meth:`on_thinking_start`.
+        self._turn_content_watermark: tuple[int, int] = (0, 0)
         # Per-turn inflight accumulators: the in-progress turn's content
         # + reasoning, exposed to a reconnecting SSE client via the
         # ``in_progress_snapshot`` event so a mid-stream page refresh
@@ -2118,7 +2122,7 @@ class SessionUIBase:
         #     sibling or the ``__budget_override__`` pseudo-tool makes
         #     candidates < pending, AND
         #   - call_ids must be unique — some local models emit duplicate
-        #     non-empty tool-call ids (``_ensure_tool_call_ids`` only fills
+        #     non-empty tool-call ids (``model_turn.ensure_tool_call_ids`` only fills
         #     MISSING ones), which collapse in the ``needed`` set and would let
         #     one verdict clear two distinct calls (their args differ).
         # Either mismatch → hold the whole batch for a human.  Checked
@@ -3181,6 +3185,28 @@ class SessionUIBase:
             self._flush_all_chunk_batches_locked()
             self._reset_inflight_buffers_locked()
 
+    def on_stream_discarded(self) -> None:
+        """Drop a dead stream attempt's text from every server buffer.
+
+        The mid-stream retry re-issues the turn; the dead attempt's tokens
+        were finalized client-side (``stream_end``) but its batches also
+        landed in ``_ws_turn_content`` — the multi-segment buffer the IDLE
+        payload drains — which :meth:`on_turn_committed` deliberately does
+        NOT clear (earlier segments of a tool-looping turn must survive
+        commits).  Truncating back to the segment watermark removes exactly
+        the dead attempt's contribution.  The pending-batch reset is
+        DEFENSIVE: in the shipped sequence the preceding ``stream_end``
+        already flushed (and broadcast) any pending tail, so the reset
+        no-ops — it matters only for a caller that discards without
+        finalizing first, whose tail genuinely was never displayed.
+        """
+        with self._ws_lock:
+            self._reset_pending_locked()
+            watermark_len, watermark_size = self._turn_content_watermark
+            del self._ws_turn_content[watermark_len:]
+            self._ws_turn_content_size = watermark_size
+            self._reset_inflight_buffers_locked()
+
     def on_thinking_start(self) -> None:
         """Track that the model is thinking; broadcast activity + enqueue.
 
@@ -3190,6 +3216,16 @@ class SessionUIBase:
         ``thinking_start`` event still flows for the spinner UIs.
         """
         with self._ws_lock:
+            # Segment watermark for on_stream_discarded: thinking_start
+            # precedes every stream segment (send start, mid-stream retry,
+            # compaction wrap), and no content batch lands between it and
+            # the segment's first token — so the buffer position here is
+            # the truncation point should the segment that follows be
+            # discarded.
+            self._turn_content_watermark = (
+                len(self._ws_turn_content),
+                self._ws_turn_content_size,
+            )
             if not self._compaction_activity_live:
                 self._ws_current_activity = "Thinking…"
                 self._ws_activity_state = "thinking"

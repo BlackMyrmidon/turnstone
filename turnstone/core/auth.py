@@ -700,6 +700,7 @@ APPROVE_PATHS: frozenset[str] = frozenset(
     {
         "/api/_internal/config-reload",
         "/api/_internal/mcp-reload",
+        "/api/_internal/model-auth-cache-invalidate",
         "/api/_internal/model-reload",
     }
 )
@@ -1050,6 +1051,15 @@ def required_scope(method: str, path: str) -> str:
         normalized.startswith("/api/_internal/mcp-refresh/")
         or normalized.startswith("/api/_internal/mcp-reconnect/")
     ):
+        return "approve"
+
+    # The node's model-status readout carries per-alias backend-auth
+    # configuration (auth mode, OBO audience, exchange scopes) — data the
+    # console serves only behind admin permissions — so this GET is
+    # classified with the admin endpoints instead of falling to the read
+    # default. Service tokens carry ``approve``, so the console collector's
+    # fan-out and scheduler lanes pass unchanged.
+    if normalized == "/api/_internal/model-status":
         return "approve"
 
     # Write endpoints

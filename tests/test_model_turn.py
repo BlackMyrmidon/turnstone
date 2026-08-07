@@ -8,6 +8,7 @@ single-shot lanes (phase 2) can build on it without re-deriving semantics.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -74,6 +75,48 @@ def _fake_registry(
 
 def _lane(provider: _FakeProvider, **kw: Any) -> ModelLane:
     return ModelLane(provider=provider, client=object(), model="m", **kw)
+
+
+def test_backend_auth_token_binds_sdk_credential_once() -> None:
+    """Dynamic credentials use SDK with_options, not an override header."""
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    base_client = MagicMock()
+    bound_client = object()
+    base_client.with_options.return_value = bound_client
+    lane = ModelLane(provider=provider, client=base_client, model="m", alias="gateway")
+
+    result = model_turn(
+        lane,
+        [Turn.user("hello")],
+        backend_auth_token="minted-token",
+    )
+
+    assert result.content == "ok"
+    base_client.with_options.assert_called_once_with(api_key="minted-token")
+    assert provider.calls[0]["client"] is bound_client
+    assert "extra_headers" not in provider.calls[0]
+
+
+def test_entra_app_lane_resolver_never_issues_placeholder_client() -> None:
+    """A resolver-carrying lane binds its app token before the provider call."""
+    provider = _FakeProvider([CompletionResult(content="ok")])
+    placeholder_client = MagicMock(name="backend-auth-placeholder-unused")
+    bound_client = object()
+    placeholder_client.with_options.return_value = bound_client
+    resolver = MagicMock(return_value="app-token")
+    lane = ModelLane(
+        provider=provider,
+        client=placeholder_client,
+        model="m",
+        alias="app-gateway",
+        backend_auth_resolver=resolver,
+    )
+
+    model_turn(lane, [Turn.user("hello")])
+
+    resolver.assert_called_once_with("app-gateway")
+    placeholder_client.with_options.assert_called_once_with(api_key="app-token")
+    assert provider.calls[0]["client"] is bound_client
 
 
 class _FlakyProvider:
@@ -189,10 +232,17 @@ def test_model_turn_abort_during_backoff_suppresses_reissue(
     assert len(provider.calls) == 1
 
 
-def test_model_turn_does_not_retry_after_abort() -> None:
-    # A deadline that closed the stream must not have the request
-    # resurrected behind its back: the closed stream dies with an error
-    # that LOOKS retryable, but the aborted cancel_ref gates the re-issue.
+def test_model_turn_does_not_retry_after_abort(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A call the deadline abandoned must not have its request resurrected
+    # behind its back: in the field the abort closes the stream and the
+    # drain dies with an error that LOOKS retryable.  The fixture models
+    # only the shape of that — abort landing after dispatch, drain raising
+    # IncompleteStreamError — because the aborted ref is what gates the
+    # re-issue regardless of which of the two produced the error.  This is
+    # the RE-ISSUE gate; of the tests below, two cover the pre-dispatch reads
+    # and the third pins the raised message.
     from turnstone.core.deadline import StreamAbortRef
 
     provider = _FlakyProvider(
@@ -200,12 +250,107 @@ def test_model_turn_does_not_retry_after_abort() -> None:
     )
     lane = ModelLane(provider=provider, client=object(), model="m")
     ref = StreamAbortRef()
-    ref.abort()
+    dispatch = provider.create_streaming
 
-    with pytest.raises(IncompleteStreamError):
+    def _abort_after_dispatch(**kwargs: Any) -> Any:
+        stream = dispatch(**kwargs)
+        ref.abort()  # the deadline daemon fires; the request is already out
+        return stream
+
+    monkeypatch.setattr(provider, "create_streaming", _abort_after_dispatch)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="turnstone.core.model_turn"),
+        pytest.raises(IncompleteStreamError),
+    ):
         model_turn(lane, [Turn.user("x")], cancel_ref=ref)
 
     assert len(provider.calls) == 1
+    # Isolates THIS gate from the post-backoff one its sibling covers.  The
+    # abort is read where the failure surfaces, so the loop never announces a
+    # re-issue it will not make; delete that gate and the backoff arm still
+    # ends at one dispatch, but it logs on the way — which is what makes this
+    # assertion, and not the call count, the discriminating one.
+    assert "model_turn.drain_retry" not in caplog.text
+
+
+def test_abort_landing_during_the_backend_auth_mint_still_never_dispatches() -> None:
+    # The window an entry-only check cannot see: on a dynamic-auth alias
+    # the resolve can block for seconds on a cache miss, so an abort can
+    # land after the entry read and before the request.  The read
+    # immediately before create_streaming is what covers it.
+    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
+
+    provider = _FakeProvider([CompletionResult(content="never")])
+    ref = StreamAbortRef()
+    client = MagicMock()
+
+    def _abort_during_mint(alias: str) -> str:
+        ref.abort()  # the user hits Stop while the mint is blocked
+        return "minted-token"
+
+    lane = ModelLane(
+        provider=provider,
+        client=client,
+        model="m",
+        alias="obo-gateway",
+        backend_auth_resolver=_abort_during_mint,
+    )
+
+    with pytest.raises(DeadlineCancelledError):
+        model_turn(lane, [Turn.user("x")], cancel_ref=ref)
+
+    assert provider.calls == []
+
+
+def test_pre_dispatch_abort_precedes_the_backend_auth_mint() -> None:
+    # Placement of the FIRST read: an already-abandoned call skips the
+    # resolve entirely.  On a cache miss that resolve is a network mint
+    # under a cluster-wide lock, so this is work worth not doing — but the
+    # invariant itself rides the read before create_streaming, not this one.
+    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
+
+    provider = _FakeProvider([CompletionResult(content="never")])
+    resolver = MagicMock(return_value="minted-token")
+    client = MagicMock()
+    lane = ModelLane(
+        provider=provider,
+        client=client,
+        model="m",
+        alias="obo-gateway",
+        backend_auth_resolver=resolver,
+    )
+    ref = StreamAbortRef()
+    ref.abort()
+
+    with pytest.raises(DeadlineCancelledError):
+        model_turn(lane, [Turn.user("x")], cancel_ref=ref)
+
+    resolver.assert_not_called()
+    client.with_options.assert_not_called()
+    assert provider.calls == []
+
+
+def test_pre_dispatch_abort_does_not_read_as_a_context_overflow() -> None:
+    # A latent coupling, pinned deliberately rather than a live path: today
+    # compaction's ``except`` arm re-checks the session first and raises
+    # GenerationCancelled, and ``_stop_retrying`` short-circuits on the class
+    # gate, so this message never reaches ``_is_ctx_overflow``.  It would the
+    # moment either shortcut moves — and ``_is_ctx_overflow`` classifies an
+    # unrecognized class by TEXT, so an overflow reading would send the
+    # compaction lane subdividing.  The message is a wire contract; pin it.
+    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
+    from turnstone.core.session import _is_ctx_overflow
+
+    provider = _FakeProvider([CompletionResult(content="never")])
+    lane = ModelLane(provider=provider, client=object(), model="m")
+    ref = StreamAbortRef()
+    ref.abort()
+
+    with pytest.raises(DeadlineCancelledError) as excinfo:
+        model_turn(lane, [Turn.user("x")], cancel_ref=ref)
+
+    assert not _is_ctx_overflow(excinfo.value)
 
 
 def _real_semantics_store(**stored: Any) -> SimpleNamespace:
@@ -685,3 +830,64 @@ def test_resolve_capabilities_survives_get_config_raise() -> None:
     registry.get_config.side_effect = KeyError("gone")
     caps = resolve_capabilities(provider, "m", "gone", registry)
     assert caps == ModelCapabilities()
+
+
+def test_inline_tags_segregate_to_native_reasoning_text_and_clean_content() -> None:
+    # A passthrough server's tagged content, drained through the real seam:
+    # the turn's text is IR-clean and the extracted reasoning lands in the
+    # native lane as the path-3 synth block (so it survives reload and the
+    # operator-gated replay), never in any consumer-visible content.
+    provider = _FakeProvider([CompletionResult(content="<think>plan</think>answer")])
+    result = model_turn(_lane(provider), [Turn.user("q")])
+    assert result.content == "answer"
+    assert result.turn.text == "answer"
+    assert result.turn.native is not None
+    synth = [b for b in result.turn.native.blocks if b.get("type") == "reasoning_text"]
+    assert len(synth) == 1
+    assert synth[0]["text"] == "plan"
+
+
+def test_synth_bail_is_silent_and_leaks_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Bailing on an existing native reasoning block is the ROUTINE no-op on
+    # Anthropic/Responses lanes (reasoning_delta mirrors the block): no log
+    # event here, and reasoning text never reaches a log payload.  The
+    # genuinely anomalous shape (inline-EXTRACTED text beside a native
+    # block) is logged at the drain, where it is distinguishable.
+    import logging
+
+    from turnstone.core.model_turn import synth_reasoning_block
+
+    secret_reasoning = "the plan nobody logs"
+    with caplog.at_level(logging.DEBUG):
+        blocks = synth_reasoning_block(
+            [{"type": "thinking", "thinking": "native"}], [secret_reasoning]
+        )
+    assert blocks == [{"type": "thinking", "thinking": "native"}]
+    assert secret_reasoning not in caplog.text
+
+
+def test_capability_bool_overrides_coerced() -> None:
+    """The capabilities dict is hand-edited JSON: a string "false" is
+    truthy, and left raw it would flip every downstream truthiness read
+    (a ``server_parses_reasoning: "false"`` typo silently turning the
+    inline tag scan off is #940 reopened by punctuation).  Recognized
+    spellings coerce, ints pass through ``bool()``, and an unrecognized
+    value drops the key so the field keeps its default."""
+    from turnstone.core.model_turn import apply_capability_overrides
+
+    base = ModelCapabilities()
+    off = apply_capability_overrides(base, {"server_parses_reasoning": "false"})
+    assert off.server_parses_reasoning is False
+    on = apply_capability_overrides(base, {"server_parses_reasoning": "true"})
+    assert on.server_parses_reasoning is True
+    coerced = apply_capability_overrides(base, {"supports_vision": 1, "supports_tools": 0})
+    assert coerced.supports_vision is True
+    assert coerced.supports_tools is False
+    # Unrecognized string: key dropped, default kept; non-bool fields untouched.
+    kept = apply_capability_overrides(
+        base, {"server_parses_reasoning": "maybe", "thinking_mode": "manual"}
+    )
+    assert kept.server_parses_reasoning is False
+    assert kept.thinking_mode == "manual"
