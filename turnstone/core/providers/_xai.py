@@ -28,8 +28,7 @@ Two xAI-specific extensions over the inherited Responses behaviour:
 2. **Prompt-cache hinting.**  The ``x-grok-conv-id`` request header
    maximises cache-hit rate on multi-turn conversations.  This module
    does not populate it; callers thread it via ``extra_headers`` on
-   :meth:`create_streaming` / :meth:`create_completion` once they
-   know the workstream id.
+   :meth:`create_streaming` once they know the workstream id.
 
 A static :data:`GROK_CAPABILITIES` table covers the five chat models
 listed at docs.x.ai/developers/models (May 2026).  Aliases such as
@@ -41,6 +40,7 @@ reasoning-replay behaviour.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from turnstone.core.providers._openai_common import resolve_server_side_tools
@@ -129,7 +129,18 @@ _GROK_DEFAULT = ModelCapabilities(
     max_output_tokens=64_000,
     supports_web_search=True,
     server_side_tools=("web_search",),
+    # The commercial endpoint segregates reasoning natively
+    # (``reasoning_content``) — content never carries inline think tags,
+    # so the inline tag scan is off; the table transform below applies
+    # the same rule to every known entry.
+    server_parses_reasoning=True,
 )
+
+# ONE rule for the whole table — a per-entry flag would be forgotten on
+# the next model row (see the default's comment).
+GROK_CAPABILITIES = {
+    name: replace(caps, server_parses_reasoning=True) for name, caps in GROK_CAPABILITIES.items()
+}
 
 
 def lookup_grok_capabilities(model: str) -> ModelCapabilities:
@@ -164,8 +175,8 @@ class XAIProvider(OpenAIResponsesProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         max_tokens: int,
-        temperature: float,
-        reasoning_effort: str,
+        temperature: float | None,
+        reasoning_effort: str | None,
         deferred_names: frozenset[str] | None,
         capabilities: ModelCapabilities | None = None,
         replay_reasoning_to_model: bool = True,

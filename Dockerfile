@@ -8,7 +8,7 @@ FROM python:3.14-slim
 LABEL org.opencontainers.image.title="turnstone" \
       org.opencontainers.image.description="Multi-node AI orchestration platform"
 
-COPY --from=ghcr.io/astral-sh/uv:0.11.27 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.12.1 /uv /usr/local/bin/uv
 
 # Remove the slim image's man page exclusion so man-db has actual content
 RUN rm -f /etc/dpkg/dpkg.cfg.d/docker
@@ -60,8 +60,12 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 WORKDIR /data
 RUN chown turnstone:turnstone /data
 
-# Workspace mount point — bind-mount a host directory here
+# Workspace mount point — bind-mount a host directory here.  The env var
+# surfaces the path in the model's shell/file tool descriptions
+# (config.get_workspace_dir); without it the mount is invisible to the
+# model, whose cwd is /data below.
 RUN mkdir -p /workspace && chown turnstone:turnstone /workspace
+ENV TURNSTONE_WORKSPACE=/workspace
 
 USER turnstone
 

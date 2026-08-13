@@ -9,18 +9,19 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.attachments import safe_attachment_label
 from turnstone.core.providers._protocol import (
     EFFORT_TEMPLATE_FALLBACK_PARAM,
-    CompletionResult,
     ModelCapabilities,
     StreamChunk,
     ToolCallDelta,
     UsageInfo,
     _join_reasoning_with_cap,
     _lookup_capabilities,
+    finish_shim_due,
     merge_reasoning_template_kwargs,
     snap_reasoning_effort,
 )
@@ -158,6 +159,36 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_reasoning_replay=True,
         supports_mid_conversation_system=True,
     ),
+    # Opus 5: same wire surface as opus-4-8.  Two of this model's documented
+    # breaking changes are unreachable from this lane, and stay that way only
+    # while thinking_mode is "adaptive":
+    #   * thinking is ON by default when the param is omitted (opus-4-8 omitted
+    #     meant OFF) — we never omit it, the adaptive branch in
+    #     _build_thinking_and_kwargs always writes an explicit {"type":
+    #     "adaptive"}, so the changed default cannot reach us.
+    #   * thinking={"type": "disabled"} is a 400 at effort xhigh/max — that
+    #     branch does not exist here (same reasoning as the fable-5 row above).
+    # Adding a disabled-thinking branch to this lane re-opens both; gate it on
+    # effort <= high if that ever happens.
+    # This model's safety classifiers can also decline a request with
+    # stop_reason="refusal" on an HTTP 200 — normalized in
+    # _normalize_finish_reason, see the note there.
+    "claude-opus-5": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
+    ),
     "claude-opus-4-8": ModelCapabilities(
         context_window=1000000,
         max_output_tokens=128000,
@@ -273,9 +304,22 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
     ),
 }
 
+# The commercial endpoint segregates reasoning natively (``thinking`` /
+# ``redacted_thinking`` blocks) — content never carries inline think
+# tags, so the inline tag scan is off for every entry, known or
+# defaulted, as ONE rule applied to the whole table (a per-entry flag
+# would be forgotten on the next model row).  ``_ANTHROPIC_COMPAT_DEFAULT``
+# is deliberately NOT covered: local /v1/messages checkpoints are exactly
+# the passthrough dialect the scan exists for.
+_ANTHROPIC_DEFAULT = replace(_ANTHROPIC_DEFAULT, server_parses_reasoning=True)
+_ANTHROPIC_CAPABILITIES = {
+    name: replace(caps, server_parses_reasoning=True)
+    for name, caps in _ANTHROPIC_CAPABILITIES.items()
+}
+
 
 def _map_reasoning_to_effort(
-    reasoning_effort: str,
+    reasoning_effort: str | None,
     valid_levels: tuple[str, ...],
 ) -> str | None:
     """Map turnstone reasoning_effort to Anthropic effort parameter.
@@ -404,10 +448,10 @@ class AnthropicProvider:
     def _build_thinking_and_kwargs(
         self,
         caps: ModelCapabilities,
-        reasoning_effort: str,
+        reasoning_effort: str | None,
         extra_params: dict[str, Any] | None,
         max_tokens: int,
-        temperature: float,
+        temperature: float | None,
         converted_msgs: list[dict[str, Any]],
         system_prompt: str,
         model: str,
@@ -453,7 +497,10 @@ class AnthropicProvider:
             # 90% input cost reduction on cache hits; 1.25x write on first turn.
             "cache_control": {"type": "ephemeral"},
         }
-        if caps.supports_temperature:
+        # None temperature is never written — the request omits the field so
+        # the server default applies (house rule: no code pins).  The
+        # thinking branches above still force 1.0 where the API requires it.
+        if caps.supports_temperature and temperature is not None:
             kwargs["temperature"] = temperature
         if system_prompt:
             kwargs["system"] = system_prompt
@@ -507,8 +554,8 @@ class AnthropicProvider:
         intentionally preserved.  The kwarg defaults to ``True`` here
         purely for back-compat with any direct caller that hasn't been
         updated to thread the resolver — production call sites
-        (``ChatSession._try_stream`` / ``_utility_completion``) always
-        pass the resolved flag explicitly.
+        (``model_turn`` — every lane, the interactive loop included)
+        always pass the resolved flag explicitly.
 
         ``supports_mid_conversation_system`` (claude-opus-4-8,
         claude-fable-5) makes the
@@ -825,7 +872,7 @@ class AnthropicProvider:
 
     def _reasoning_params(
         self,
-        reasoning_effort: str,
+        reasoning_effort: str | None,
         extra_params: dict[str, Any] | None,
         max_tokens: int = 4096,
     ) -> dict[str, Any]:
@@ -861,8 +908,8 @@ class AnthropicProvider:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
-        temperature: float = 0.5,
-        reasoning_effort: str = "medium",
+        temperature: float | None = None,
+        reasoning_effort: str | None = None,
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         cancel_ref: list[Any] | None = None,
@@ -901,20 +948,35 @@ class AnthropicProvider:
             raise
         if cancel_ref is not None:
             cancel_ref.append(stream)
-        return self._iter_with_cleanup(stream, manager)
+        return self._iter_with_cleanup(
+            stream, manager, finish_reason_optional=caps.finish_reason_optional
+        )
 
-    def _iter_with_cleanup(self, stream: Any, manager: Any) -> Iterator[StreamChunk]:
+    def _iter_with_cleanup(
+        self, stream: Any, manager: Any, *, finish_reason_optional: bool = False
+    ) -> Iterator[StreamChunk]:
         """Iterate the Anthropic stream, ensuring the context manager exits."""
         try:
-            yield from self._iter_anthropic_stream(stream)
+            yield from self._iter_anthropic_stream(
+                stream, finish_reason_optional=finish_reason_optional
+            )
         except BaseException:
             manager.__exit__(*sys.exc_info())
             raise
         else:
             manager.__exit__(None, None, None)
 
-    def _iter_anthropic_stream(self, stream: Any) -> Iterator[StreamChunk]:
-        """Convert Anthropic streaming events to normalized StreamChunks."""
+    def _iter_anthropic_stream(
+        self, stream: Any, *, finish_reason_optional: bool = False
+    ) -> Iterator[StreamChunk]:
+        """Convert Anthropic streaming events to normalized StreamChunks.
+
+        *finish_reason_optional* is the model capability of the same name:
+        a lax anthropic-compatible gateway that ends the stream without
+        EITHER terminal signal (no ``message_delta`` stop_reason, no
+        ``message_stop``) gets the end-of-generator shim below — the
+        retired non-streaming path's absent-stop_reason tolerance.
+        """
         first = True
         # Map content block index → tool call index for our accumulator
         tool_block_to_index: dict[int, int] = {}
@@ -923,6 +985,18 @@ class AnthropicProvider:
         server_tool_blocks: dict[int, dict[str, str]] = {}
         # Capture raw content blocks for multi-turn preservation
         raw_blocks: dict[int, dict[str, Any]] = {}
+        saw_text_block = False
+        emitted_finish = False
+        delivered_output = False
+
+        def _attach_terminal_blocks(chunk: StreamChunk) -> None:
+            # Every terminal path (message_delta stop_reason, message_stop
+            # shim, lax-gateway end-of-stream shim) attaches the full
+            # sorted raw-block list identically — one implementation so
+            # replay fidelity cannot depend on WHICH terminal path a
+            # stream happened to take.
+            if raw_blocks:
+                chunk.provider_blocks = [raw_blocks[i] for i in sorted(raw_blocks)]
 
         for event in stream:
             sc = StreamChunk()
@@ -931,13 +1005,53 @@ class AnthropicProvider:
             if event_type == "content_block_start":
                 block = event.content_block
                 raw_blocks[event.index] = _block_to_dict(block)
+                # Whole-block emission (lax anthropic-compatible gateways):
+                # a block's content may arrive pre-populated inside
+                # content_block_start with no following deltas.  The real
+                # API sends start blocks EMPTY (text ""/input {}) and
+                # streams the content as deltas, so emitting the start
+                # payload never double-counts there — but skipping it made
+                # every drained lane return a clean-looking empty result
+                # where the retired non-streaming path (SDK
+                # get_final_message accumulation) returned the content.
+                # Residual bet, documented: a HYBRID gateway that sends a
+                # populated start AND re-streams the same content as
+                # deltas would double-count.  No known server does this
+                # (it would double on the SDK's own accumulators too), and
+                # the two attested classes — real API (empty starts),
+                # whole-block gateways (no deltas) — are both handled;
+                # disambiguating would mean buffering every start block
+                # until its first delta or block_stop.
+                if block.type == "text":
+                    # Separate consecutive text blocks the way the Messages
+                    # API's non-streaming shape reads when joined — without
+                    # this, a web-search turn's post-results text block fuses
+                    # onto the pre-search sentence.  Emitted as a plain
+                    # content delta so it never lands in the raw block.
+                    if saw_text_block:
+                        sc.content_delta = "\n"
+                    saw_text_block = True
+                    # Type-guarded like _reasoning_text: duck-typed blocks
+                    # must never leak a non-str into the accumulators.
+                    start_text = getattr(block, "text", "")
+                    if isinstance(start_text, str) and start_text:
+                        sc.content_delta = (sc.content_delta or "") + start_text
+                elif block.type == "thinking":
+                    start_thinking = getattr(block, "thinking", "")
+                    if isinstance(start_thinking, str) and start_thinking:
+                        sc.reasoning_delta = start_thinking
                 if block.type == "tool_use":
                     idx = next_tool_index
                     tool_block_to_index[event.index] = idx
                     next_tool_index += 1
-                    sc.tool_call_deltas.append(
-                        ToolCallDelta(index=idx, id=block.id, name=block.name)
-                    )
+                    tcd = ToolCallDelta(index=idx, id=block.id, name=block.name)
+                    start_input = getattr(block, "input", None)
+                    if isinstance(start_input, dict) and start_input:
+                        # Non-empty start input = the whole call arrived in
+                        # one block; the real API sends {} here and streams
+                        # input_json_delta events instead.
+                        tcd.arguments_delta = json.dumps(start_input)
+                    sc.tool_call_deltas.append(tcd)
                 elif block.type == "server_tool_use":
                     # Server-side tool (web search) — track for query accumulation
                     server_tool_blocks[event.index] = {
@@ -981,6 +1095,20 @@ class AnthropicProvider:
                         raw_blocks[event.index]["signature"] = (
                             raw_blocks[event.index].get("signature", "") + delta.signature
                         )
+                elif delta.type == "citations_delta":
+                    # Text-block citations (web-search models) arrive one
+                    # citation object per delta.  They must ride the raw
+                    # block for replay — Anthropic requires citations to be
+                    # passed back unmodified alongside their
+                    # web_search_tool_result blocks on later turns.
+                    if event.index in raw_blocks:
+                        citation = getattr(delta, "citation", None)
+                        if citation is not None:
+                            raw_blocks[event.index].setdefault("citations", []).append(
+                                citation.model_dump()
+                                if hasattr(citation, "model_dump")
+                                else citation
+                            )
                 elif delta.type == "input_json_delta":
                     if event.index in server_tool_blocks:
                         # Accumulate server tool input (search query)
@@ -1037,10 +1165,43 @@ class AnthropicProvider:
                         cache_read_tokens=cr,
                     )
                 if hasattr(event.delta, "stop_reason") and event.delta.stop_reason:
-                    sc.finish_reason = _normalize_finish_reason(event.delta.stop_reason)
+                    raw_stop = event.delta.stop_reason
+                    sc.finish_reason = _normalize_finish_reason(raw_stop)
+                    if raw_stop == "refusal":
+                        # Normalization is lossy and this is the only site that
+                        # still holds the provider's own word: a safety-classifier
+                        # decline is indistinguishable from an ordinary content
+                        # filter once collapsed onto "content_filter".  Record it
+                        # here rather than plumb a raw field through StreamChunk
+                        # for a consumer that does not exist yet.  Gate on the RAW
+                        # value, not on (normalized != raw) — normalization
+                        # rewrites end_turn and tool_use too, so an inequality
+                        # test fires on every ordinary turn in every lane.
+                        # ``stop_details`` rides the same event and is populated
+                        # exactly when the stop reason is a refusal; its
+                        # ``category`` is the one distinction an operator acts
+                        # on.  ``getattr`` keeps this floor-safe on SDKs that
+                        # predate the field.
+                        details = getattr(event.delta, "stop_details", None)
+                        log.info(
+                            "anthropic.refusal: classifier declined the turn (category=%s)",
+                            getattr(details, "category", None),
+                        )
+                    emitted_finish = True
                     # Emit all raw content blocks for multi-turn preservation
-                    if raw_blocks:
-                        sc.provider_blocks = [raw_blocks[i] for i in sorted(raw_blocks)]
+                    _attach_terminal_blocks(sc)
+
+            elif event_type == "message_stop":
+                # Terminal marker: the message completed even if the compat
+                # server's message_delta never carried a stop_reason (the
+                # official API always sends one; the retired non-streaming
+                # path defaulted missing stop_reason to end_turn).  Without
+                # this, the drain's complete-or-error gate fails a stream
+                # whose content actually arrived intact.
+                if not emitted_finish:
+                    sc.finish_reason = "stop"
+                    emitted_finish = True
+                    _attach_terminal_blocks(sc)
 
             elif event_type == "message_start":
                 if hasattr(event.message, "usage") and event.message.usage:
@@ -1058,136 +1219,54 @@ class AnthropicProvider:
                     )
 
             has_content = sc.content_delta or sc.reasoning_delta or sc.tool_call_deltas
-            if has_content and first:
-                sc.is_first = True
-                first = False
+            if has_content:
+                delivered_output = True
+                if first:
+                    sc.is_first = True
+                    first = False
 
             if has_content or sc.finish_reason or sc.usage or sc.info_delta:
                 yield sc
 
-    # -- non-streaming -------------------------------------------------------
-
-    def create_completion(
-        self,
-        *,
-        client: Any,
-        model: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        max_tokens: int = 4096,
-        temperature: float = 0.5,
-        reasoning_effort: str = "medium",
-        extra_params: dict[str, Any] | None = None,
-        deferred_names: frozenset[str] | None = None,
-        capabilities: ModelCapabilities | None = None,
-        replay_reasoning_to_model: bool = True,
-        extra_headers: dict[str, str] | None = None,
-        resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
-    ) -> CompletionResult:
-        messages = materialize_attachments(messages, resolve_attachments)
-        caps = capabilities or self.get_capabilities(model)
-        system_prompt, converted_msgs = self._convert_messages(
-            messages,
-            replay_reasoning_to_model=replay_reasoning_to_model,
-            supports_mid_conversation_system=caps.supports_mid_conversation_system,
-        )
-        kwargs = self._build_thinking_and_kwargs(
-            caps,
-            reasoning_effort,
-            extra_params,
-            max_tokens,
-            temperature,
-            converted_msgs,
-            system_prompt,
-            model,
-            tools,
-            deferred_names,
-        )
-        if extra_headers:
-            kwargs["extra_headers"] = extra_headers
-
-        # Use streaming internally to avoid the Anthropic SDK's 10-minute
-        # timeout on non-streaming requests.  get_final_message() returns the
-        # same Message object as messages.create() would.
-        # Mirror create_streaming's defensive __enter__/__exit__ pattern so
-        # resources are cleaned up even if __enter__ fails.
-        manager = client.messages.stream(**kwargs)
-        try:
-            stream = manager.__enter__()
-        except BaseException:
-            manager.__exit__(*sys.exc_info())
-            raise
-        try:
-            response = stream.get_final_message()
-        except BaseException:
-            manager.__exit__(*sys.exc_info())
-            raise
-        else:
-            manager.__exit__(None, None, None)
-
-        # Extract content and tool_calls from content blocks.
-        # Skip server-side blocks (server_tool_use, web_search_tool_result)
-        # which are handled server-side and don't require client execution.
-        content_parts: list[str] = []
-        tool_calls: list[dict[str, Any]] = []
-        provider_blocks: list[dict[str, Any]] = []
-        for block in response.content:
-            provider_blocks.append(_block_to_dict(block))
-            if block.type == "text":
-                content_parts.append(block.text)
-            elif block.type == "tool_use":
-                tool_calls.append(
-                    {
-                        "id": block.id,
-                        "type": "function",
-                        "function": {
-                            "name": block.name,
-                            "arguments": json.dumps(block.input),
-                        },
-                    }
-                )
-            # server_tool_use, web_search_tool_result — captured in provider_blocks
-
-        finish_reason = _normalize_finish_reason(response.stop_reason or "end_turn")
-
-        usage = None
-        if hasattr(response, "usage") and response.usage:
-            u = response.usage
-            inp = getattr(u, "input_tokens", 0) or 0
-            out = getattr(u, "output_tokens", 0) or 0
-            cc = getattr(u, "cache_creation_input_tokens", 0) or 0
-            cr = getattr(u, "cache_read_input_tokens", 0) or 0
-            total_input = inp + cc + cr
-            usage = UsageInfo(
-                prompt_tokens=total_input,
-                completion_tokens=out,
-                total_tokens=total_input + out,
-                cache_creation_tokens=cc,
-                cache_read_tokens=cr,
-            )
-
-        return CompletionResult(
-            content="\n".join(content_parts),
-            tool_calls=tool_calls if tool_calls else None,
-            finish_reason=finish_reason,
-            usage=usage,
-            provider_blocks=provider_blocks,
-        )
+        # Terminal-signal-less lax-gateway tolerance, armed ONLY by the
+        # operator-declared ``finish_reason_optional`` capability: a
+        # stream that ended cleanly after delivering output but carried
+        # NEITHER terminal signal (no message_delta stop_reason, no
+        # message_stop — an anthropic-compatible proxy shape; the real
+        # API always sends both) is a completed generation.  Everywhere
+        # else the drain's complete-or-error gate raises, because a
+        # missing message_stop on a signal-disciplined server means the
+        # generation died mid-response.
+        if finish_shim_due(
+            finish_reason_optional=finish_reason_optional,
+            finish_seen=emitted_finish,
+            delivered_output=delivered_output,
+        ):
+            sc = StreamChunk(finish_reason="stop")
+            _attach_terminal_blocks(sc)
+            yield sc
 
     # -- retryable errors ----------------------------------------------------
 
+    # Computed once at class creation — the retry predicate consults this
+    # per error, and a per-access literal allocates a fresh frozenset each
+    # time.
+    _RETRYABLE_ERROR_NAMES: frozenset[str] = frozenset(
+        {
+            "RateLimitError",
+            "APITimeoutError",
+            "APIConnectionError",
+            "InternalServerError",
+            "APIError",
+            "OverloadedError",
+            # Transport-level: drained stream ended without a stop reason.
+            "IncompleteStreamError",
+        }
+    )
+
     @property
     def retryable_error_names(self) -> frozenset[str]:
-        return frozenset(
-            {
-                "RateLimitError",
-                "APITimeoutError",
-                "APIConnectionError",
-                "InternalServerError",
-                "APIError",
-                "OverloadedError",
-            }
-        )
+        return self._RETRYABLE_ERROR_NAMES
 
     # -- reasoning extraction ------------------------------------------------
 
@@ -1220,6 +1299,18 @@ def _normalize_finish_reason(reason: str) -> str:
     if reason == "pause_turn":
         # Server-side tool (web search) paused a long turn; treat as stop
         return "stop"
+    if reason == "refusal":
+        # A safety classifier declined the request.  This arrives as a
+        # SUCCESSFUL HTTP 200 with content empty (declined before any
+        # output) or partial (declined mid-stream), so nothing upstream
+        # raises — the drain gate only errors on an ABSENT finish reason.
+        # "content_filter" is the OpenAI-vocabulary equivalent this
+        # function normalizes onto, and both consumers already handle it:
+        # the interactive wrapper's _finalize_stream_result warns the
+        # user, and the sub-agent loop stops early instead of flailing on
+        # an empty turn.  Falling through to the raw "refusal" string
+        # instead would land a truncated answer as a complete result.
+        return "content_filter"
     return reason
 
 

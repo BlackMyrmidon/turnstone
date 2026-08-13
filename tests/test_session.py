@@ -11,6 +11,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._oidc_test_helpers import keyed_app_state
+from tests._session_helpers import (
+    FakeAnthropicBlock,
+    as_stream,
+    make_result,
+    make_session,
+    mock_completion_result,
+    scripted_anthropic_client,
+    scripted_chat_client,
+    seam_provider,
+)
+from turnstone.core.model_turn import ModelTurnResult, provider_extra_params
 from turnstone.core.session import _IMAGE_EXTENSIONS, _IMAGE_SIZE_CAP, ChatSession
 from turnstone.core.trajectory import (
     Turn,
@@ -94,19 +106,14 @@ def _make_session(
     instructions=None,
     **kwargs,
 ):
-    """Helper to construct a ChatSession with minimal setup."""
-    client = mock_openai_client or MagicMock()
-    defaults = dict(
-        client=client,
-        model="test-model",
-        ui=NullUI(),
-        instructions=instructions,
-        temperature=0.5,
-        max_tokens=4096,
-        tool_timeout=30,
+    """Wrap the shared session factory with this suite's conveniences
+    (positional mock client; local recording NullUI default).  The
+    defaults live in tests/_session_helpers.make_session — duplicating
+    them here is exactly the drift its docstring warns about."""
+    kwargs.setdefault("ui", NullUI())
+    return make_session(
+        client=mock_openai_client or MagicMock(), instructions=instructions, **kwargs
     )
-    defaults.update(kwargs)
-    return ChatSession(**defaults)
 
 
 @contextlib.contextmanager
@@ -124,19 +131,20 @@ def _send_with_mocks(session, responses, mock_execute, **extra_patches):
     Extra per-test patches (e.g. wrapping ``_collect_advisories``) ride
     via ``**extra_patches`` — keyword name maps to attribute on the
     session, value is the ``side_effect`` to inject.
+
+    ``responses`` are ``ModelTurnResult``s (build them with
+    ``tests._session_helpers.make_result``) — the streaming seam's return
+    type since #832 folded creation and drain into ``model_turn``.  None
+    of these tests care HOW the turn was produced, only that one
+    happened, so they patch the whole ``_stream_response`` seam rather
+    than script a provider.
     """
     from unittest.mock import patch as _patch
 
-    def mock_stream(_msgs):
-        return iter([])
-
-    def mock_response(_stream, _gen):
+    def mock_response(_gen):
         return responses.pop(0)
 
     with contextlib.ExitStack() as stack:
-        stack.enter_context(
-            _patch.object(session, "_create_stream_with_retry", side_effect=mock_stream)
-        )
         stack.enter_context(_patch.object(session, "_stream_response", side_effect=mock_response))
         stack.enter_context(_patch.object(session, "_execute_tools", side_effect=mock_execute))
         for attr, side_effect in extra_patches.items():
@@ -206,6 +214,46 @@ def _run_exec_search(session, capture_return):
     return output
 
 
+class TestSkillCommand:
+    @pytest.mark.parametrize(
+        ("command", "skill", "expected_name", "expected_target"),
+        [
+            ("/skill beta", {"name": "beta"}, "beta", "beta"),
+            ("/skill clear", None, None, "defaults"),
+        ],
+    )
+    def test_operator_change_is_recorded_in_trajectory(
+        self, command, skill, expected_name, expected_target
+    ):
+        session = ChatSession.__new__(ChatSession)
+        session._skill_name = "alpha"
+        session.messages = [turn_from_dict({"role": "user", "content": "prior work"})]
+        session._msg_tokens = [2]
+        session._chars_per_token = 4.0
+        session._ws_id = "test-workstream"
+        session.ui = MagicMock()
+        session.ui.on_system_turn.return_value = None
+        session._ui_event_id = MagicMock(return_value=None)
+        session.set_skill = MagicMock(
+            side_effect=lambda name: setattr(session, "_skill_name", name)
+        )
+
+        with (
+            patch("turnstone.core.session.get_skill_by_name", return_value=skill),
+            patch("turnstone.core.session.save_message") as save_message,
+        ):
+            session.handle_command(command)
+
+        session.set_skill.assert_called_once_with(expected_name)
+        marker = turn_to_dict(session.messages[-1])
+        assert marker["role"] == "system"
+        assert marker["_source"] == "skill_hint"
+        assert marker["content"] == (
+            f"Operator set the active skill from alpha to {expected_target}."
+        )
+        save_message.assert_called_once()
+
+
 class TestChatSessionConstruction:
     def test_system_messages_created(self, tmp_db):
         session = _make_session()
@@ -267,8 +315,10 @@ class TestChatSessionConstruction:
         assert session.reasoning_effort == "high"
 
     def test_default_reasoning_effort(self, tmp_db):
+        # Unset by default: no rung of the assignment scheme spoke, so the
+        # wire omits the effort param (no hidden "medium" constructor pin).
         session = _make_session()
-        assert session.reasoning_effort == "medium"
+        assert session.reasoning_effort is None
 
 
 # ---------------------------------------------------------------------------
@@ -1002,6 +1052,27 @@ class TestEvaluateIntentProjection:
         assert fa["edits"][0]["near_line"] == 42
         assert fa["replace_all"] is False
 
+    # -- bash: backgrounding is part of the intent (#817) -------------------
+
+    def test_bash_background_projects_run_in_background(self) -> None:
+        """The judge must know a bash command will run detached — a
+        backgrounded server/miner is a different intent than a bounded run.
+        Built via the real preparer so the prepared item can't silently drop
+        the flag before the projection reads it."""
+        session = _make_session()
+        item = session._prepare_bash(
+            "c1", {"command": "python -m http.server 8000", "run_in_background": True}
+        )
+        fa = _project_func_args(item)
+        assert fa["run_in_background"] is True
+        assert fa["command"] == "python -m http.server 8000"
+
+    def test_bash_foreground_projects_run_in_background_false(self) -> None:
+        session = _make_session()
+        item = session._prepare_bash("c1", {"command": "echo hi"})
+        fa = _project_func_args(item)
+        assert fa["run_in_background"] is False
+
     # -- skills: the dead-assignment bug -----------------------------------
 
     def test_skills_create_projection_is_not_empty(self) -> None:
@@ -1421,7 +1492,13 @@ class TestAgentModelOverride:
         # followed by sync-to-nodes / internal_model_reload).
         new_models = dict(reg.models)
         new_models["bigboi"] = ModelConfig("bigboi", "x", "x", "m")
-        reg.reload(new_models, reg.default, reg.fallback, reg.agent_model)
+        reg.reload(
+            new_models,
+            reg.default,
+            reg.fallback,
+            reg.agent_model,
+            app_state=keyed_app_state(),
+        )
 
         session.refresh_agent_tool_schemas()
 
@@ -1495,7 +1572,11 @@ class TestAgentModelOverride:
 
         # Reload the registry down to only ``default`` (admin removed
         # every other model definition).
-        reg.reload({"default": ModelConfig("default", "x", "x", "m")}, "default")
+        reg.reload(
+            {"default": ModelConfig("default", "x", "x", "m")},
+            "default",
+            app_state=keyed_app_state(),
+        )
         session.refresh_agent_tool_schemas()
 
         task_tool = self._agent_tool(session, "task_agent")
@@ -1692,7 +1773,7 @@ class TestTitleRetry:
         # Mock provider to raise
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.side_effect = RuntimeError("API error")
+        session._provider.create_streaming.side_effect = RuntimeError("API error")
 
         session._generate_title()
 
@@ -1709,11 +1790,11 @@ class TestTitleRetry:
                 {"role": "assistant", "content": "Hi there"},
             ]
         )
-        result = MagicMock()
+        result = mock_completion_result()
         result.content = "Test Title"
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.return_value = result
+        session._provider.create_streaming.return_value = as_stream(result)
 
         with patch("turnstone.core.session.update_workstream_title"):
             session._generate_title()
@@ -1725,23 +1806,24 @@ class TestTitleRetry:
         """A reasoning model's answer can arrive wrapped in an unparsed
         ``<think>`` span (lanes that don't split it into reasoning_content)
         plus markdown / quotes. There is no portable switch to disable thinking,
-        so the title pass gives reasoning room (raised max_tokens), reuses
-        ``_strip_reasoning``, and peels wrapping decoration — keeping INTERNAL
-        punctuation (the hyphen survives)."""
+        so the title pass gives reasoning room (raised max_tokens), relies on
+        the drain seam's segregation (``split_inline_reasoning`` — this lane
+        holds no strip of its own), and peels wrapping decoration — keeping
+        INTERNAL punctuation (the hyphen survives)."""
         from turnstone.core.providers._protocol import ModelCapabilities
         from turnstone.core.session import _TITLE_MAX_TOKENS
 
         session = _make_session()
         session._title_generated = True
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
-        result = MagicMock()
+        result = mock_completion_result()
         result.content = (
             "<think>The user greets me; a fitting title would be...</think>\n\n"
             '**"Cluster Routing Deep-Dive"**'
         )
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.return_value = result
+        session._provider.create_streaming.return_value = as_stream(result)
 
         captured: dict[str, str] = {}
         with patch(
@@ -1754,7 +1836,7 @@ class TestTitleRetry:
         # Reasoning gets room to finish rather than a 200-token squeeze that
         # the think pass swallows whole (the empty-content regression); and the
         # title call forces no temperature — it defers to the session value.
-        _, kw = session._provider.create_completion.call_args
+        _, kw = session._provider.create_streaming.call_args
         assert kw["max_tokens"] == _TITLE_MAX_TOKENS
         assert kw["temperature"] == session.temperature
 
@@ -1768,11 +1850,11 @@ class TestTitleRetry:
         session = _make_session()
         session._title_generated = True
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
-        result = MagicMock()
+        result = mock_completion_result()
         result.content = "<think>still reasoning, never closed before the cap"
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.return_value = result
+        session._provider.create_streaming.return_value = as_stream(result)
 
         with patch("turnstone.core.session.update_workstream_title") as upd:
             session._generate_title()
@@ -1782,8 +1864,17 @@ class TestTitleRetry:
     def test_title_strips_reasoning_variants(self, tmp_db):
         """Reasoning reaches ``content`` in several shapes the title pass must
         survive: an opener-absent ``…</think>`` (templates that pre-inject the
-        opening tag), a paired ``<reasoning>`` block, and a trailing
-        explanation after the title (only the first non-empty line is kept)."""
+        opening tag), a paired ``<reasoning>`` block, trailing prose after the
+        title (an explanation sentence, a short sign-off, a parenthetical —
+        each rejected by the word cap or the ends-alphanumeric check, so the
+        end-first scan still lands on the title), an over-cap padded answer
+        (kept via the last-line fallback rather than replaced by a
+        reasoning fragment from higher up), and a CJK title whose trailing
+        explanation whitespace-counts as one word but ends in terminal
+        punctuation.
+
+        Two cases pin the BOTH-VOCABULARY peel shape in either order — the
+        cut lands after whichever close tag occurs LAST."""
         from turnstone.core.providers._protocol import ModelCapabilities
 
         cases = [
@@ -1793,16 +1884,31 @@ class TestTitleRetry:
                 "Cluster Health Digest",
             ),
             ("Auth Layer Refactor\n\nThis title captures the request well.", "Auth Layer Refactor"),
+            ("Fix Login Bug\n\nHope this helps!", "Fix Login Bug"),
+            ("Alembic Migration Fix\n\n(3 words)", "Alembic Migration Fix"),
+            (
+                "Hmm, let me reconsider.\n\nAlembic Async Migration Failure Debugging Session",
+                "Alembic Async Migration Failure Debugging Session",
+            ),
+            ("数据库迁移问题\n\n这个标题很好地概括了用户的请求。", "数据库迁移问题"),
+            (
+                "weighing</reasoning>still weighing</think>\n\nRendezvous Routing",
+                "Rendezvous Routing",
+            ),
+            (
+                "weighing</think>still weighing</reasoning>\n\nCluster Health Digest",
+                "Cluster Health Digest",
+            ),
         ]
         for content, expected in cases:
             session = _make_session()
             session._title_generated = True
             session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
-            result = MagicMock()
+            result = mock_completion_result()
             result.content = content
             session._provider = MagicMock()
             session._provider.get_capabilities.return_value = ModelCapabilities()
-            session._provider.create_completion.return_value = result
+            session._provider.create_streaming.return_value = as_stream(result)
 
             captured: dict[str, str] = {}
             with patch(
@@ -1812,20 +1918,88 @@ class TestTitleRetry:
                 session._generate_title()
             assert captured.get("title") == expected, (content, captured)
 
+    def test_title_from_unmarked_reasoning_takes_the_answer(self, tmp_db):
+        """A server can leave reasoning inline and entirely UNMARKED — no open
+        tag, no close tag, no ``reasoning_content`` — so there is nothing for
+        the seam to segregate and nothing for the lane to peel.  Measured on
+        the dev vLLM (qwen3.6-27b, 20 sampled responses): the chain-of-thought
+        opens with a ``Thinking Process:`` heading, which BECAME the title.
+
+        The answer is last and honors the prompt's word cap; the reasoning
+        lines around it do not."""
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        session._title_generated = True
+        session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
+        result = mock_completion_result()
+        # Condensed from a captured qwen3.6-27b streamed response.
+        result.content = (
+            "Thinking Process:\n"
+            "1.  **Analyze the Request:** The user wants a title of at most 3 words.\n"
+            "2.  **Brainstorm:** Alembic Migration Failure, Migration Debugging.\n"
+            "6.  **Final Output Generation:** Alembic Migration Fix\n"
+            "\n\n"
+            "Alembic Migration Fix"
+        )
+        session._provider = MagicMock()
+        session._provider.get_capabilities.return_value = ModelCapabilities()
+        session._provider.create_streaming.return_value = as_stream(result)
+
+        captured: dict[str, str] = {}
+        with patch(
+            "turnstone.core.session.update_workstream_title",
+            side_effect=lambda ws_id, title: captured.update(title=title),
+        ):
+            session._generate_title()
+
+        assert captured["title"] == "Alembic Migration Fix"
+
+    def test_title_peel_off_when_backend_segregates(self, tmp_db):
+        """On a backend that segregates reasoning (``server_parses_reasoning``)
+        a close tag in content IS quoted prose — the title lane's cosmetic
+        peel is off there, like the seam's scan, so a title that mentions
+        the tag survives intact."""
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        session._title_generated = True
+        session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
+        result = mock_completion_result()
+        result.content = "Fixing </think> Leak"
+        session._provider = MagicMock()
+        session._provider.provider_name = "openai-compatible"
+        session._provider.get_capabilities.return_value = ModelCapabilities(
+            server_parses_reasoning=True
+        )
+        session._provider.create_streaming.return_value = as_stream(result)
+
+        captured: dict[str, str] = {}
+        with patch(
+            "turnstone.core.session.update_workstream_title",
+            side_effect=lambda ws_id, title: captured.update(title=title),
+        ):
+            session._generate_title()
+
+        assert captured["title"] == "Fixing </think> Leak"
+
     def test_title_truncates_to_max_chars(self, tmp_db):
         """The ``[:_TITLE_MAX_CHARS]`` slice is the only length guard now that
-        the persist-time ``title[:80]`` is gone — a long title is bounded."""
+        the persist-time ``title[:80]`` is gone — a long title is bounded.
+
+        No line here honors the word cap, so the scan falls back to the last
+        non-empty line rather than yielding nothing."""
         from turnstone.core.providers._protocol import ModelCapabilities
         from turnstone.core.session import _TITLE_MAX_CHARS
 
         session = _make_session()
         session._title_generated = True
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
-        result = MagicMock()
+        result = mock_completion_result()
         result.content = "Story " * 40  # 240 chars on one line
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.return_value = result
+        session._provider.create_streaming.return_value = as_stream(result)
 
         captured: dict[str, str] = {}
         with patch(
@@ -1848,18 +2022,18 @@ class TestTitleRetry:
             ]
         )
         original_ws_id = session._ws_id
-        result = MagicMock()
+        result = mock_completion_result()
         result.content = "Test Title"
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.return_value = result
+        session._provider.create_streaming.return_value = as_stream(result)
 
         # Simulate resume() changing ws_id while title generation is in flight
         def _change_ws_id(*args, **kwargs):
             session._ws_id = "different-ws-id"
-            return result
+            return as_stream(result)
 
-        session._provider.create_completion.side_effect = _change_ws_id
+        session._provider.create_streaming.side_effect = _change_ws_id
 
         with patch("turnstone.core.session.update_workstream_title") as mock_update:
             session._generate_title()
@@ -1881,18 +2055,17 @@ class TestTitleRetry:
         # The assistant's opening turn is ALL tool calls — under the old
         # trigger no title would generate until a later text-only turn.
         responses = [
-            {
-                "role": "assistant",
-                "content": "working",
-                "tool_calls": [
+            make_result(
+                "working",
+                tool_calls=[
                     {
                         "id": "c1",
                         "type": "function",
                         "function": {"name": "echo", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "done"},
+            ),
+            make_result("done"),
         ]
         capture_cls, started = _capturing_thread_cls()
 
@@ -1922,7 +2095,7 @@ class TestTitleRetry:
         for user_input, kwargs in (("   ", {}), ("a real message", {"from_wake": True})):
             session = _make_session()
             with (
-                _send_with_mocks(session, [{"role": "assistant", "content": "ok"}], mock_execute),
+                _send_with_mocks(session, [make_result("ok")], mock_execute),
                 patch("turnstone.core.session.threading.Thread", capture_cls),
             ):
                 session.send(user_input, **kwargs)
@@ -2030,34 +2203,20 @@ class TestAgentOutputGuard:
             session, "_evaluate_output", wraps=lambda cid, o, fn, **_kw: (o, None)
         ) as mock_eval:
             # Simulate _run_agent getting a tool call response then a text response
-            call_count = [0]
-
-            def fake_create(**kwargs):
-                call_count[0] += 1
-                resp = MagicMock()
-                if call_count[0] == 1:
-                    # First call: model returns a tool call
-                    choice = MagicMock()
-                    choice.finish_reason = "tool_calls"
-                    tc = MagicMock()
-                    tc.id = "call_1"
-                    tc.function.name = "read_file"
-                    tc.function.arguments = '{"path": "/tmp/test"}'
-                    choice.message.tool_calls = [tc]
-                    choice.message.content = None
-                    resp.choices = [choice]
-                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                else:
-                    # Second call: model returns text (done)
-                    choice = MagicMock()
-                    choice.finish_reason = "stop"
-                    choice.message.tool_calls = None
-                    choice.message.content = "Done"
-                    resp.choices = [choice]
-                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                return resp
-
-            session.client.chat.completions.create = fake_create
+            # Script: a tool-call turn, then text (done).
+            session.client.chat.completions.create = scripted_chat_client(
+                {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "name": "read_file",
+                            "arguments": '{"path": "/tmp/test"}',
+                        }
+                    ],
+                    "finish_reason": "tool_calls",
+                },
+                {"content": "Done"},
+            )
 
             # Mock tool preparation to return a simple output
             def fake_prepare(tc_dict, **kwargs):
@@ -2096,32 +2255,19 @@ class TestAgentOutputGuard:
         session._provider = OpenAIChatCompletionsProvider()
 
         with patch.object(session, "_evaluate_output") as mock_eval:
-            call_count = [0]
-
-            def fake_create(**kwargs):
-                call_count[0] += 1
-                resp = MagicMock()
-                if call_count[0] == 1:
-                    choice = MagicMock()
-                    choice.finish_reason = "tool_calls"
-                    tc = MagicMock()
-                    tc.id = "call_1"
-                    tc.function.name = "read_file"
-                    tc.function.arguments = '{"path": "/tmp/test"}'
-                    choice.message.tool_calls = [tc]
-                    choice.message.content = None
-                    resp.choices = [choice]
-                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                else:
-                    choice = MagicMock()
-                    choice.finish_reason = "stop"
-                    choice.message.tool_calls = None
-                    choice.message.content = "Done"
-                    resp.choices = [choice]
-                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                return resp
-
-            session.client.chat.completions.create = fake_create
+            session.client.chat.completions.create = scripted_chat_client(
+                {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "name": "read_file",
+                            "arguments": '{"path": "/tmp/test"}',
+                        }
+                    ],
+                    "finish_reason": "tool_calls",
+                },
+                {"content": "Done"},
+            )
 
             def fake_prepare(tc_dict, **kwargs):
                 return {
@@ -2159,18 +2305,7 @@ class TestAgentOutputGuard:
         with patch.object(
             session, "_evaluate_output", wraps=lambda cid, o, fn, **_kw: (o, None)
         ) as mock_eval:
-
-            def fake_create(**_kwargs):
-                resp = MagicMock()
-                choice = MagicMock()
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = synth
-                resp.choices = [choice]
-                resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                return resp
-
-            session.client.chat.completions.create = fake_create
+            session.client.chat.completions.create = scripted_chat_client({"content": synth})
 
             result = session._run_agent(
                 [Turn.user("test")],
@@ -2198,18 +2333,9 @@ class TestAgentOutputGuard:
         with patch.object(
             session, "_evaluate_output", wraps=lambda cid, o, fn: (o, None)
         ) as mock_eval:
-
-            def fake_create(**_kwargs):
-                resp = MagicMock()
-                choice = MagicMock()
-                choice.finish_reason = "length"
-                choice.message.tool_calls = None
-                choice.message.content = partial
-                resp.choices = [choice]
-                resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                return resp
-
-            session.client.chat.completions.create = fake_create
+            session.client.chat.completions.create = scripted_chat_client(
+                {"content": partial, "finish_reason": "length"}
+            )
             result = session._run_agent(
                 [Turn.user("test")],
                 tools=[{"type": "function", "function": {"name": "read_file"}}],
@@ -2324,33 +2450,20 @@ class TestAgentOutputGuard:
         session.agent_max_turns = 1  # one tool turn, then forced synthesis
 
         forced = "Forced synthesis after hitting the tool-turn ceiling."
-        call_count = [0]
 
         with patch.object(
             session, "_evaluate_output", wraps=lambda cid, o, fn, **_kw: (o, None)
         ) as mock_eval:
-
-            def fake_create(**_kwargs):
-                call_count[0] += 1
-                resp = MagicMock()
-                choice = MagicMock()
-                if call_count[0] == 1:
-                    # First call: tool call, eats the turn budget.
-                    choice.finish_reason = "tool_calls"
-                    tc = MagicMock()
-                    tc.id = "call_1"
-                    tc.function.name = "read_file"
-                    tc.function.arguments = '{"path": "/tmp/x"}'
-                    choice.message.tool_calls = [tc]
-                    choice.message.content = None
-                else:
-                    # Forced synthesis turn.
-                    choice.finish_reason = "stop"
-                    choice.message.tool_calls = None
-                    choice.message.content = forced
-                resp.choices = [choice]
-                resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                return resp
+            # Script: a tool call eats the turn budget, then forced synthesis.
+            fake_create = scripted_chat_client(
+                {
+                    "tool_calls": [
+                        {"id": "call_1", "name": "read_file", "arguments": '{"path": "/tmp/x"}'}
+                    ],
+                    "finish_reason": "tool_calls",
+                },
+                {"content": forced},
+            )
 
             session.client.chat.completions.create = fake_create
 
@@ -2389,29 +2502,15 @@ class TestAgentChildRegistration:
         session._provider = OpenAIChatCompletionsProvider()
         session.ui.note_agent_child = MagicMock()
 
-        call_count = [0]
-
-        def fake_create(**_kwargs):
-            call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
-            if call_count[0] == 1:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_1"
-                tc.function.name = "read_file"
-                tc.function.arguments = '{"path": "/tmp/x"}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
-
-        session.client.chat.completions.create = fake_create
+        session.client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [
+                    {"id": "call_1", "name": "read_file", "arguments": '{"path": "/tmp/x"}'}
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "done"},
+        )
 
         def fake_prepare(tc_dict, **_kwargs):
             return {
@@ -2429,9 +2528,487 @@ class TestAgentChildRegistration:
                 parent_call_id="task-1",
             )
 
-        # Sub-agent tool ids are namespaced by the parent so the UI registry
-        # can't collide across concurrent task agents (local sequential ids).
-        session.ui.note_agent_child.assert_called_once_with("task-1::call_1", "task-1")
+        # Sub-agent tool ids are minted ``{parent}::r{run}s{step}::{provider_id}``
+        # so the UI registry can't collide across concurrent task agents, across
+        # turns within one agent (local sequential ids like "call_0"), or across
+        # runs whose PARENT id was itself reused.
+        session.ui.note_agent_child.assert_called_once_with("task-1::r1s1::call_1", "task-1")
+
+    def test_cross_turn_reused_provider_ids_stay_distinct(self):
+        # A local provider reuses "call_0" verbatim every response.  The minted
+        # id carries a per-agent step sequence, so the registry, the wire, the
+        # recall projection, and the cancel ledger all see two DISTINCT calls.
+        # Pre-mint both mapped to "task-1::call_0": the live card collapsed the
+        # rows (bug-3) while FIFO recall kept them apart — the two disagreed on
+        # identical input.
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        session = _make_session()
+        session._provider = OpenAIChatCompletionsProvider()
+        session.ui.note_agent_child = MagicMock()
+
+        def _reused_call(path: str) -> dict:
+            # id reused verbatim across turns — the local-server shape.
+            return {
+                "tool_calls": [{"id": "call_0", "name": "read_file", "arguments": path}],
+                "finish_reason": "tool_calls",
+            }
+
+        client_fn = scripted_chat_client(
+            _reused_call('{"path": "/tmp/f1"}'),
+            _reused_call('{"path": "/tmp/f2"}'),
+            {"content": "done"},
+        )
+        session.client.chat.completions.create = client_fn
+
+        def fake_prepare(tc_dict, **_kwargs):
+            n = len(client_fn.calls)
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p, n=n: (p["call_id"], f"contents-{n}"),
+            }
+
+        agent_turns = [Turn.user("x")]
+        with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
+            session._run_agent(
+                agent_turns,
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                label="task",
+                parent_call_id="task-1",
+            )
+
+        # Registry: two registrations, distinct minted ids, same parent.
+        assert [c.args for c in session.ui.note_agent_child.call_args_list] == [
+            ("task-1::r1s1::call_0", "task-1"),
+            ("task-1::r1s2::call_0", "task-1"),
+        ]
+        # Recall projection: two steps, each paired to its OWN result.
+        steps = ChatSession._project_agent_steps(agent_turns)
+        assert [s["id"] for s in steps] == ["task-1::r1s1::call_0", "task-1::r1s2::call_0"]
+        assert [s["output"] for s in steps] == ["contents-1", "contents-2"]
+        # Cancel ledger agrees: both calls answered, no in-flight gap.
+        issued, first_gap = ChatSession._cancel_ledger(agent_turns)
+        assert issued == [("read_file", True), ("read_file", True)]
+        assert first_gap is None
+
+    @staticmethod
+    def _reusing_provider(session, tool_turns: int = 1):
+        """Fake create() reissuing id "call_0" for ``tool_turns`` turns, then
+        stopping — the local-server id-reuse shape."""
+        reused = {
+            "tool_calls": [
+                {"id": "call_0", "name": "read_file", "arguments": '{"path": "/tmp/x"}'}
+            ],
+            "finish_reason": "tool_calls",
+        }
+        session.client.chat.completions.create = scripted_chat_client(
+            *([reused] * tool_turns), {"content": "done"}
+        )
+
+    def test_parent_id_reuse_across_runs_mints_distinct_child_ids(self):
+        # A local provider reuses "call_0" for the PARENT task_agent call too:
+        # two sequential runs share parent_call_id "call_0".  The session-level
+        # run counter keeps their minted CHILD ids distinct — with only the
+        # per-run step seq (the intermediate fix, before the run counter) both
+        # runs minted "call_0::s1::call_0" and the second agent's sub-tool
+        # steps grafted onto the first agent's DOM rows.
+        #
+        # SCOPE: this fixes child (sub-tool) ids only.  The parent CARD still
+        # keys on the raw reused parent id ("call_0") — stash_agent_trajectory,
+        # _tool_status, the card's own data-call-id row — so two runs with the
+        # same parent id still alias at the card level.  Parent ids are
+        # main-loop ids; de-colliding them is the main-loop id-hygiene
+        # follow-up, not this change.
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        session = _make_session()
+        session._provider = OpenAIChatCompletionsProvider()
+        session.ui.note_agent_child = MagicMock()
+
+        def fake_prepare(tc_dict, **_kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p: (p["call_id"], "contents"),
+            }
+
+        minted: list[str] = []
+        for _run in range(2):
+            self._reusing_provider(session)
+            with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
+                session._run_agent(
+                    [Turn.user("x")],
+                    tools=[{"type": "function", "function": {"name": "read_file"}}],
+                    label="task",
+                    parent_call_id="call_0",
+                )
+            minted.append(session.ui.note_agent_child.call_args.args[0])
+
+        assert minted == ["call_0::r1s1::call_0", "call_0::r2s1::call_0"]
+        assert len(set(minted)) == 2
+
+    def test_agent_wire_restores_provider_ids_and_sanitizes_args(self):
+        # The agent seam bypasses the main-loop wire prep and builds its own
+        # history, so it runs its own validity passes.  Drive one tool turn
+        # whose call carries a minted "::" id (mapped back to the provider's
+        # own id on the wire) and malformed non-object arguments (a strict
+        # renderer json.loads and 400s them), then assert the REPLAY request
+        # the second _api_call sends carries the PROVIDER-ORIGINAL id on both
+        # the call and its result, and object-shaped arguments.  The internal
+        # id keeps the minted "::" form.
+        import json as _json
+
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        session = _make_session()
+        session._provider = OpenAIChatCompletionsProvider()
+        session.ui.note_agent_child = MagicMock()
+
+        client_fn = scripted_chat_client(
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "name": "read_file",
+                        # Malformed: unterminated JSON with a non-"length"
+                        # finish reason — the sanitize pass's reason to exist.
+                        "arguments": '{"path": "/tmp/x"',
+                    }
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "done"},
+        )
+        session.client.chat.completions.create = client_fn
+
+        def fake_prepare(tc_dict, **_kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p: (p["call_id"], "contents"),
+            }
+
+        with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
+            session._run_agent(
+                [Turn.user("x")],
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                label="task",
+                parent_call_id="task-1",
+            )
+
+        # Internal id (registry) keeps the minted "::" form.
+        internal = session.ui.note_agent_child.call_args.args[0]
+        assert internal == "task-1::r1s1::call_0"
+        # The SECOND request replays the tool turn: the wire carries the
+        # provider's own id, consistent between the call and its result (the
+        # shape the provider-native tool_use block also holds, so a native
+        # replay and a rebuild agree); arguments are legalized to a JSON
+        # object.
+        replay = client_fn.calls[1].get("messages") or []
+        wire_calls = [tc for m in replay if m.get("tool_calls") for tc in m["tool_calls"]]
+        wire_results = [m for m in replay if m.get("role") == "tool"]
+        assert wire_calls and wire_results
+        assert wire_calls[0]["id"] == "call_0"
+        assert wire_results[0]["tool_call_id"] == "call_0"
+        assert isinstance(_json.loads(wire_calls[0]["function"]["arguments"]), dict)
+
+    def test_agent_carries_native_lane_and_replays_thinking_anthropic(self):
+        # The load-bearing fidelity pin: a thinking-model agent's SECOND
+        # request must carry the prior assistant turn's native lane verbatim
+        # — thinking block and signature untouched — with the provider's own
+        # tool_use id agreeing across the native block, the restored
+        # top-level mirror, and the tool_result.  Pre-native-lane, the seam
+        # rebuilt the turn from content + tool_calls and the model re-reasoned
+        # from scratch every tool turn (and commercial Anthropic rejects a
+        # thinking-enabled tool_use turn without its thinking block).
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        session = _make_session()
+        session._provider = AnthropicProvider()
+        session.ui.note_agent_child = MagicMock()
+
+        client_fn = scripted_anthropic_client(
+            {
+                "blocks": [
+                    FakeAnthropicBlock(
+                        type="thinking", thinking="check the file first", signature="sig_v1"
+                    ),
+                    FakeAnthropicBlock(type="text", text="reading"),
+                    FakeAnthropicBlock(
+                        type="tool_use", id="toolu_01AB", name="read_file", input={"path": "x"}
+                    ),
+                ],
+                "stop_reason": "tool_use",
+            },
+            {"blocks": [FakeAnthropicBlock(type="text", text="done")]},
+        )
+        session.client.messages.stream = client_fn
+
+        def fake_prepare(tc_dict, **_kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p: (p["call_id"], "contents"),
+            }
+
+        with (
+            patch.object(session, "_prepare_tool", side_effect=fake_prepare),
+            # The agent seam resolves the operator flag through model_turn's
+            # module-level resolver (not the session wrapper), so the pin
+            # patches the module function — the seam production reads.
+            patch(
+                "turnstone.core.model_turn.resolve_replay_reasoning_to_model",
+                return_value=True,
+            ),
+        ):
+            session._run_agent(
+                [Turn.user("x")],
+                tools=[{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+                label="task",
+                parent_call_id="task-1",
+            )
+
+        # Internal key stays minted — the nesting registry saw the "::" id.
+        assert session.ui.note_agent_child.call_args.args[0] == "task-1::r1s1::toolu_01AB"
+        # Second request: the assistant wire turn IS the native lane.
+        replay = client_fn.calls[1]["messages"]
+        assistant = next(
+            m for m in replay if m["role"] == "assistant" and isinstance(m.get("content"), list)
+        )
+        kinds = [b.get("type") for b in assistant["content"]]
+        assert kinds == ["thinking", "text", "tool_use"]
+        assert assistant["content"][0]["thinking"] == "check the file first"
+        assert assistant["content"][0]["signature"] == "sig_v1"  # byte-untouched
+        assert assistant["content"][2]["id"] == "toolu_01AB"  # provider-original
+        tool_results = [
+            b
+            for m in replay
+            if m["role"] == "user" and isinstance(m.get("content"), list)
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        ]
+        assert tool_results and tool_results[0]["tool_use_id"] == "toolu_01AB"
+
+    def test_agent_blank_provider_id_repairs_native_lane(self):
+        # A server that leaves a tool-call id blank gets a uuid back-fill in
+        # the tool_calls mirror — and model_turn's pairwise repair writes the
+        # SAME manufactured id into the blank native client block, so the
+        # lane survives with every representation agreeing (native tool_use,
+        # mirror, tool_result).  Pre-repair the whole Messages-shaped lane
+        # was dropped for the turn, losing the thinking block's reasoning
+        # continuity; the total drop remains only as the pairing-mismatch
+        # fallback (pinned in test_model_turn).
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        session = _make_session()
+        session._provider = AnthropicProvider()
+        session.ui.note_agent_child = MagicMock()
+
+        client_fn = scripted_anthropic_client(
+            {
+                "blocks": [
+                    FakeAnthropicBlock(type="thinking", thinking="hm", signature="sig_b"),
+                    # Blank provider id — the back-fill case.
+                    FakeAnthropicBlock(
+                        type="tool_use", id="", name="read_file", input={"path": "x"}
+                    ),
+                ],
+                "stop_reason": "tool_use",
+            },
+            {"blocks": [FakeAnthropicBlock(type="text", text="done")]},
+        )
+        session.client.messages.stream = client_fn
+
+        def fake_prepare(tc_dict, **_kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p: (p["call_id"], "contents"),
+            }
+
+        turns = [Turn.user("x")]
+        with (
+            patch.object(session, "_prepare_tool", side_effect=fake_prepare),
+            # Pin the operator flag ON at the model_turn seam (where the
+            # agent path resolves it) so the lane content below is
+            # attributable to the repair alone, not a False replay flag.
+            patch(
+                "turnstone.core.model_turn.resolve_replay_reasoning_to_model",
+                return_value=True,
+            ),
+        ):
+            session._run_agent(
+                turns,
+                tools=[{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+                label="task",
+                parent_call_id="task-1",
+            )
+
+        # The repaired turn KEEPS its native lane: thinking survives, and the
+        # tool_use block carries the manufactured (back-filled) id.
+        assert turns[1].native is not None
+        native_types = [b.get("type") for b in turns[1].native.blocks]
+        assert native_types == ["thinking", "tool_use"]
+        manufactured = turns[1].native.blocks[1]["id"]
+        assert manufactured.startswith("call_")
+        # The mirror's minted id maps back to the manufactured id on the wire.
+        assert turns[1].tool_calls[0].id == f"task-1::r1s1::{manufactured}"
+        # The replay request carries the native lane verbatim — thinking and
+        # signature intact — with tool_use and tool_result agreeing on the
+        # manufactured id: no blank id, no orphan, no lost reasoning.
+        replay = client_fn.calls[1]["messages"]
+        assistant = next(
+            m for m in replay if m["role"] == "assistant" and isinstance(m.get("content"), list)
+        )
+        kinds = [b.get("type") for b in assistant["content"]]
+        assert kinds == ["thinking", "tool_use"]
+        assert assistant["content"][0]["signature"] == "sig_b"  # byte-untouched
+        assert assistant["content"][1]["id"] == manufactured
+        tool_results = [
+            b
+            for m in replay
+            if m["role"] == "user" and isinstance(m.get("content"), list)
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        ]
+        assert tool_results and tool_results[0]["tool_use_id"] == manufactured
+
+    def test_agent_blank_provider_id_keeps_synthesized_reasoning(self):
+        # The over-drop guard: a Chat-Completions server that BOTH leaves
+        # tool-call ids blank AND surfaces reasoning_content (llama.cpp,
+        # older vLLM) must still get its reasoning carried — the blank-id
+        # gate drops only the blocks a back-fill desyncs, and the
+        # synthesized reasoning_text lane has no client tool blocks at all.
+        from types import SimpleNamespace
+
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+        from turnstone.core.providers._openai_common import OPENAI_COMPAT_DEFAULT
+
+        session = _make_session()
+        session._provider = OpenAIChatCompletionsProvider()
+        session._model_alias = "loc"
+        session._registry = MagicMock()
+        session._registry.resolve_agent_alias.return_value = None
+        session._registry.resolve_agent_effort.return_value = None
+        session._registry.get_config.return_value = SimpleNamespace(
+            server_compat={"server_type": "vllm"}, replay_reasoning_to_model=True
+        )
+        session.ui.note_agent_child = MagicMock()
+
+        session.client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [
+                    # blank id — the back-fill case
+                    {"id": "", "name": "read_file", "arguments": '{"path": "x"}'}
+                ],
+                "finish_reason": "tool_calls",
+                "reasoning_content": "work it out",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+            },
+            {"content": "done", "prompt_tokens": 1, "completion_tokens": 1},
+        )
+
+        def fake_prepare(tc_dict, **_kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p: (p["call_id"], "contents"),
+            }
+
+        turns = [Turn.user("x")]
+        with (
+            patch.object(session, "_prepare_tool", side_effect=fake_prepare),
+            patch.object(session, "_resolve_capabilities", return_value=OPENAI_COMPAT_DEFAULT),
+        ):
+            session._run_agent(
+                turns,
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                label="task",
+                parent_call_id="task-1",
+            )
+
+        # Reasoning survives the blank-id turn.
+        assert turns[1].native is not None
+        assert [b["type"] for b in turns[1].native.blocks] == ["reasoning_text"]
+        assert turns[1].native.blocks[0]["text"] == "work it out"
+
+    def test_agent_synthesizes_reasoning_and_attaches_vllm_replay_field(self):
+        # Chat-Completions lane (vLLM): non-streaming ``reasoning_content`` is
+        # captured into CompletionResult.reasoning, synthesized into the agent
+        # turn's native lane as a ``reasoning_text`` block by the SAME
+        # finalize helper the main loop uses — source-tagged from the AGENT
+        # alias — and replayed on the next request as vLLM's non-standard
+        # ``reasoning`` field (Phase 5 at the agent seam; the internal
+        # ``_provider_content`` key itself never reaches the wire).
+        from types import SimpleNamespace
+
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+        from turnstone.core.providers._openai_common import OPENAI_COMPAT_DEFAULT
+
+        session = _make_session()
+        session._provider = OpenAIChatCompletionsProvider()
+        session._model_alias = "loc-qwen"
+        session._registry = MagicMock()
+        session._registry.resolve_agent_alias.return_value = None
+        session._registry.resolve_agent_effort.return_value = None
+        session._registry.get_config.return_value = SimpleNamespace(
+            server_compat={"server_type": "vllm"}, replay_reasoning_to_model=True
+        )
+        session.ui.note_agent_child = MagicMock()
+
+        client_fn = scripted_chat_client(
+            {
+                "tool_calls": [{"id": "call_0", "name": "read_file", "arguments": '{"path": "x"}'}],
+                "finish_reason": "tool_calls",
+                "reasoning_content": "scan the repo first",
+            },
+            {"content": "done"},
+        )
+        session.client.chat.completions.create = client_fn
+
+        def fake_prepare(tc_dict, **_kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p: (p["call_id"], "contents"),
+            }
+
+        turns = [Turn.user("x")]
+        with (
+            patch.object(session, "_prepare_tool", side_effect=fake_prepare),
+            patch.object(session, "_resolve_capabilities", return_value=OPENAI_COMPAT_DEFAULT),
+        ):
+            session._run_agent(
+                turns,
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                label="task",
+                parent_call_id="task-1",
+            )
+
+        # The agent Turn carries the synthesized native lane, source-tagged
+        # via the agent alias (alias threading through the shared helper).
+        assistant_turn = turns[1]
+        assert assistant_turn.native is not None
+        assert assistant_turn.native.producer == "openai-compatible"
+        assert assistant_turn.native.blocks == (
+            {"type": "reasoning_text", "text": "scan the repo first", "source": "vllm"},
+        )
+        # The replay request carries the vLLM ``reasoning`` field on the
+        # assistant turn; the internal ``_provider_content`` key is stripped
+        # by the provider's sanitize before the wire.
+        replay = client_fn.calls[1].get("messages") or []
+        assistant_wire = next(m for m in replay if m.get("role") == "assistant")
+        assert assistant_wire.get("reasoning") == "scan the repo first"
+        assert "_provider_content" not in assistant_wire
 
 
 class TestRunAgentDenialMessage:
@@ -2448,29 +3025,15 @@ class TestRunAgentDenialMessage:
         session = _make_session()
         session._provider = OpenAIChatCompletionsProvider()
 
-        call_count = [0]
-
-        def fake_create(**_kwargs):
-            call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
-            if call_count[0] == 1:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_1"
-                tc.function.name = "notify"
-                tc.function.arguments = '{"message": "hi"}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
-
-        session.client.chat.completions.create = fake_create
+        session.client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [
+                    {"id": "call_1", "name": "notify", "arguments": '{"message": "hi"}'}
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "done"},
+        )
         # approve_tools is the real two-phase gate: on denial it stamps a
         # specific denial_msg on the item AND returns the reason as its 2nd
         # value.  The sub-agent must honour both, not overwrite them.
@@ -2612,6 +3175,9 @@ class TestProjectAgentSteps:
     def test_colliding_ids_paired_fifo_not_last_wins(self):
         # A local provider reuses id "call_0" across turns; FIFO pairing gives
         # each call its OWN result, not last-wins (which would show out-B twice).
+        # Parented runs can no longer produce this input (_run_agent mints
+        # unique ids), but the FIFO stays as honest pairing for input a mint
+        # never touched — an unparented run, or turns constructed directly.
         from turnstone.core.trajectory import ToolCall, Turn
 
         turns = [
@@ -2753,29 +3319,15 @@ class TestSubAgentErrorRecall:
 
         session = _make_session()
         session._provider = OpenAIChatCompletionsProvider()
-        calls = [0]
-
-        def fake_create(**_kwargs):
-            calls[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
-            if calls[0] == 1:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_1"
-                tc.function.name = "bash"
-                tc.function.arguments = '{"command":"false"}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
-
-        session.client.chat.completions.create = fake_create
+        session.client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [
+                    {"id": "call_1", "name": "bash", "arguments": '{"command":"false"}'}
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "done"},
+        )
 
         def fake_prepare(tc_dict, **_kwargs):
             cid = tc_dict["id"]
@@ -3379,7 +3931,16 @@ class TestTruncateBeforeJudge:
 
 
 class TestProviderExtraParams:
-    """Tests for _provider_extra_params — server_compat passthrough only."""
+    """Tests for the session lane's extra_params resolution — server_compat
+    passthrough only.
+
+    #832 deleted ``ChatSession._provider_extra_params``: it was a thin
+    delegate whose last caller was the retired stream-creation ladder, and
+    the resolution now happens inside ``resolve_lane``.  These pin the
+    module function every lane goes through,
+    :func:`turnstone.core.model_turn.provider_extra_params`, with the
+    session's own binding supplied explicitly.
+    """
 
     def _session_with_provider(self, provider_name: str, tmp_db) -> ChatSession:
         from turnstone.core.providers import create_provider
@@ -3388,19 +3949,29 @@ class TestProviderExtraParams:
         session._provider = create_provider(provider_name)
         return session
 
+    @staticmethod
+    def _extra(session: ChatSession, alias: str | None = None):
+        """The session binding's extra_params, as ``resolve_lane`` resolves
+        them (*alias* overrides the primary — the fallback-lane case)."""
+        return provider_extra_params(
+            session._provider,
+            session._registry,
+            alias if alias is not None else (session._model_alias or ""),
+        )
+
     def test_openai_compatible_no_compat_returns_none(self, tmp_db):
         """No server_compat → no extra_body needed (no auto-injection)."""
         session = self._session_with_provider("openai-compatible", tmp_db)
-        assert session._provider_extra_params() is None
+        assert self._extra(session) is None
 
     def test_openai_commercial_no_compat_returns_none(self, tmp_db):
         """Cloud OpenAI without server_compat → None."""
         session = self._session_with_provider("openai", tmp_db)
-        assert session._provider_extra_params() is None
+        assert self._extra(session) is None
 
     def test_anthropic_returns_none(self, tmp_db):
         session = self._session_with_provider("anthropic", tmp_db)
-        assert session._provider_extra_params() is None
+        assert self._extra(session) is None
 
     def test_no_reasoning_effort_kwarg(self, tmp_db):
         """reasoning_effort is not part of the surface; passing it should TypeError.
@@ -3414,7 +3985,7 @@ class TestProviderExtraParams:
         bad_kwargs = {"reasoning_effort": "high"}
         session = self._session_with_provider("openai-compatible", tmp_db)
         with pytest.raises(TypeError):
-            session._provider_extra_params(**bad_kwargs)
+            provider_extra_params(session._provider, session._registry, "", **bad_kwargs)
 
     def test_server_compat_extra_body_passes_through(self, tmp_db):
         """server_compat.extra_body workarounds forward as extra_params."""
@@ -3430,8 +4001,7 @@ class TestProviderExtraParams:
         )
         session._registry = ModelRegistry(models={"test": cfg}, default="test")
         session._model_alias = "test"
-        result = session._provider_extra_params()
-        assert result == {"skip_special_tokens": False}
+        assert self._extra(session) == {"skip_special_tokens": False}
 
     def test_operator_chat_template_kwargs_pass_through(self, tmp_db):
         """Operator-set chat_template_kwargs (e.g. for gpt-oss) forwards verbatim."""
@@ -3447,11 +4017,11 @@ class TestProviderExtraParams:
         )
         session._registry = ModelRegistry(models={"test": cfg}, default="test")
         session._model_alias = "test"
-        result = session._provider_extra_params()
-        assert result == {"chat_template_kwargs": {"reasoning_effort": "high"}}
+        assert self._extra(session) == {"chat_template_kwargs": {"reasoning_effort": "high"}}
 
     def test_model_alias_resolves_target_compat(self, tmp_db):
-        """model_alias parameter selects compat from the target, not the primary."""
+        """The alias argument selects compat from the target, not the primary
+        — the fallback lane's own extra_params, resolved per lane swap."""
         from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
         session = self._session_with_provider("openai-compatible", tmp_db)
@@ -3477,9 +4047,9 @@ class TestProviderExtraParams:
         session._model_alias = "primary"
 
         # Primary alias → gets Gemma workaround
-        assert session._provider_extra_params() == {"skip_special_tokens": False}
+        assert self._extra(session) == {"skip_special_tokens": False}
         # Fallback alias → no compat at all
-        assert session._provider_extra_params(model_alias="fallback") is None
+        assert self._extra(session, "fallback") is None
 
 
 class TestSafePrepareTool:
@@ -4457,7 +5027,7 @@ class TestMemoryCompositionDeferral:
             seen_queries.append(extract_recent_context(dicts_from_turns(session.messages)))
             real_init()
 
-        responses = [{"role": "assistant", "content": "ok"}]
+        responses = [make_result("ok")]
         with _send_with_mocks(
             session, responses, lambda _tc: ([], None), _init_system_messages=spy_init
         ):
@@ -4480,7 +5050,7 @@ class TestMemoryCompositionDeferral:
             nonlocal init_calls
             init_calls += 1
 
-        responses = [{"role": "assistant", "content": "ok"}]
+        responses = [make_result("ok")]
         with _send_with_mocks(
             session, responses, lambda _tc: ([], None), _init_system_messages=spy_init
         ):
@@ -5051,18 +5621,17 @@ class TestMetacognitiveBuffers:
         full ``send`` loop, not just ``_collect_advisories`` in isolation."""
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "echo", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -5153,18 +5722,17 @@ class TestMetacognitiveBuffers:
         """
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "echo", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -5214,18 +5782,17 @@ class TestMetacognitiveBuffers:
         a prefix-only call."""
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "echo", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -5269,18 +5836,17 @@ class TestMetacognitiveBuffers:
         breaks this test."""
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "echo", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -5363,18 +5929,17 @@ class TestMetacognitiveBuffers:
         ``system`` DB row appended after the tool row."""
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "echo", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -5403,18 +5968,17 @@ class TestMetacognitiveBuffers:
         is never spliced into tool content anymore."""
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "echo", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -5440,18 +6004,17 @@ class TestMetacognitiveBuffers:
         interjection rides its own ``system`` row."""
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "view_image", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -5489,18 +6052,17 @@ class TestMetacognitiveBuffers:
         carries the interjection — both replay from their own rows."""
         session = _make_session()
         responses = [
-            {
-                "role": "assistant",
-                "content": "calling",
-                "tool_calls": [
+            make_result(
+                "calling",
+                tool_calls=[
                     {
                         "id": "call_x",
                         "type": "function",
                         "function": {"name": "view_image", "arguments": "{}"},
                     }
                 ],
-            },
-            {"role": "assistant", "content": "ack"},
+            ),
+            make_result("ack"),
         ]
 
         def mock_execute(_tool_calls):
@@ -5553,11 +6115,7 @@ class TestMetacognitiveBuffers:
         # gate passes — content of the memories doesn't matter here.
         with (
             patch.object(session, "_visible_memory_count", return_value=3),
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=GenerationCancelled(),
-            ),
+            patch.object(session, "_stream_response", side_effect=GenerationCancelled()),
         ):
             session.send("first user message")
 
@@ -5641,11 +6199,7 @@ class TestMetacognitiveBuffers:
         session._queue_tool_advisory("tool_error", "leftover")
         with (
             patch.object(session, "_visible_memory_count", return_value=0),
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=GenerationCancelled(),
-            ),
+            patch.object(session, "_stream_response", side_effect=GenerationCancelled()),
         ):
             session.send("user input")
 
@@ -5876,7 +6430,12 @@ class TestUpdateTokenTableMsgsParam:
     """``_update_token_table(msgs=...)`` reuses the wire-bound message
     list already built for the stream call instead of re-folding the
     system turns (perf-2), so the calibration char count matches the
-    bytes the provider counted."""
+    bytes the provider counted.
+
+    Post-#832 the main loop feeds it ``ModelTurnResult.wire_msgs``, and
+    the on-the-fly re-fold fallback survives for callers (fake results,
+    direct calls) that have no wire list.  The old leading
+    ``assistant_msg`` argument is gone — the body never read it."""
 
     def test_uses_provided_msgs_skips_re_application(self, tmp_db):
         session = _make_session()
@@ -5890,13 +6449,15 @@ class TestUpdateTokenTableMsgsParam:
         ) as m_prep:
             pre_built = session._prepare_wire_messages(session._full_messages())
             calls_after_prebuild = m_prep.call_count
-            session._update_token_table({"role": "assistant", "content": "ok"}, msgs=pre_built)
+            session._update_token_table(msgs=pre_built)
             # Calibration must not have re-folded.
             assert m_prep.call_count == calls_after_prebuild
 
     def test_falls_back_to_apply_when_msgs_missing(self, tmp_db):
         """The optional kwarg has a fallback so callers that don't (or
-        can't) pre-build the wire copy still get a sane calibration."""
+        can't) pre-build the wire copy still get a sane calibration —
+        a ``ModelTurnResult`` with ``wire_msgs=None`` (the fake-result
+        shape send() passes straight through) takes this path."""
         session = _make_session()
         session._last_usage = {"prompt_tokens": 100, "completion_tokens": 50}
         session.messages.append(turn_from_dict({"role": "user", "content": "hi"}))
@@ -5905,7 +6466,7 @@ class TestUpdateTokenTableMsgsParam:
             "_prepare_wire_messages",
             wraps=session._prepare_wire_messages,
         ) as m_prep:
-            session._update_token_table({"role": "assistant", "content": "ok"})
+            session._update_token_table(msgs=make_result("ok").wire_msgs)
             # Fallback path folds on the fly.
             assert m_prep.call_count == 1
 
@@ -5925,11 +6486,7 @@ class TestUserAdvisoryCancelClear:
         session._queue_user_advisory("denial", "leftover")
         with (
             patch.object(session, "_visible_memory_count", return_value=0),
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=GenerationCancelled(),
-            ),
+            patch.object(session, "_stream_response", side_effect=GenerationCancelled()),
         ):
             session.send("user input")
         assert _user_pending(session) == []
@@ -5939,11 +6496,7 @@ class TestUserAdvisoryCancelClear:
         session._queue_user_advisory("correction", "leftover")
         with (
             patch.object(session, "_visible_memory_count", return_value=0),
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=KeyboardInterrupt(),
-            ),
+            patch.object(session, "_stream_response", side_effect=KeyboardInterrupt()),
             contextlib.suppress(KeyboardInterrupt),
         ):
             session.send("user input")
@@ -5954,11 +6507,7 @@ class TestUserAdvisoryCancelClear:
         session._queue_user_advisory("resume", "leftover")
         with (
             patch.object(session, "_visible_memory_count", return_value=0),
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=RuntimeError("boom"),
-            ),
+            patch.object(session, "_stream_response", side_effect=RuntimeError("boom")),
             contextlib.suppress(RuntimeError),
         ):
             session.send("user input")
@@ -5985,7 +6534,7 @@ class TestUserAdvisoryCancelClear:
         session._title_generated = True
         stream_calls = 0
 
-        def mock_create_stream(msgs):
+        def mock_stream_response(my_generation=0):
             nonlocal stream_calls
             stream_calls += 1
             if stream_calls == 1:
@@ -5993,15 +6542,10 @@ class TestUserAdvisoryCancelClear:
                 # time the no-tool branch runs ``_flush_queued_messages``,
                 # this item is in the queue waiting to be drained.
                 session.queue_message("late arrival", queue_msg_id="q-late")
-            return iter([])
+            return make_result("ok")
 
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=mock_create_stream),
-            patch.object(
-                session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(session, "_stream_response", side_effect=mock_stream_response),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -6046,11 +6590,11 @@ class TestDeliverWakeNudge:
         # won't match.  Bail before synthesizing an empty user turn.
         session._queue_tool_advisory("tool_error", "stale")
         before_len = len(session.messages)
-        with patch.object(session, "_create_stream_with_retry") as stream:
+        with patch.object(session, "_stream_response") as turn:
             session.deliver_wake_nudge_from_queue()
-        # No send → no message appended → stream untouched.
+        # No send → no message appended → the streaming seam untouched.
         assert len(session.messages) == before_len
-        assert stream.call_count == 0
+        assert turn.call_count == 0
         # Tool entry still queued (would orphan in production today; the
         # bail just protects against the empty-envelope failure mode).
         assert _tool_pending(session) == [("tool_error", "stale")]
@@ -6060,10 +6604,10 @@ class TestDeliverWakeNudge:
     def test_no_op_when_queue_is_empty(self, tmp_db):
         session = _make_session()
         before_len = len(session.messages)
-        with patch.object(session, "_create_stream_with_retry") as stream:
+        with patch.object(session, "_stream_response") as turn:
             session.deliver_wake_nudge_from_queue()
         assert len(session.messages) == before_len
-        assert stream.call_count == 0
+        assert turn.call_count == 0
         assert session._wake_source_tag == ""
 
     def test_drains_any_channel_onto_synthetic_empty_user_turn(self, tmp_db):
@@ -6075,12 +6619,7 @@ class TestDeliverWakeNudge:
         session._title_generated = True  # suppress auto-title thread
         session._nudge_queue.enqueue("idle_children", "your kids", "any")
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -6107,12 +6646,7 @@ class TestDeliverWakeNudge:
         session._title_generated = True
         session._queue_user_advisory("denial", "leftover")
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -6130,12 +6664,7 @@ class TestDeliverWakeNudge:
         session._title_generated = True
         session._queue_user_advisory("denial", "x")
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -6166,12 +6695,7 @@ class TestDeliverWakeNudge:
         # otherwise fire a fresh correction nudge.
         session.messages.append(turn_from_dict({"role": "user", "content": "earlier"}))
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -6201,20 +6725,29 @@ class TestDeliverWakeNudge:
         is passed explicitly (the wake's synthesized first turn);
         ``_flush_queued_messages``'s default-False call leaves the tag
         unset on the flushed message.
+
+        The message is queued MID-wake-send (from the first stream call),
+        not before the wake: a message already waiting when the wake
+        worker starts now owns the idle seam outright — the interjection
+        handoff, pinned in test_idle_nudge_wake_integration.py — and the
+        wake turn never runs.  The mid-turn window is where the wake's
+        chat loop and a real user message can still interleave.
         """
         session = _make_session()
         session._title_generated = True
         session._nudge_queue.enqueue("idle_children", "kids", "any")
-        # Queue a real user message that will be flushed at the IDLE seam.
-        session.queue_message("real user input", queue_msg_id="q-1")
+
+        def _queue_then_reply(*_a: Any, **_k: Any) -> ModelTurnResult:
+            # First stream call: a real user message lands mid-wake-turn.
+            # Subsequent calls: plain replies until the flush seam empties.
+            if not session._queued_messages and not any(
+                "real user input" in str(m.content) for m in session.messages
+            ):
+                session.queue_message("real user input", queue_msg_id="q-1")
+            return make_result("ok")
 
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(session, "_stream_response", side_effect=_queue_then_reply),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -6244,11 +6777,7 @@ class TestDeliverWakeNudge:
         session._queue_user_advisory("denial", "leftover")
         with (
             patch.object(session, "_visible_memory_count", return_value=0),
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                side_effect=RuntimeError("boom"),
-            ),
+            patch.object(session, "_stream_response", side_effect=RuntimeError("boom")),
             contextlib.suppress(RuntimeError),
         ):
             session.deliver_wake_nudge_from_queue()
@@ -6273,12 +6802,7 @@ class TestDeliverWakeNudge:
         session._title_generated = True
         session._queue_user_advisory("denial", "leftover")
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -6304,12 +6828,7 @@ class TestDeliverWakeNudge:
         session._title_generated = True
         session._queue_user_advisory("denial", "do not do that")
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
-            patch.object(
-                session,
-                "_stream_response",
-                return_value={"role": "assistant", "content": "ok"},
-            ),
+            patch.object(session, "_stream_response", return_value=make_result("ok")),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -6988,18 +7507,20 @@ def test_utility_completion_records_aux_usage():
     session = _make_session(ui=ui)
     session._provider = MagicMock()
     session._provider.get_capabilities.return_value = ModelCapabilities()
-    session._provider.create_completion.return_value = CompletionResult(
-        content="A Generated Title",
-        usage=UsageInfo(
-            prompt_tokens=120,
-            completion_tokens=8,
-            total_tokens=128,
-            cache_creation_tokens=4,
-            cache_read_tokens=16,
-        ),
+    session._provider.create_streaming.return_value = as_stream(
+        CompletionResult(
+            content="A Generated Title",
+            usage=UsageInfo(
+                prompt_tokens=120,
+                completion_tokens=8,
+                total_tokens=128,
+                cache_creation_tokens=4,
+                cache_read_tokens=16,
+            ),
+        )
     )
 
-    session._utility_completion([{"role": "user", "content": "hi"}])
+    session._utility_completion([Turn.user("hi")])
 
     assert len(ui.aux_calls) == 1
     rec = ui.aux_calls[0]
@@ -7022,15 +7543,113 @@ def test_utility_completion_defers_temperature_to_session():
     session.temperature = 0.42
     session._provider = MagicMock()
     session._provider.get_capabilities.return_value = ModelCapabilities()
-    session._provider.create_completion.return_value = CompletionResult(content="x")
+    session._provider.create_streaming.return_value = as_stream(CompletionResult(content="x"))
 
-    session._utility_completion([{"role": "user", "content": "hi"}])
-    _, kw = session._provider.create_completion.call_args
+    session._utility_completion([Turn.user("hi")])
+    _, kw = session._provider.create_streaming.call_args
     assert kw["temperature"] == 0.42  # deferred to the session/registry value
 
-    session._utility_completion([{"role": "user", "content": "hi"}], temperature=0.9)
-    _, kw2 = session._provider.create_completion.call_args
+    session._utility_completion([Turn.user("hi")], temperature=0.9)
+    _, kw2 = session._provider.create_streaming.call_args
     assert kw2["temperature"] == 0.9  # explicit override still honored
+
+
+def test_utility_completion_asks_a_passthrough_backend_for_no_reasoning():
+    """#940: a server that does not segregate reasoning leaves it in
+    ``content``, and when it arrives UNMARKED the seam cannot lift it out —
+    the chain-of-thought becomes the artifact (the web-fetch tool result,
+    then every following turn's context).  The bounded-artifact lanes
+    therefore ask for none through EVERY channel: the alias's OWN declared
+    toggle pinned off (over any operator ``server_compat`` flag, surviving
+    the provider's adaptive-``true`` injection), the model definition's
+    default-effort rung cleared, and the caller's relayed effort knob
+    zeroed — an effort value beside a pinned-off toggle re-requests the
+    reasoning the pin declined."""
+    from turnstone.core.providers._protocol import CompletionResult, ModelCapabilities
+
+    session = _make_session()
+    session._provider = MagicMock()
+    session._provider.provider_name = "openai-compatible"
+    session._provider.get_capabilities.return_value = ModelCapabilities(
+        thinking_mode="adaptive",
+        thinking_param="enable_thinking",
+        default_reasoning_effort="high",
+    )
+    session._provider.create_streaming.return_value = as_stream(CompletionResult(content="x"))
+
+    # The web-fetch relay shape: an explicit caller effort rides in.
+    session._utility_completion([Turn.user("hi")], reasoning_effort="high")
+    _, kw = session._provider.create_streaming.call_args
+    assert kw["extra_params"]["chat_template_kwargs"] == {"enable_thinking": False}
+    # Neither the caller rung nor the definition's default survives.
+    assert kw["reasoning_effort"] is None
+
+
+def test_utility_completion_suppresses_effort_on_toggle_less_passthrough():
+    """A passthrough box with NO template toggle (thinking_mode="none",
+    effort-passthrough) has no off switch — but the effort channel alone is
+    a reasoning request, so the utility lanes omit it entirely rather than
+    asking a non-segregating box for more chain-of-thought."""
+    from turnstone.core.providers._protocol import CompletionResult, ModelCapabilities
+
+    session = _make_session()
+    session._provider = MagicMock()
+    session._provider.provider_name = "openai-compatible"
+    session._provider.get_capabilities.return_value = ModelCapabilities(
+        thinking_mode="none",
+        effort_passthrough=True,
+        default_reasoning_effort="high",
+    )
+    session._provider.create_streaming.return_value = as_stream(CompletionResult(content="x"))
+
+    session._utility_completion([Turn.user("hi")], reasoning_effort="high")
+    _, kw = session._provider.create_streaming.call_args
+    assert kw["reasoning_effort"] is None
+    # No toggle declared → no guessed key.
+    assert (kw["extra_params"] or {}).get("chat_template_kwargs") is None
+
+
+def test_utility_completion_keeps_reasoning_when_the_backend_segregates_it():
+    """The pin is remediation for a lane that cannot separate reasoning from
+    the artifact.  A backend that puts reasoning in its own channel has no
+    such problem, so nothing is suppressed — reasoning there costs the
+    artifact nothing, and silencing a model the operator chose for its
+    reasoning would be the harness overriding them for no gain."""
+    from turnstone.core.providers._protocol import CompletionResult, ModelCapabilities
+
+    session = _make_session()
+    session._provider = MagicMock()
+    session._provider.provider_name = "openai-compatible"
+    session._provider.get_capabilities.return_value = ModelCapabilities(
+        thinking_mode="adaptive",
+        thinking_param="enable_thinking",
+        server_parses_reasoning=True,
+    )
+    session._provider.create_streaming.return_value = as_stream(CompletionResult(content="x"))
+
+    session._utility_completion([Turn.user("hi")], reasoning_effort="high")
+    _, kw = session._provider.create_streaming.call_args
+    assert (kw["extra_params"] or {}).get("chat_template_kwargs") is None
+    # The relayed effort knob stands — the operator chose a reasoning
+    # model whose reasoning costs the artifact nothing.
+    assert kw["reasoning_effort"] == "high"
+
+
+def test_utility_completion_never_guesses_a_toggle_key():
+    """A model that declares no thinking toggle keeps its template default:
+    the pin sends the alias's declared key or nothing at all.  Inventing one
+    would flip a lever the operator never wired."""
+    from turnstone.core.providers._protocol import CompletionResult, ModelCapabilities
+
+    session = _make_session()
+    session._provider = MagicMock()
+    session._provider.provider_name = "openai-compatible"
+    session._provider.get_capabilities.return_value = ModelCapabilities(thinking_mode="none")
+    session._provider.create_streaming.return_value = as_stream(CompletionResult(content="x"))
+
+    session._utility_completion([Turn.user("hi")])
+    _, kw = session._provider.create_streaming.call_args
+    assert (kw["extra_params"] or {}).get("chat_template_kwargs") is None
 
 
 def test_web_fetch_extraction_inherits_session_max_tokens_and_effort():
@@ -7100,28 +7719,38 @@ def test_web_fetch_extraction_caps_max_tokens_to_window_reserve():
     assert kw["max_tokens"] == 2048  # context_window // 4, not the 16384 session value
 
 
+def test_resolve_capabilities_raises_loudly_on_registry_failure():
+    """The session lane must NOT silently cache degraded static-table caps:
+    a get_config failure on the session's own alias PROPAGATES (pre-#827
+    semantics) — the never-crash defensive fetch is a judge-constructor
+    property, and applying it here would let one transient registry hiccup
+    pin wrong capabilities (window, thinking mode, token param) onto the
+    session cache for its whole lifetime."""
+    session = _make_session()
+    session._registry = MagicMock()
+    session._registry.get_config.side_effect = ValueError("Unknown model alias")
+    session._model_alias = "primary"
+    with pytest.raises(ValueError):
+        session._get_capabilities()
+
+
 def test_record_aux_usage_skips_when_usage_missing():
     """A provider that reports no usage object must not emit a phantom
     zero-token row."""
-    from turnstone.core.providers._protocol import CompletionResult
-
     ui = _AuxRecordingUI()
     session = _make_session(ui=ui)
-    session._record_aux_usage(CompletionResult(content="x", usage=None))
+    session._record_aux_usage(None)
     assert ui.aux_calls == []
 
 
 def test_record_aux_usage_noop_without_ui_hook():
     """Minimal UI stubs predating on_aux_usage (e.g. NullUI) must not crash
     a title-gen or sub-agent turn — recording silently no-ops."""
-    from turnstone.core.providers._protocol import CompletionResult, UsageInfo
+    from turnstone.core.providers._protocol import UsageInfo
 
     session = _make_session(ui=NullUI())  # NullUI has no on_aux_usage
     session._record_aux_usage(
-        CompletionResult(
-            content="x",
-            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
-        )
+        UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2)
     )  # no exception raised == pass
 
 
@@ -7130,15 +7759,12 @@ def test_record_aux_usage_attributes_explicit_model():
     _api_call passes model=agent_model so plan/task spend attributes to the
     sub-agent's model, not the coordinating session's. Verify the override
     reaches on_aux_usage rather than defaulting to self.model."""
-    from turnstone.core.providers._protocol import CompletionResult, UsageInfo
+    from turnstone.core.providers._protocol import UsageInfo
 
     ui = _AuxRecordingUI()
     session = _make_session(ui=ui)  # session model == "test-model"
     session._record_aux_usage(
-        CompletionResult(
-            content="plan output",
-            usage=UsageInfo(prompt_tokens=900, completion_tokens=60, total_tokens=960),
-        ),
+        UsageInfo(prompt_tokens=900, completion_tokens=60, total_tokens=960),
         model="plan-model-xyz",
     )
 
@@ -7146,3 +7772,112 @@ def test_record_aux_usage_attributes_explicit_model():
     # The explicit agent model wins over the session default.
     assert ui.aux_calls[0]["model"] == "plan-model-xyz"
     assert ui.aux_calls[0]["prompt_tokens"] == 900
+
+
+def _fake_fetched_page() -> MagicMock:
+    """Response fake for the monkeypatched web_fetch guard fetch."""
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.headers = {"content-type": "text/plain"}
+    resp.text = "Page body."
+    return resp
+
+
+class TestInlineReasoningSeamLanes:
+    """#965 per-lane pins: web_fetch extraction (the #940 repro) and the
+    task_agent synthesis path receive IR-clean content from the drain seam."""
+
+    def test_web_fetch_extraction_result_is_clean(self, monkeypatch, tmp_db):
+        # The #940 class: a passthrough server wraps the extraction answer
+        # in think tags; the tool result (persisted and replayed every
+        # following turn) must carry ONLY the answer.
+        session = _make_session()
+        monkeypatch.setattr(
+            "turnstone.core.session.fetch_with_ssrf_guard",
+            lambda url, **kw: _fake_fetched_page(),
+        )
+        session._provider = seam_provider(
+            "<think>scanning the page for the answer</think>HRW hashing weights nodes.",
+            provider_name="openai",
+        )
+        call_id, answer = session._exec_web_fetch(
+            {"call_id": "wf1", "url": "https://example.com/x", "question": "What is HRW?"}
+        )
+        assert answer == "HRW hashing weights nodes."
+
+    def test_web_fetch_think_only_extraction_is_honest_error(self, monkeypatch, tmp_db):
+        # An all-reasoning extraction drains to empty content — the tool
+        # result flips to an explicit error instead of silently persisting
+        # think text as a "success".
+        session = _make_session()
+        monkeypatch.setattr(
+            "turnstone.core.session.fetch_with_ssrf_guard",
+            lambda url, **kw: _fake_fetched_page(),
+        )
+        session._provider = seam_provider("<think>hmm, unclear</think>", provider_name="openai")
+        call_id, answer = session._exec_web_fetch(
+            {"call_id": "wf2", "url": "https://example.com/x", "question": "What is HRW?"}
+        )
+        assert answer == "Error: extraction returned no answer"
+
+    def test_task_agent_synthesis_is_clean(self, tmp_db):
+        # The audit's unverified sibling, scripted: a sub-agent turn wrapped
+        # in think tags reaches the coordinator-visible synthesis clean.
+        from turnstone.core.trajectory import Turn
+
+        session = _make_session()
+        session._provider = seam_provider(
+            "<think>sub-agent deliberation</think>Sub-agent findings.", provider_name="openai"
+        )
+        out = session._run_agent(
+            [Turn.system("You are a test agent."), Turn.user("Report findings.")],
+            label="task",
+            tools=[],
+            auto_tools=set(),
+        )
+        assert out == "Sub-agent findings."
+
+    def test_task_agent_think_only_turn_reports_no_output(self, tmp_db):
+        from turnstone.core.trajectory import Turn
+
+        session = _make_session()
+        session._provider = seam_provider(
+            "<think>nothing but reasoning</think>", provider_name="openai"
+        )
+        out = session._run_agent(
+            [Turn.system("You are a test agent."), Turn.user("Report findings.")],
+            label="task",
+            tools=[],
+            auto_tools=set(),
+        )
+        assert out == "(no output)"
+
+
+class TestWhitespaceOnlyBlanknessGates:
+    """Whitespace-only drained content takes the no-answer fallbacks —
+    blankness, not truthiness, campaign-wide."""
+
+    def test_task_agent_whitespace_only_turn_reports_no_output(self, tmp_db):
+        from turnstone.core.trajectory import Turn
+
+        session = _make_session()
+        session._provider = seam_provider("\n\n", provider_name="openai")
+        out = session._run_agent(
+            [Turn.system("You are a test agent."), Turn.user("Report findings.")],
+            label="task",
+            tools=[],
+            auto_tools=set(),
+        )
+        assert out == "(no output)"
+
+    def test_web_fetch_whitespace_only_extraction_is_honest_error(self, monkeypatch, tmp_db):
+        session = _make_session()
+        monkeypatch.setattr(
+            "turnstone.core.session.fetch_with_ssrf_guard",
+            lambda url, **kw: _fake_fetched_page(),
+        )
+        session._provider = seam_provider("\n\n", provider_name="openai")
+        call_id, answer = session._exec_web_fetch(
+            {"call_id": "wf3", "url": "https://example.com/x", "question": "What?"}
+        )
+        assert answer == "Error: extraction returned no answer"

@@ -27,6 +27,7 @@ import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -57,8 +58,23 @@ from turnstone.core.auth import (
     require_permission,
 )
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
+from turnstone.core.mcp_crypto import STARTUP_KEY_REQUIRED_HINT, is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
+from turnstone.core.metacognition import field_str, sanitize_display
+from turnstone.core.model_registry import (
+    APP_IDENTITY_MODEL_AUTH_MODES,
+    DYNAMIC_MODEL_AUTH_MODES,
+    MODEL_AUTH_MODE_PROFILES,
+    MODEL_AUTH_TEXT_MAX_LEN,
+    SCOPES_MODEL_AUTH_MODES,
+    DynamicAuthKeyError,
+    dynamic_auth_key_error,
+    sanitize_backend_auth_scopes,
+    strip_control_characters,
+)
+from turnstone.core.model_registry import MODEL_AUTH_MODES as _MODEL_AUTH_MODES
 from turnstone.core.rendezvous import NoAvailableNodeError
+from turnstone.core.rerank_calibrate import canonical_caps_value
 from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_routes import (
     AttachmentUploadHelpers,
@@ -154,24 +170,17 @@ def _parse_int(
 # Proxy helpers
 # ---------------------------------------------------------------------------
 
-# Inline JS injected into proxied server-UI pages.  Two responsibilities,
-# kept in one IIFE so the original window.fetch closure variable is
-# available to the picker (which has to bypass the prefix shim):
+# Inline JS injected into proxied server-UI pages.  Two responsibilities:
 #
-#   1. Prefix shim \u2014 rewrites root-relative fetch() and EventSource()
+#   1. Prefix shim — rewrites root-relative fetch() and EventSource()
 #      URLs to /node/{id}/... so the proxied page's API calls land
 #      at the console (which forwards them to the right server node).
 #
-#   2. Node picker \u2014 on DOMContentLoaded, prepends a node-id pill into
-#      the server UI's #ui-header (.appbar).  Click \u2192 dropdown with
-#      \u2190 Console + the other healthy nodes.  Replaces the earlier
-#      32px back-to-console banner that used to live above the appbar.
-#      Lazy-fetches /api/cluster/nodes the first time the menu opens
-#      (cheap when the user never clicks; fresh when they do).
+#   2. Back to console — repoints the proxied page's rail brand at "/",
+#      so the console stays reachable from inside a node view.
 _JS_PROXY_SHIM = """\
 (function(){
   var _pfx = "PREFIX_PLACEHOLDER";
-  var _nodeId = "NODE_ID_PLACEHOLDER";
   var _oF = window.fetch;
   window.fetch = function(u, o){
     if (typeof u === "string" && u.startsWith("/")) u = _pfx + u;
@@ -187,405 +196,48 @@ _JS_PROXY_SHIM = """\
   window.EventSource.OPEN = _oE.OPEN;
   window.EventSource.CLOSED = _oE.CLOSED;
 
-  function el(tag, cls, text){
-    var n = document.createElement(tag);
-    if (cls) n.className = cls;
-    if (text != null) n.textContent = text;
-    return n;
-  }
-
-  function buildPicker(){
-    var header = document.getElementById("ui-header");
-    if (!header) return;
-
-    // Trigger pill \u2014 prepended into #ui-header (the server UI's appbar).
-    var pill = document.createElement("button");
-    pill.type = "button";
-    pill.className = "console-node-pill";
-    pill.setAttribute("aria-haspopup", "menu");
-    pill.setAttribute("aria-expanded", "false");
-    pill.setAttribute("aria-label", "Switch node, currently " + _nodeId);
-    // title gives sighted users the full id when it ellipsizes
-    // \u2014 see the max-width + text-overflow rules in _CONSOLE_PROXY_STYLE.
-    pill.setAttribute("title", _nodeId);
-    pill.appendChild(el("span", "console-node-pill-dot"));
-    pill.appendChild(el("span", "console-node-pill-id", _nodeId));
-    pill.appendChild(el("span", "console-node-pill-caret", "\u25be"));
-    header.insertBefore(pill, header.firstChild);
-
-    // Menu state lives at the picker level, not on the menu DOM, so a
-    // close-then-reopen reuses the cached node list (no stale spinner).
-    var menu = null;
-    var loaded = false;
-    var loading = false;
-    var lastNodes = [];
-    var closeHandler = null;
-
-    function closeMenu(){
-      if (menu){ menu.remove(); menu = null; }
-      if (closeHandler){
-        document.removeEventListener("mousedown", closeHandler);
-        document.removeEventListener("keydown", closeHandler);
-        closeHandler = null;
-      }
-      pill.setAttribute("aria-expanded", "false");
-    }
-
-    function openMenu(){
-      if (menu) return;
-      // Reuse the workstream-tab dropdown shell for visual + behavioural
-      // consistency with the chevron menu next to it in the same toolbar.
-      menu = document.createElement("div");
-      menu.className = "ws-tab-dropdown console-node-menu";
-      menu.setAttribute("role", "menu");
-      menu.setAttribute("aria-label", "Switch node");
-      menu.addEventListener("contextmenu", function(e){ e.preventDefault(); });
-      document.body.appendChild(menu);
-      pill.setAttribute("aria-expanded", "true");
-
-      if (loaded){
-        renderMenu(lastNodes);
-      } else if (loading){
-        menu.appendChild(skeleton());
-        positionMenu();
-      } else {
-        menu.appendChild(skeleton());
-        positionMenu();
-        loadNodes();
-      }
-
-      // Keyboard handler kept in lockstep with the workstream-tab dropdown
-      // in turnstone/ui/static/app.js (search for _tabDropdownCloseHandler).
-      // If you change the keys here, change them there.  The only intentional
-      // divergence is the :not([aria-disabled='true']) filter — the picker
-      // skips disabled rows (current + unreachable) during arrow-key cycling.
-      closeHandler = function(e){
-        if (e.type === "keydown"){
-          if (e.key === "Escape"){
-            e.preventDefault();
-            closeMenu();
-            pill.focus();
-          } else if (e.key === "Tab"){
-            // Per ARIA APG menu pattern: Tab closes the menu AND moves
-            // focus to the next focusable element.  Don't preventDefault —
-            // let the browser do its native Tab traversal.
-            closeMenu();
-          } else if (e.key === "ArrowDown" || e.key === "ArrowUp"
-                  || e.key === "Home" || e.key === "End"){
-            e.preventDefault();
-            if (!menu) return;
-            var btns = Array.from(
-              menu.querySelectorAll(".ws-tab-dropdown-item:not([aria-disabled='true'])")
-            );
-            if (!btns.length) return;
-            var idx = btns.indexOf(document.activeElement);
-            if (e.key === "ArrowDown") btns[(idx + 1) % btns.length].focus();
-            // idx <= 0 covers both "first item" (wrap to last) and "no
-            // current focus" (idx === -1, which would otherwise yield N-2
-            // via the modulo).  Same shape worth backporting to app.js.
-            else if (e.key === "ArrowUp") btns[idx <= 0 ? btns.length - 1 : idx - 1].focus();
-            else if (e.key === "Home") btns[0].focus();
-            else if (e.key === "End") btns[btns.length - 1].focus();
-          }
-        } else if (e.type === "mousedown"
-                && menu && !menu.contains(e.target)
-                && e.target !== pill && !pill.contains(e.target)){
-          closeMenu();
-        }
-      };
-
-      // Defer listener wiring + initial focus so the click that opened
-      // the menu doesn't immediately trigger the mousedown-close path.
-      var activeMenu = menu;
-      var activeHandler = closeHandler;
-      setTimeout(function(){
-        if (menu !== activeMenu || !activeHandler) return;
-        document.addEventListener("mousedown", activeHandler);
-        document.addEventListener("keydown", activeHandler);
-        var first = activeMenu.querySelector(
-          ".ws-tab-dropdown-item:not([aria-disabled='true'])"
-        );
-        if (first) first.focus();
-      }, 0);
-    }
-
-    function positionMenu(){
-      if (!menu) return;
-      var pr = pill.getBoundingClientRect();
-      var mr = menu.getBoundingClientRect();
-      var mx = pr.left;
-      var my = pr.bottom + 4;
-      if (my + mr.height > window.innerHeight) my = pr.top - mr.height - 4;
-      if (mx + mr.width > window.innerWidth) mx = window.innerWidth - mr.width - 4;
-      if (mx < 4) mx = 4;
-      menu.style.left = mx + "px";
-      menu.style.top = my + "px";
-    }
-
-    function skeleton(){
-      var box = el("div", "console-node-skeleton");
-      box.setAttribute("role", "status");
-      box.setAttribute("aria-label", "Loading nodes");
-      // Three rows: roughly the typical small-cluster size.  CSS fades
-      // opacity per :nth-child (1.0 / 0.7 / 0.5) — adding a fourth would
-      // need a fourth opacity stop to avoid visual repetition.
-      for (var i = 0; i < 3; i++) box.appendChild(el("div", "console-node-skeleton-row"));
-      return box;
-    }
-
-    function loadNodes(){
-      loading = true;
-      // Saved original fetch \u2014 the prefix shim above would otherwise
-      // rewrite this to /node/{id}/v1/api/cluster/nodes, which the node
-      // doesn't serve (it's a console-only endpoint mounted at /v1).
-      // limit=1000 requests the collector's hard maximum in one round-trip;
-      // beyond 1000 nodes the picker UI is no longer the right shape (it'd
-      // need a search box) so we don't try to paginate.
-      _oF.call(window, "/v1/api/cluster/nodes?limit=1000", { credentials: "same-origin" })
-        .then(function(r){ if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-        .then(function(data){
-          loaded = true; loading = false;
-          lastNodes = Array.isArray(data && data.nodes) ? data.nodes : [];
-          if (menu) renderMenu(lastNodes);
-        })
-        .catch(function(){
-          loading = false;
-          if (menu) renderError();
-        });
-    }
-
-    function renderError(){
-      var status = el("div", "console-node-menu-status", "Failed to load nodes");
-      var retry = document.createElement("button");
-      retry.type = "button";
-      retry.className = "ws-tab-dropdown-item console-node-menu-item";
-      retry.setAttribute("role", "menuitem");
-      retry.setAttribute("tabindex", "-1");
-      retry.appendChild(el("span", "ws-tab-dropdown-label", "Retry"));
-      retry.addEventListener("click", function(e){
-        e.stopPropagation();
-        loaded = false;
-        if (menu){ menu.replaceChildren(skeleton()); positionMenu(); }
-        loadNodes();
-      });
-      menu.replaceChildren(status, retry);
-      positionMenu();
-      setTimeout(function(){ retry.focus(); }, 0);
-    }
-
-    function buildBackItem(){
-      var back = document.createElement("a");
-      back.href = "/";
-      back.className = "ws-tab-dropdown-item console-node-menu-item console-node-menu-back";
-      back.setAttribute("role", "menuitem");
-      back.setAttribute("tabindex", "-1");
-      back.setAttribute("aria-label", "Back to console");
-      back.appendChild(el("span", "console-node-menu-arrow", "\u2190"));
-      back.appendChild(el("span", "ws-tab-dropdown-label", "Console"));
-      return back;
-    }
-
-    function buildNodeItem(n){
-      var nid = n.node_id || "";
-      if (!nid) return null;
-      var isCurrent = nid === _nodeId;
-      var reachable = n.reachable !== false;
-      var hStatus = (n.health && n.health.status) || "";
-      var status = !reachable ? "unreachable"
-                  : (hStatus && hStatus !== "ok" ? "degraded" : "healthy");
-      var dotMod = status === "healthy" ? "" : status;
-      var wsTotal = n.ws_total != null ? n.ws_total : 0;
-      // Current + unreachable rows are non-interactive: rendered as <div>
-      // with aria-disabled so the keyboard-nav filter skips them and
-      // mouse clicks land on dead text.  A clickable <a> for an
-      // unreachable node would route the user to a 502 page.
-      var nonInteractive = isCurrent || !reachable;
-
-      var item;
-      if (nonInteractive){
-        item = document.createElement("div");
-      } else {
-        item = document.createElement("a");
-        item.href = "/node/" + encodeURIComponent(nid) + "/";
-      }
-      item.className = "ws-tab-dropdown-item console-node-menu-item"
-                      + (isCurrent ? " is-current" : "")
-                      + (!reachable && !isCurrent ? " is-unreachable" : "");
-      item.setAttribute("role", "menuitem");
-      item.setAttribute("tabindex", "-1");
-      if (isCurrent) item.setAttribute("aria-current", "true");
-      if (nonInteractive) item.setAttribute("aria-disabled", "true");
-      item.setAttribute(
-        "aria-label",
-        nid + ", " + wsTotal + " workstream" + (wsTotal === 1 ? "" : "s")
-            + ", " + status + (isCurrent ? ", current node" : "")
-      );
-
-      var dot = el("span",
-        "console-node-menu-item-dot"
-        + (dotMod ? " console-node-menu-item-dot--" + dotMod : ""));
-      dot.setAttribute("aria-hidden", "true");
-      item.appendChild(dot);
-
-      item.appendChild(el("span", "ws-tab-dropdown-label console-node-menu-item-id", nid));
-
-      // Meta carries ws-count + status text \u2014 the text suffix doubles as
-      // a colorblind-safe encoding of the dot color.  aria-hidden because
-      // the menuitem aria-label already says it.
-      var metaText = wsTotal + " ws" + (status !== "healthy" ? " \u00b7 " + status : "");
-      var meta = el("span", "ws-tab-dropdown-key", metaText);
-      meta.setAttribute("aria-hidden", "true");
-      item.appendChild(meta);
-
-      if (isCurrent){
-        var check = el("span", "console-node-menu-item-check", "\u2713");
-        check.setAttribute("aria-hidden", "true");
-        item.appendChild(check);
-      }
-      return item;
-    }
-
-    function renderMenu(nodes){
-      var children = [buildBackItem()];
-
-      var nodeItems = [];
-      nodes.forEach(function(n){
-        var it = buildNodeItem(n);
-        if (it) nodeItems.push(it);
-      });
-
-      if (nodeItems.length){
-        var sep = el("div", "ws-tab-dropdown-sep");
-        sep.setAttribute("role", "separator");
-        children.push(sep);
-        children = children.concat(nodeItems);
-      }
-
-      menu.replaceChildren(...children);
-      positionMenu();
-
-      // First-open path: openMenu()'s deferred focus hook ran before the
-      // async fetch resolved, so it found only the skeleton and left
-      // focus on the pill.  If focus is still on the pill (i.e. the user
-      // didn't navigate away while the skeleton was up), grab it now.
-      if (document.activeElement === pill){
-        var first = menu.querySelector(
-          ".ws-tab-dropdown-item:not([aria-disabled='true'])"
-        );
-        if (first) first.focus();
-      }
-    }
-
-    pill.addEventListener("click", function(e){
+  // Repoint the rail brand at the console.  Only proxied pages get this shim,
+  // so a standalone server keeps shell.js's showHome().  The node's own
+  // dashboard stays reachable as the non-closable first tab.
+  function wireBrandHome(){
+    var brand = document.querySelector(".rail-brand .brand-home");
+    if (!brand) return;
+    brand.setAttribute("aria-label", "Back to console");
+    brand.setAttribute("title", "Back to console");
+    var sub = brand.querySelector(".brand-sub");
+    if (sub) sub.textContent = "← console";
+    // Capture at the document so this runs during the capture walk, before
+    // any listener on the button itself; stopPropagation() then keeps
+    // shell.js's showHome() bubble listener from ever being reached.
+    document.addEventListener("click", function(e){
+      if (!brand.contains(e.target)) return;
+      e.preventDefault();
       e.stopPropagation();
-      if (menu) closeMenu(); else openMenu();
-    });
+      window.location.href = "/";
+    }, true);
   }
 
+  // shell.js builds the rail synchronously in mountShell (before its first
+  // await), and deferred modules run before DOMContentLoaded — so
+  // .brand-home exists by the time this fires.
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", buildPicker);
+    document.addEventListener("DOMContentLoaded", wireBrandHome);
   } else {
-    buildPicker();
+    wireBrandHome();
   }
 })();
 """
 
-# Inline <style> injected into proxied server-UI pages.  The dropdown
-# panel itself reuses .ws-tab-dropdown* (defined in ui/static/style.css,
-# which the proxied page already loads) for animation, shadow, theme
-# override, and item layout.  This sheet adds:
-#   - the trigger pill (no analogue exists in the server UI),
-#   - the inline health-dot in menu items (mirrors --green / --accent /
-#     --red from the cluster-overview node table \u2014 see
-#     console/static/style.css:535-549),
-#   - the "you are here" tint + cursor:default for the current node row,
-#   - a 3-row pulse skeleton for the loading state.
-_CONSOLE_PROXY_STYLE = (
-    "<style>"
-    # --- Trigger pill \u2014 sits at the start of #ui-header (.appbar).
-    # Height 24px passes WCAG 2.5.8 (24px min target) and harmonises
-    # with .btn (28px) and .appbar-back (~20px) without looking stunted.
-    # max-width caps the pill against pathologically long node ids
-    # (validated up to 256 chars upstream); the id span ellipsizes
-    # inside.  min-width:0 lets it shrink under appbar pressure.
-    ".console-node-pill{display:inline-flex;align-items:center;gap:6px;"
-    "height:24px;padding:0 10px;max-width:240px;min-width:0;"
-    "font-family:var(--font-mono);font-size:12px;color:var(--fg-dim);"
-    "background:transparent;border:1px solid var(--border-strong);"
-    "border-radius:var(--radius-sm);cursor:pointer;line-height:1;"
-    "transition:background .12s,color .12s}"
-    ".console-node-pill:hover{background:var(--bg-highlight);color:var(--fg)}"
-    '.console-node-pill[aria-expanded="true"]{background:var(--bg-highlight);'
-    "color:var(--fg);border-color:var(--accent-dim)}"
-    ".console-node-pill:focus-visible{outline:2px solid var(--accent);"
-    "outline-offset:2px}"
-    ".console-node-pill-dot{width:6px;height:6px;border-radius:50%;"
-    "background:var(--green);box-shadow:0 0 4px var(--green-glow);"
-    "flex-shrink:0}"
-    ".console-node-pill-id{font-weight:500;overflow:hidden;"
-    "text-overflow:ellipsis;white-space:nowrap;min-width:0}"
-    ".console-node-pill-caret{font-size:10px;color:var(--fg-dim);opacity:.7;"
-    "display:inline-block;transition:transform .12s}"
-    '.console-node-pill[aria-expanded="true"] .console-node-pill-caret'
-    "{transform:rotate(180deg)}"
-    # --- Menu shell uses .ws-tab-dropdown directly; no CSS needed here.
-    # Constrain the picker's width so node ids + meta have room.
-    ".console-node-menu{min-width:240px;max-width:360px}"
-    # --- Menu items reuse .ws-tab-dropdown-item \u2014 we only override
-    # font (mono, for hostname-like ids) and add the dot column.
-    ".console-node-menu-item{font-family:var(--font-mono);font-size:12px;"
-    "padding:6px 12px;gap:8px;color:var(--fg-dim);text-decoration:none}"
-    # Current row: keep the accent-tint visible.  The shared
-    # .ws-tab-dropdown-item[aria-disabled="true"] rule applies opacity:.55
-    # which would otherwise wash out the "you are here" tint \u2014 restore
-    # full opacity here.  Same restore for the unreachable row's red dot
-    # so its color signal stays legible against the dim row background.
-    ".console-node-menu-item.is-current{background:var(--accent-dim);"
-    "color:var(--fg);cursor:default;opacity:1}"
-    ".console-node-menu-item.is-current:hover{background:var(--accent-dim);"
-    "color:var(--fg)}"
-    # Unreachable row: dim the text but leave the dot at full saturation
-    # so the red signal reads against the dim row.  cursor:not-allowed
-    # comes from the shared aria-disabled rule.
-    ".console-node-menu-item.is-unreachable{color:var(--fg-dim)}"
-    ".console-node-menu-item.is-unreachable .console-node-menu-item-dot{opacity:1}"
-    ".console-node-menu-back{color:var(--accent)}"
-    ".console-node-menu-back:hover{color:var(--accent)}"
-    ".console-node-menu-arrow{font-family:var(--font-mono);font-size:13px}"
-    # Health dots in menu items \u2014 match cluster-overview canonical colors:
-    #   reachable + ok      \u2192 --green  (style.css:539)
-    #   reachable + !ok     \u2192 --accent (style.css:548  \u2014 was --yellow)
-    #   unreachable         \u2192 --red    (style.css:544)
-    ".console-node-menu-item-dot{width:6px;height:6px;border-radius:50%;"
-    "flex-shrink:0;background:var(--green);box-shadow:0 0 4px var(--green-glow)}"
-    ".console-node-menu-item-dot--unreachable{background:var(--red);"
-    "box-shadow:0 0 4px var(--red-glow)}"
-    ".console-node-menu-item-dot--degraded{background:var(--accent);"
-    "box-shadow:0 0 4px var(--accent-glow-strong)}"
-    ".console-node-menu-item-id{flex:1}"
-    ".console-node-menu-item-check{color:var(--accent);font-size:11px}"
-    # --- Loading state: 3-row pulsing skeleton.  Reuses --border-strong
-    # for the row tint and a dedicated keyframe so we can guard it under
-    # prefers-reduced-motion in step.
-    ".console-node-skeleton{padding:6px 0}"
-    ".console-node-skeleton-row{height:14px;margin:6px 12px;"
-    "background:var(--border-strong);border-radius:var(--radius-sm);"
-    "animation:console-node-skel-pulse 1.4s ease-in-out infinite}"
-    ".console-node-skeleton-row:nth-child(2){opacity:.7;animation-delay:.15s}"
-    ".console-node-skeleton-row:nth-child(3){opacity:.5;animation-delay:.3s}"
-    "@keyframes console-node-skel-pulse{"
-    "0%,100%{opacity:.4}50%{opacity:.8}}"
-    "@media (prefers-reduced-motion:reduce){"
-    ".console-node-skeleton-row{animation:none}}"
-    # --- Status text fallback (only used by the error path now).
-    ".console-node-menu-status{padding:8px 12px;font-family:var(--font-mono);"
-    "font-size:11px;color:var(--fg-dim);text-align:center}"
-    "</style>"
-)
-
-
 _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
 _VALID_WS_ID_RE = re.compile(r"^[a-f0-9]{1,64}$")
+
+# Client timeout for the REST proxy pool (BOTH constructions: startup and
+# the mTLS re-create).  Node endpoints that answer degraded-but-in-time
+# responses size their backstops strictly UNDER this bound — e.g. the
+# quick-command ``running`` answer (turnstone/server.py
+# _COMMAND_RESPONSE_BACKSTOP_S); a test pins the inequality.  The SSE
+# proxy client's granular Timeout is a separate contract.
+_PROXY_CLIENT_TIMEOUT_S = 30
 
 _PROXY_JWT_EXPIRY_SECONDS = 300  # 5 min — ample for any request round-trip
 
@@ -641,6 +293,13 @@ def _bounded_body_preview(text: str | bytes, cap: int = 200) -> str:
     if isinstance(text, bytes):
         text = text.decode("utf-8", "replace")
     return _CONTROL_CHAR_RE.sub(" ", text)[:cap]
+
+
+def _dispatch_failed(node_id: str) -> JSONResponse:
+    """The sanitized 502 the cluster-create proxy returns for every masked node
+    outcome (network failure, unparseable 2xx body, and any non-require_project
+    node status). One wording, one status — each caller keeps its own distinct log."""
+    return JSONResponse({"error": f"Dispatch to node {node_id} failed"}, status_code=502)
 
 
 def _proxy_auth_headers(request: Request) -> dict[str, str]:
@@ -2196,18 +1855,81 @@ async def create_workstream(request: Request) -> JSONResponse:
             )
         else:
             resp = await client.post(node_url, json=ws_body, headers=headers)
-        resp.raise_for_status()
     except httpx.HTTPError as exc:
         log.warning("Workstream dispatch to %s failed: %s", node_id, exc)
-        return JSONResponse({"error": f"Dispatch to node {node_id} failed"}, status_code=502)
+        return _dispatch_failed(node_id)
 
-    return JSONResponse(
-        {
-            "status": "ok",
-            "correlation_id": resp.json().get("ws_id", ""),
-            "target_node": node_id,
-        }
+    # The node is the authoritative require_project gate. Surface ONLY its
+    # coded require_project 400 to the operator; mask every OTHER node outcome
+    # as an opaque 502. Rationale (do not "simplify" by re-emitting the node
+    # status/body generically):
+    #   * a node 401 re-emitted here trips authFetch's reactive refresh +
+    #     force-logout, dumping a VALID operator to the login overlay and
+    #     double-sending the (non-idempotent) create;
+    #   * a node 429 re-emitted here trips authFetch's auto-retry, minting a
+    #     DUPLICATE workstream;
+    #   * any non-require_project node body may carry internal detail
+    #     ("cannot fork <id>: <persona ValueError>", skill/persona/path text)
+    #     that would land in the operator's browser DOM.
+    # The discriminator is an EXACT code match: coded-but-different bodies
+    # (too_many/too_large/upload) and every un-coded 400 mask to 502. The
+    # actionable attach-denied 403 and factory-misconfig 503 are also masked
+    # to 502 — a deliberate leak boundary; do NOT surface 403/503 here without
+    # re-checking the leak. Branch on the explicit success range (not
+    # raise_for_status) so a future httpx that lets a 3xx through still cannot
+    # reach the 2xx json parse. Guard BOTH body reads (a 204 / non-JSON 2xx
+    # would otherwise raise a JSONDecodeError → console 500 → operator retry →
+    # orphan/duplicate ws).
+    try:
+        _raw = resp.json()
+        node_body = _raw if isinstance(_raw, dict) else None
+    except Exception:
+        # Broad by design at this console->node proxy boundary: ANY parse failure
+        # (a 204 with no body, an intermediary's HTML, a truncated body) must fall
+        # through to the 502 mask below, never propagate. Deliberately wider than
+        # the codebase's narrow (ValueError, JSONDecodeError) json-guard.
+        node_body = None
+
+    if 200 <= resp.status_code < 300:
+        if node_body is None:
+            log.warning(
+                "Workstream dispatch to %s: unparseable %s success body: %s",
+                node_id,
+                resp.status_code,
+                _bounded_body_preview(resp.content),
+            )
+            return _dispatch_failed(node_id)
+        return JSONResponse(
+            {
+                "status": "ok",
+                "correlation_id": node_body.get("ws_id", ""),
+                "target_node": node_id,
+            }
+        )
+
+    from turnstone.core.auth import REQUIRE_PROJECT_CODE, REQUIRE_PROJECT_ERROR
+
+    if (
+        resp.status_code == 400
+        and node_body is not None
+        and node_body.get("code") == REQUIRE_PROJECT_CODE
+    ):
+        # Surface OUR canonical wording, not the node's echoed `error` string: a
+        # version-skewed or misbehaving node must not control the operator-facing
+        # text, and this keeps the message identical across every refusal cause.
+        log.info("Workstream dispatch to %s refused: require_project", node_id)
+        return JSONResponse(
+            {"error": REQUIRE_PROJECT_ERROR, "code": REQUIRE_PROJECT_CODE},
+            status_code=400,
+        )
+
+    log.warning(
+        "Workstream dispatch to %s failed: node status %s: %s",
+        node_id,
+        resp.status_code,
+        _bounded_body_preview(resp.content),
     )
+    return _dispatch_failed(node_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2964,16 +2686,12 @@ async def proxy_index(request: Request) -> Response:
         page = page.replace('src="/static/', f'src="{prefix}/static/')
         page = page.replace('href="/shared/', f'href="{prefix}/shared/')
         page = page.replace('src="/shared/', f'src="{prefix}/shared/')
-        # Inject the proxy shim (prefix rewriting + node-picker) after <body>.
-        # The picker self-attaches to #ui-header on DOMContentLoaded; the
-        # banner that used to live above the appbar is gone.  node_id is
-        # validated against _VALID_NODE_ID upstream, so json.dumps is the
-        # only escaping the JS literal needs.
-        shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix)).replace(
-            '"NODE_ID_PLACEHOLDER"', json.dumps(node_id)
-        )
-        shim = "<script>" + shim_js + "</script>"
-        page = page.replace("<body>", "<body>" + _CONSOLE_PROXY_STYLE + shim, 1)
+        # Inject the proxy shim (prefix rewriting + back-to-console) after
+        # <body>.  prefix is built from a node_id already validated against
+        # _VALID_NODE_ID, so json.dumps is the only escaping the JS literal
+        # needs.
+        shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
+        page = page.replace("<body>", "<body><script>" + shim_js + "</script>", 1)
         html_resp = HTMLResponse(page)
         html_resp.headers["Cache-Control"] = "no-cache"
         return html_resp
@@ -3886,7 +3604,7 @@ def _audit_coordinator_create(
     )
 
 
-def _coord_spawn_metrics(_request: Request, ui: Any) -> None:
+def _coord_spawn_metrics(ui: Any) -> None:
     """Per-spawn counter writes for coord — mirrors interactive's pattern.
 
     Wired onto :attr:`SessionEndpointConfig.spawn_metrics`. Increments
@@ -4313,21 +4031,6 @@ async def _fanout_on_children(
     return ok, failed, skipped
 
 
-async def _require_json_object(request: Request) -> dict[str, Any] | JSONResponse:
-    """Parse the request body and require a JSON object.
-
-    ``read_json_or_400`` only validates that the body parses as JSON,
-    not that it's an object.  A ``null``/list/scalar body otherwise
-    reaches ``body.get(...)`` and raises ``AttributeError`` → 500.
-    """
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    if not isinstance(body, dict):
-        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
-    return body
-
-
 async def _resolve_coord_session(
     request: Request,
     *,
@@ -4430,7 +4133,7 @@ async def coordinator_trust(request: Request) -> JSONResponse:
         return resolved
     session, storage, user_id, ws_id = resolved
 
-    body = await _require_json_object(request)
+    body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
     raw_send = body.get("send")
@@ -4457,7 +4160,7 @@ async def coordinator_restrict(request: Request) -> JSONResponse:
         return resolved
     session, storage, user_id, ws_id = resolved
 
-    body = await _require_json_object(request)
+    body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
     raw_revoke = body.get("revoke")
@@ -4592,7 +4295,7 @@ async def coordinator_close_all_children(request: Request) -> JSONResponse:
     del coord_mgr  # children_snapshot moved to the adapter
     coord_adapter = getattr(request.app.state, "coord_adapter", None)
 
-    body = await _require_json_object(request)
+    body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
     raw_reason = body.get("reason", "")
@@ -4674,7 +4377,81 @@ async def coordinator_tasks(request: Request) -> JSONResponse:
         return err404
 
     envelope, _corrupt = await asyncio.to_thread(load_task_envelope, storage, ws_id)
+    envelope = _sanitize_task_envelope_for_display(envelope)
     return JSONResponse(envelope)
+
+
+def _sanitize_task_envelope_for_display(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Sanitise the operator-facing copy of a task envelope.
+
+    ``title`` and ``note`` are model-authored free text and this response
+    feeds the operator's tasks pane, so a bidi override or zero-width run
+    could make the pane display an ask in an order different from the one
+    stored — on a ``needs_user`` row, the one the operator acts on.
+
+    Sanitising happens at each operator-facing render (here, the nudge
+    card's producer, the approval preview) rather than at the write:
+    storing the sanitised form would rewrite the model's planning text
+    under it, which is the mutation the reject-don't-truncate rule
+    forbids.  Storage stays verbatim, so the model reads back what it
+    sent through ``tasks(action='list')``.
+
+    ``sanitize_display`` — not ``sanitize_name`` — is the sanitiser on
+    this path, so what it removes is exactly the invisible class:
+    control chars (including newlines, which would ragged the pane's
+    rows), bidi overrides, zero-width runs and tag chars.  Angle
+    brackets are KEPT here, because this response IS the operator's view
+    of storage and deleting them turned a stored "cut p99 latency to
+    <200ms" into "...to 200ms" — the constraint inverted on the pane
+    while ``tasks(action='list')`` showed the model the original.  The
+    model-facing nudge body keeps the bracket-deleting sanitiser; see
+    ``metacognition.sanitize_display``.
+
+    Ragged-row coercion goes through ``metacognition.field_str`` — the
+    same single coercion point the nudge card's producer uses — so the
+    two operator-facing surfaces cannot disagree on a ragged row (the
+    previous ``str(x or "")`` mapped ``0``/``False`` to ``""`` while the
+    card rendered ``"0"``).  ``status`` is coerced too, which keeps a
+    falsy-but-real value (``0``/``False``) out of the FE's
+    ``task.status || "pending"`` fallback — but ``field_str(None)`` is
+    the falsy ``""``, so a null/absent status still hits that fallback:
+    the row renders a ``pending`` chip on the pane while the idle-tasks
+    nudge (whose ``_open_tasks`` coerces the same way and drops the
+    row) is blind to it.  Accepted ragged-row residual, same
+    hand-edited-envelope class as ``created``/``updated`` below;
+    server-side normalisation is deferred.  ``id``/``child_ws_id`` are
+    coerced for contract compliance (``CoordinatorTaskInfo`` publishes
+    them as required strings while this handler returns unvalidated
+    JSON).
+    ``child_ws_id`` is additionally SANITISED where ``id`` is not: the
+    id is server-minted (``tsk_`` + hex), while ``child_ws_id`` is
+    whatever the model passed, so it carries the same steering risk as
+    ``title``/``note`` and renders on the same pane.
+    ``created``/``updated`` stay uncoerced — accepted residual under the
+    same contract caveat.
+
+    Rows that are not dicts pass through untouched — the envelope is a
+    JSON blob and ``load_task_envelope`` shape-checks only its top level.
+    """
+    rows = envelope.get("tasks")
+    if not isinstance(rows, list):
+        return envelope
+    clean: list[Any] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            clean.append(row)
+            continue
+        row = {
+            **row,
+            "id": field_str(row.get("id")),
+            "title": sanitize_display(field_str(row.get("title"))),
+            "status": field_str(row.get("status")),
+            "child_ws_id": sanitize_display(field_str(row.get("child_ws_id"))),
+        }
+        if "note" in row:
+            row["note"] = sanitize_display(field_str(row.get("note")))
+        clean.append(row)
+    return {**envelope, "tasks": clean}
 
 
 # ---------------------------------------------------------------------------
@@ -5042,6 +4819,9 @@ def _bootstrap_coord_subsystem(
         config_store=config_store,
         node_id="console",
         coord_client_factory=_coord_client_factory,
+        # Getter, not the instance: the console MCP ensure-helper can
+        # (re)construct the manager after this bootstrap (#725).
+        mcp_client_getter=lambda: getattr(app.state, "mcp_client", None),
     )
     coord_adapter = CoordinatorAdapter(
         collector=app.state.collector,
@@ -5078,8 +4858,10 @@ def _bootstrap_coord_subsystem(
     # ``app.state._idle_nudge_watchers``.
     try:
         coord_state_writer.start()
-        # Coord-side observer: when a coord goes IDLE with active
-        # children still running, enqueues an idle_children nudge.
+        # Coord-side observer: enqueues idle_children / idle_tasks
+        # nudges when a coord goes IDLE with unfinished work — children
+        # still running, open tasks still held, or both (the two fire
+        # independently and may co-deliver).
         # MUST register BEFORE the IdleNudgeWatcher so subscriber-fire
         # order on the same IDLE event has the observer enqueueing
         # first, then the watcher peeking.
@@ -5175,6 +4957,40 @@ def _bootstrap_coord_subsystem(
     )
 
 
+def _record_coord_key_refusal(app_state: Any, key_err: str) -> None:
+    """Record a dynamic-auth key refusal from a coordinator install/swap path.
+
+    Shared by the lifespan bootstrap, the CRUD-triggered runtime bootstrap
+    and :func:`_refresh_coord_registry` so the three cannot drift: an ERROR
+    log (the observable while the coordinator is live) plus the
+    ``coord_registry_error`` banner (rendered by the 503 path while down).
+    """
+    log.error("console.model_auth_key_missing: %s", key_err)
+    app_state.coord_registry_error = key_err
+
+
+def _refuse_keyless_registry(app_state: Any, registry: Any) -> bool:
+    """Refuse a freshly-loaded registry whose dynamic aliases lack the key.
+
+    The shared refusal step of both bootstrap twins. Derives the error
+    against the REGISTRY, not raw rows — config.toml overrides DB.
+    Returns True when the registry was refused (the caller must not
+    install it).
+    """
+    key_err = dynamic_auth_key_error(registry.models, app_state)
+    if not key_err:
+        return False
+    _record_coord_key_refusal(app_state, key_err)
+    # Defensive teardown of the throwaway, mirroring
+    # _refresh_coord_registry's finally: iterates empty dicts today, kept
+    # against the day the loader grows eager client init.
+    try:
+        registry.shutdown()
+    except Exception:
+        log.warning("console.coord_bootstrap_shutdown_failed", exc_info=True)
+    return True
+
+
 def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_store: Any) -> None:
     """Synchronous lifespan-startup entry point: load the model
     registry from storage, run :func:`_bootstrap_coord_subsystem` on
@@ -5199,6 +5015,12 @@ def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_sto
             # operator can recover at runtime by adding a model in the
             # admin panel (see :func:`_maybe_bootstrap_coord_subsystem`).
             app.state.coord_registry_error = str(exc)
+            return
+        # Console-side twin of initialize_mcp_crypto_state's dynamic-auth key
+        # requirement: that guard runs before this registry exists and can
+        # only see the MCP half. Non-fatal by design — the subsystem reports
+        # through coord_registry_error rather than killing the admin surface.
+        if _refuse_keyless_registry(app.state, coord_registry):
             return
         _bootstrap_coord_subsystem(app, storage, config_store, coord_registry)
     except Exception:
@@ -5321,7 +5143,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     _proxy_verify: Any = _proxy_ssl if _proxy_ssl else True
 
     app.state.proxy_client = httpx.AsyncClient(
-        timeout=30,
+        timeout=_PROXY_CLIENT_TIMEOUT_S,
         limits=httpx.Limits(
             max_connections=fan_out + 50,
             max_keepalive_connections=min(fan_out // 4, 100),
@@ -5463,7 +5285,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 await app.state.proxy_client.aclose()
                 await app.state.proxy_sse_client.aclose()
                 app.state.proxy_client = httpx.AsyncClient(
-                    timeout=30,
+                    timeout=_PROXY_CLIENT_TIMEOUT_S,
                     limits=httpx.Limits(
                         max_connections=app.state.fan_out_limit + 50,
                         max_keepalive_connections=min(app.state.fan_out_limit // 4, 100),
@@ -5499,6 +5321,34 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         # startup.  Mirrors the runtime CRUD-triggered path's
         # ``asyncio.to_thread`` invocation.
         await asyncio.to_thread(_load_and_bootstrap_coord_subsystem, app, storage, config_store)
+
+    # Console-hosted MCP client manager for coordinator workstreams
+    # (#725) — node-boot parity: same constructor, same catalog
+    # resolution (DB → mcp.config_path → config.toml), same bounded
+    # inline connect wait, None when nothing is configured.  Later
+    # convergence rides the reload fan-out (_ensure_console_mcp_client).
+    app.state.mcp_client = None
+    if storage and config_store:
+        from turnstone.core.mcp_client import create_mcp_client
+
+        try:
+            app.state.mcp_client = await asyncio.to_thread(
+                create_mcp_client,
+                config_store.get("mcp.config_path") or None,
+                storage=storage,
+                required=bool(
+                    app.state.coord_registry and app.state.coord_registry.has_dynamic_auth()
+                ),
+            )
+            if app.state.mcp_client is not None:
+                app.state.mcp_client.set_storage(storage)
+                app.state.mcp_client.set_app_state(app.state)
+        except Exception:
+            log.warning(
+                "console MCP manager boot failed — coordinators get no MCP "
+                "until the next admin MCP write or reload",
+                exc_info=True,
+            )
 
     yield
     # Shutdown
@@ -5554,6 +5404,20 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         log.debug("console.coord_ui_refs_reset_failed", exc_info=True)
     await app.state.proxy_sse_client.aclose()
     await app.state.proxy_client.aclose()
+    # Console-hosted MCP manager: coordinator sessions stay LOADED at
+    # console shutdown (there is no session-close loop here, unlike the
+    # node), so their MCP listeners are intentionally still registered
+    # when the manager dies — acceptable because the process is exiting
+    # and the manager's listener fan-out swallows per-callback
+    # exceptions.  shutdown() blocks (mcp-loop join + transport
+    # teardown), so offload like coord_state_writer above.  Ordered
+    # before close_mcp_oauth_state per LIFO teardown.
+    _console_mcp_shutdown = getattr(app.state, "mcp_client", None)
+    if _console_mcp_shutdown is not None:
+        try:
+            await asyncio.to_thread(_console_mcp_shutdown.shutdown)
+        except Exception:
+            log.debug("console.mcp_client_shutdown_failed", exc_info=True)
     # Close in reverse order of initialization (mcp_oauth → mcp_crypto →
     # oidc) per LIFO teardown discipline.
     from turnstone.core.mcp_oauth import close_mcp_oauth_state
@@ -5977,10 +5841,57 @@ async def admin_list_oidc_identities(request: Request) -> JSONResponse:
     return JSONResponse({"oidc_identities": identities})
 
 
+async def _invalidate_model_auth_memos_cluster(request: Request, user_id: str) -> tuple[int, int]:
+    """Best-effort eviction of one user's delegated model memo on every node."""
+    collector = getattr(request.app.state, "collector", None)
+    client = getattr(request.app.state, "proxy_client", None)
+    token_mgr = getattr(request.app.state, "proxy_token_mgr", None)
+    if collector is None or client is None or token_mgr is None:
+        return 0, 0
+
+    headers = dict(token_mgr.bearer_header)
+    nodes = collector.get_all_nodes()
+    sem = asyncio.Semaphore(_get_fan_out_limit(request))
+
+    async def _invalidate(node: dict[str, Any]) -> bool | None:
+        node_id = str(node.get("node_id") or "")
+        url = str(node.get("server_url") or "").rstrip("/")
+        if not url:
+            return None
+        try:
+            async with sem:
+                response = await client.post(
+                    f"{url}/v1/api/_internal/model-auth-cache-invalidate",
+                    headers=headers,
+                    json={"user_id": user_id},
+                    timeout=5,
+                )
+            if response.status_code == 200:
+                return True
+            log.warning(
+                "admin.oidc_identity.model_memo_invalidate_rejected user=%s node=%s status=%s",
+                user_id,
+                node_id,
+                response.status_code,
+            )
+        except Exception:
+            log.warning(
+                "admin.oidc_identity.model_memo_invalidate_failed user=%s node=%s",
+                user_id,
+                node_id,
+                exc_info=True,
+            )
+        return False
+
+    outcomes = await asyncio.gather(*(_invalidate(node) for node in nodes))
+    return outcomes.count(True), outcomes.count(False)
+
+
 async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
     """DELETE /v1/api/admin/oidc-identities?issuer=...&subject=... — unlink OIDC identity."""
     from turnstone.core.audit import record_audit
     from turnstone.core.auth import require_permission
+    from turnstone.core.mcp_oauth import MODEL_OBO_CACHE_PREFIX
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
@@ -6002,6 +5913,85 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
 
     storage.delete_oidc_identity(issuer, subject)
 
+    # #551: unlinking the identity must revoke the captured IdP refresh
+    # credential (keyed on (user_id, issuer)) AND purge the already-minted
+    # oauth_obo access-token cache rows — otherwise a deprovisioned user's
+    # scheduled/autonomous runs keep executing MCP tool calls with the still-fresh
+    # cached bearer until it expires (deleting only the credential stops FUTURE
+    # mints but not the live cache). Best-effort: a failure must not leave the
+    # identity un-deleted.
+    user_id = identity["user_id"]
+    credential_revoked = False
+    obo_cache_purged = 0
+    token_store = getattr(request.app.state, "mcp_token_store", None)
+    if token_store is not None:
+        try:
+            credential_revoked = bool(token_store.delete_oidc_credential(user_id, issuer))
+        except Exception:
+            log.warning(
+                "admin.oidc_identity.credential_revoke_failed user=%s", user_id, exc_info=True
+            )
+        try:
+            from turnstone.core.mcp_oauth import obo_server_names
+
+            obo_servers = sorted(obo_server_names(storage))
+        except Exception:
+            obo_servers = []
+            log.warning(
+                "admin.oidc_identity.obo_server_list_failed user=%s", user_id, exc_info=True
+            )
+        for server_name in obo_servers:
+            # Per-server try/except: a failure on one server must not leave the
+            # remaining servers' cached bearers un-purged for a deprovisioned user.
+            try:
+                if token_store.delete_user_token(user_id, server_name):
+                    obo_cache_purged += 1
+            except Exception:
+                log.warning(
+                    "admin.oidc_identity.obo_cache_purge_failed user=%s server=%s",
+                    user_id,
+                    server_name,
+                    exc_info=True,
+                )
+        # Model-provider OBO rows use synthetic server keys and therefore are
+        # not present in mcp_servers/obo_server_names. Purge only delegated
+        # model rows for this user; __model_app__ rows belong to the shared
+        # __app__ identity and intentionally survive user deprovisioning.
+        try:
+            metadata = token_store.list_user_token_metadata(user_id)
+        except Exception:
+            metadata = []
+            log.warning(
+                "admin.oidc_identity.model_obo_cache_list_failed user=%s",
+                user_id,
+                exc_info=True,
+            )
+        for row in metadata:
+            server_name = str(row.get("server_name") or "")
+            if not server_name.startswith(MODEL_OBO_CACHE_PREFIX):
+                continue
+            try:
+                if token_store.delete_user_token(user_id, server_name):
+                    obo_cache_purged += 1
+            except Exception:
+                log.warning(
+                    "admin.oidc_identity.model_obo_cache_purge_failed user=%s server=%s",
+                    user_id,
+                    server_name,
+                    exc_info=True,
+                )
+    # The console-hosted coordinator has its own manager/memo and is not in the
+    # node collector, so invalidate it directly as well as fanning out below.
+    mcp_client = getattr(request.app.state, "mcp_client", None)
+    if mcp_client is not None and hasattr(mcp_client, "invalidate_model_mint_memo_sync"):
+        mcp_client.invalidate_model_mint_memo_sync(
+            user_id=user_id,
+            server_prefix=MODEL_OBO_CACHE_PREFIX,
+        )
+    memo_nodes_invalidated, memo_nodes_failed = await _invalidate_model_auth_memos_cluster(
+        request, user_id
+    )
+
     audit_uid, ip = _audit_context(request)
     record_audit(
         storage,
@@ -6009,11 +5999,25 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
         "oidc_identity.delete",
         "oidc_identity",
         f"{issuer}:{subject}",
-        {"user_id": identity["user_id"]},
+        {
+            "user_id": user_id,
+            "obo_credential_revoked": credential_revoked,
+            "obo_cache_rows_purged": obo_cache_purged,
+            "model_memo_nodes_invalidated": memo_nodes_invalidated,
+            "model_memo_nodes_failed": memo_nodes_failed,
+        },
         ip,
     )
 
-    return JSONResponse({"status": "ok"})
+    return JSONResponse(
+        {
+            "status": "ok",
+            "obo_credential_revoked": credential_revoked,
+            "obo_cache_rows_purged": obo_cache_purged,
+            "model_memo_nodes_invalidated": memo_nodes_invalidated,
+            "model_memo_nodes_failed": memo_nodes_failed,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -9669,11 +9673,13 @@ async def admin_registry_install(request: Request) -> JSONResponse:
         ip,
     )
 
-    # Auto-reload nodes for one-click UX
-    await _notify_nodes_mcp_reload(request)
-
     server_row = storage.get_mcp_server(server_id)
-    return JSONResponse(_mcp_server_to_detail(_mask_mcp_secrets(server_row or {})))
+    # Auto-reload nodes for one-click UX — scheduled after the response so the
+    # install isn't blocked on cluster fan-out (see _schedule_mcp_reload).
+    return JSONResponse(
+        _mcp_server_to_detail(_mask_mcp_secrets(server_row or {})),
+        background=_schedule_mcp_reload(request),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -9682,7 +9688,7 @@ async def admin_registry_install(request: Request) -> JSONResponse:
 
 _MCP_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 _MCP_MAX_SERVERS = 200  # fallback; prefer cluster.mcp_max_servers from storage
-_MCP_AUTH_TYPES = frozenset({"none", "static", "oauth_user"})
+_MCP_AUTH_TYPES = frozenset({"none", "static", "oauth_user", "oauth_obo"})
 
 
 def _clean_oauth_text(value: Any, *, max_length: int = 512) -> str | None:
@@ -9690,15 +9696,85 @@ def _clean_oauth_text(value: Any, *, max_length: int = 512) -> str | None:
 
     Caps the input to ``max_length`` characters to bound DB row size on
     the admin.mcp write path.  Pass a larger ``max_length`` (e.g. 2048)
-    for URL fields where the default would otherwise truncate valid
-    long URLs.
+    for URL fields where the default would otherwise truncate valid long
+    URLs; model backend-auth sites (``obo_audience``/``obo_scopes``) pass
+    the REGISTRY's bound, :data:`MODEL_AUTH_TEXT_MAX_LEN`, so the console
+    never stores a length the registry load then refuses and the gate's
+    stored-side normalization truncates identically to the twins' input
+    cleaning.
     """
     if value is None:
         return None
-    text = str(value).strip()
+    # OAuth identifiers/URLs have no valid C0 controls. Removing them here
+    # (via the one shared spelling of the control class) prevents log/header
+    # ambiguity and benefits both MCP and model auth.
+    text = strip_control_characters(str(value)).strip()
     if not text:
         return None
     return text[:max_length]
+
+
+def _parse_obo_scopes_field(raw: Any, stored: Any = None) -> tuple[str | None, JSONResponse | None]:
+    """Parse a submitted ``obo_scopes`` field against the length policy.
+
+    The ONE parser both write twins use. Returns ``(value, None)`` to store
+    ``value``, ``(None, error)`` for a refused over-length submission, or
+    ``(None, None)`` — over-length but IDENTICAL to *stored* under the same
+    uncapped transform — which the update twin maps to "omit the column so
+    the server preserves the stored value". That omit-unchanged arm is what
+    keeps a DB-direct over-length row disarmable and full-form-resavable:
+    the echo of the row's own residue is not a change, and refusing it would
+    wedge the row (in particular, the pure-disable carve-out must never be
+    blocked by residue the operator is not touching).
+
+    The bound measures the CLEANED value: length policy bounds what is
+    STORED, and the stored form is the sanitized spelling — measuring the
+    raw paste would refuse input whose stored form fits (control bytes a
+    terminal paste smuggles in are stripped, never counted). ``stored=None``
+    (the create twin) has no residue to echo, so over-length always refuses.
+    """
+    full = sanitize_backend_auth_scopes(raw)
+    if len(full) <= MODEL_AUTH_TEXT_MAX_LEN:
+        return full, None
+    if stored is not None and full == sanitize_backend_auth_scopes(stored):
+        return None, None
+    return None, JSONResponse({"error": _SCOPES_TOO_LONG_ERROR}, status_code=400)
+
+
+def _purge_model_mint_cache(storage: Any, definition_id: str, alias: str) -> None:
+    """Best-effort purge of a model definition's mint-cache rows.
+
+    Deletes the definition's rows under BOTH synthetic prefixes — the
+    per-user OBO rows and the shared app-identity row — for the *alias* that
+    owned them. Sound because the keys are IDENTITY-keyed on the unique
+    alias, exactly as the MCP-server purges above key on the unique server
+    name: one owning definition per key, so a sibling definition's rows are
+    untouchable by construction. Purging a prefix the row's mode never
+    minted under is a no-op, so the helper needs no mode dispatch. The ONE
+    spelling both write twins call — update (rename / re-aim / scope
+    change) and delete — so the key build and the failure posture cannot
+    drift between them. Best-effort: the definition write is already
+    committed, and the mint-side freshness gate refuses a superseded row
+    regardless — this purge is at-rest hygiene, the gate is the serving
+    guarantee.
+    """
+    from turnstone.core.mcp_oauth import model_app_cache_server, model_obo_cache_server
+
+    if not alias:
+        return
+    # Per-prefix isolation: a failure deleting one prefix's rows must not
+    # abort the other's — the both-prefixes contract holds under partial
+    # storage failure, each miss logged on its own.
+    for server_key in (model_obo_cache_server(alias), model_app_cache_server(alias)):
+        try:
+            storage.delete_mcp_oauth_rows_by_server_name(server_key)
+        except Exception:
+            log.warning(
+                "admin.models.purge_mint_cache_failed definition_id=%s server=%s",
+                definition_id,
+                server_key,
+                exc_info=True,
+            )
 
 
 def _parse_auth_type(body: dict[str, Any]) -> tuple[str | None, JSONResponse | None]:
@@ -9714,20 +9790,23 @@ def _parse_auth_type(body: dict[str, Any]) -> tuple[str | None, JSONResponse | N
     auth_type = str(body["auth_type"]).strip()
     if auth_type not in _MCP_AUTH_TYPES:
         return None, JSONResponse(
-            {"error": "auth_type must be 'none', 'static', or 'oauth_user'"},
+            {"error": "auth_type must be 'none', 'static', 'oauth_user', or 'oauth_obo'"},
             status_code=400,
         )
     return auth_type, None
 
 
 def _enforce_oauth_user_https(auth_type: str, url: str | None) -> JSONResponse | None:
-    """Reject oauth_user MCP server URLs that aren't https (or loopback http).
+    """Reject per-user-auth MCP server URLs that aren't https (or loopback http).
 
-    Belt-and-braces with :func:`turnstone.core.mcp_client._validate_oauth_user_url`
+    Applies to both pool-backed types — ``oauth_user`` and ``oauth_obo`` —
+    since both transmit per-user bearers to the server URL. Belt-and-braces
+    with :func:`turnstone.core.mcp_client._validate_oauth_user_url`
     so a misconfigured row never persists. Returns the error response or
     ``None`` when the input is acceptable.
     """
-    if auth_type != "oauth_user":
+
+    if not is_user_scoped_auth(auth_type):
         return None
     if not url:
         return None  # presence checked elsewhere; this helper only checks scheme
@@ -9737,6 +9816,173 @@ def _enforce_oauth_user_https(auth_type: str, url: str | None) -> JSONResponse |
         _validate_oauth_user_url(url)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
+    return None
+
+
+def _obo_profile(request: Request) -> str:
+    """Deployment-level ``[oidc] obo_grant_profile`` (``""`` when OIDC absent).
+
+    One reader for the profile so the create handler, the update handler, and
+    the write-time enforcement never diverge on how they resolve it.
+    """
+    oidc_config = getattr(request.app.state, "oidc_config", None)
+    return str(getattr(oidc_config, "obo_grant_profile", "") or "")
+
+
+def _oauth_columns_to_clear(auth_type: str | None) -> dict[str, None]:
+    """OAuth columns to force-NULL for a row of *auth_type* (shared write policy).
+
+    Single source of the "which OAuth columns does this auth model use" policy,
+    consumed by both the create and update handlers so they cannot drift.
+    ``oauth_user`` uses every column (nothing cleared); ``oauth_obo`` uses
+    ``oauth_audience`` (+ ``oauth_scopes`` under rfc8693) but none of the
+    oauth_user-only columns; ``static``/``none`` use no OAuth columns at all.
+    ``oauth_client_secret_ct`` is owned by a dedicated write path and is not
+    included here. Callers that cannot persist ``oauth_as_issuer_cached`` (the
+    create path) drop that key.
+    """
+    if auth_type == "oauth_user":
+        return {}
+    if auth_type == "oauth_obo":
+        return {
+            "oauth_client_id": None,
+            "oauth_registration_mode": None,
+            "oauth_authorization_server_url": None,
+            "oauth_as_issuer_cached": None,
+        }
+    return {  # static / none
+        "oauth_client_id": None,
+        "oauth_scopes": None,
+        "oauth_audience": None,
+        "oauth_registration_mode": None,
+        "oauth_authorization_server_url": None,
+        "oauth_as_issuer_cached": None,
+    }
+
+
+def _enforce_oauth_obo_requirements(
+    request: Request,
+    auth_type: str,
+    *,
+    audience: str | None,
+    scopes: str | None,
+    check_oidc_deployment: bool = True,
+) -> JSONResponse | None:
+    """Write-time validation for ``oauth_obo`` rows (issue #551).
+
+    ``check_oidc_deployment`` splits the checks by what they guard. The
+    DEPLOYMENT-level checks (token-encryption key, OIDC configured/enabled,
+    capture opt-in, valid grant profile) reject configuring a NEW obo mint that
+    could never work — they run on create and on a flip INTO obo. They are
+    SKIPPED for a same-type edit of an existing obo server (``False``): OIDC
+    being operator-disabled is a deployment state, not a per-server one, so
+    blocking every edit — including the natural remedy of setting
+    ``enabled=false`` — would only lock the operator out (the row can still be
+    DELETEd, but not disabled). The PER-SERVER validity checks (audience
+    required; ``oauth_scopes`` rejected under the entra profile) always run so a
+    same-type edit can't leave the row itself invalid.
+
+    Rejects at the write choke point what would otherwise fail per-dispatch at
+    runtime (or worse, at the next boot):
+
+    - **No token-encryption key** → 503. An oauth_obo row persists encrypted
+      per-user mint-cache rows AND makes ``initialize_mcp_crypto_state``
+      ``SystemExit(1)`` at the next restart, so accepting one keyless plants a
+      deferred whole-cluster boot failure.
+    - **OIDC not enabled / no captured-credential source** → 400. The mint
+      redeems the user's captured IdP credential, so an install with no
+      ``[oidc]`` issuer (or OIDC operator-disabled) can NEVER mint — every tool
+      call would return ``mcp_refresh_unavailable`` ("please retry") forever, a
+      permanent misconfig dressed as a transient. Reject at write time.
+    - **Invalid ``obo_grant_profile``** → 400. A typo'd deployment profile
+      leaves the mint leg unresolved (``obo_misconfigured`` per dispatch), so
+      surface it here rather than as a runtime transient that never heals.
+    - **No ``oauth_audience``** → 400. The mint engine hard-requires the
+      downstream audience; without it every tool call fails transient and logs
+      ``obo_misconfigured``. Reject here, exactly as bad URL schemes are.
+    - **``oauth_scopes`` under the entra grant profile** → 400. Entra's ``scope``
+      is its only audience carrier (the leg pins ``<audience>/.default``), so a
+      per-server scope list is silently ignored at mint time — reject it at the
+      form instead of letting the operator believe it took effect. (The rfc8693
+      profile does use ``oauth_scopes``, so it is allowed there.)
+    """
+    if auth_type != "oauth_obo":
+        return None
+    profile = _obo_profile(request)
+    if check_oidc_deployment:
+        if getattr(request.app.state, "mcp_token_store", None) is None:
+            return JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
+        oidc_config = getattr(request.app.state, "oidc_config", None)
+        # Accept a config that is enabled OR merely transiently un-discovered
+        # (``discovery_retryable`` — the IdP was unreachable at this process's
+        # boot). OIDC is still CONFIGURED there (issuer set); reject only a
+        # genuinely absent / operator-disabled OIDC (neither flag set).
+        oidc_configured = oidc_config is not None and (
+            getattr(oidc_config, "enabled", False)
+            or getattr(oidc_config, "discovery_retryable", False)
+        )
+        if not oidc_configured:
+            return JSONResponse(
+                {
+                    "error": (
+                        "auth_type=oauth_obo requires OIDC sign-in to be configured and "
+                        "enabled (it mints per-server tokens from each user's Turnstone "
+                        "sign-in). Configure [oidc] and capture_user_credential, or use "
+                        "auth_type=oauth_user for per-server consent."
+                    )
+                },
+                status_code=400,
+            )
+        if not getattr(oidc_config, "capture_user_credential", False):
+            # The mint redeems the user's CAPTURED IdP refresh token; with capture
+            # off, login persists nothing, so every dispatch returns kind="missing"
+            # and the "sign in again" remedy can never succeed — a permanent
+            # misconfig this choke point exists to reject. (Enabling capture also
+            # requires the encryption key, checked at boot.)
+            return JSONResponse(
+                {
+                    "error": (
+                        "auth_type=oauth_obo requires [oidc] capture_user_credential=true "
+                        "so each user's sign-in credential is captured for minting; it is "
+                        "currently disabled, so this server could never obtain a token."
+                    )
+                },
+                status_code=400,
+            )
+        from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
+
+        if profile not in OBO_GRANT_PROFILES:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"[oidc] obo_grant_profile={profile!r} is not a valid grant profile "
+                        f"({', '.join(sorted(OBO_GRANT_PROFILES))}); fix the deployment "
+                        "config before configuring oauth_obo servers"
+                    )
+                },
+                status_code=400,
+            )
+    if not (audience or "").strip():
+        return JSONResponse(
+            {
+                "error": (
+                    "auth_type=oauth_obo requires oauth_audience "
+                    "(the downstream resource the access token is minted for)"
+                )
+            },
+            status_code=400,
+        )
+    if (scopes or "").strip() and profile == "entra":
+        return JSONResponse(
+            {
+                "error": (
+                    "oauth_scopes is not used by the entra grant profile "
+                    "(it mints <audience>/.default); leave it empty or switch "
+                    "the deployment to the rfc8693 profile"
+                )
+            },
+            status_code=400,
+        )
     return None
 
 
@@ -9926,7 +10172,15 @@ def _mcp_server_to_detail(
 async def _collect_mcp_status(
     request: Request,
 ) -> dict[str, dict[str, dict[str, Any]]]:
-    """Query all nodes for MCP status. Returns {node_id: {server_name: status}}."""
+    """Query all nodes — and the console's own manager — for MCP status.
+
+    Returns {node_id: {server_name: status}}.  The console's manager
+    reports under the collector's console pseudo-node id (#725): the
+    admin MCP view must show the surface coordinators actually dispatch
+    through.  Its rows carry the same read-scope projection node rows
+    get (``has_error``, no command/url/verbose error); on failure the
+    console key is omitted, matching ``_fetch``'s None contract.
+    """
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
     client: httpx.AsyncClient = request.app.state.proxy_client
@@ -9951,7 +10205,31 @@ async def _collect_mcp_status(
                 log.debug("Failed to fetch MCP status from node %s", node_id, exc_info=True)
         return node_id, None
 
-    results = await asyncio.gather(*[_fetch(n) for n in nodes])
+    async def _console() -> tuple[str, dict[str, dict[str, Any]] | None]:
+        # Class constant, not the collector instance: several callers
+        # exercise this collector with minimal stubs, and the pseudo-node
+        # key must not depend on runtime state they never provided.
+        console_id = ClusterCollector.CONSOLE_PSEUDO_NODE_ID
+        mgr = getattr(request.app.state, "mcp_client", None)
+        if mgr is None:
+            return console_id, None
+        from turnstone.core.mcp_utils import strip_server_status_for_read
+
+        # Mirrors internal_mcp_status's admin path: cross-user aggregate
+        # view scoped to the requesting admin.
+        uid = _auth_user_id(request)
+
+        def _status() -> dict[str, dict[str, Any]]:
+            all_status = mgr.get_all_server_status(uid, aggregate=True)
+            return {n: strip_server_status_for_read(s) for n, s in all_status.items()}
+
+        try:
+            return console_id, await asyncio.to_thread(_status)
+        except Exception:
+            log.debug("console MCP status read failed", exc_info=True)
+            return console_id, None
+
+    results = await asyncio.gather(*[_fetch(n) for n in nodes], _console())
     return {nid: servers for nid, servers in results if servers is not None}
 
 
@@ -9978,13 +10256,18 @@ async def admin_list_mcp_servers(request: Request) -> JSONResponse:
     # stack the DB latency on top of the fan-out latency.  Skipped
     # entirely when no row is oauth_user so static-only installs
     # exercise zero new storage queries.
-    has_oauth_user = any(s.get("auth_type") == "oauth_user" for s in servers)
+
+    # Both pool-backed types populate mcp_user_tokens (oauth_user: consents;
+    # oauth_obo: minted cache), so run the count for either — it drives the
+    # per-row pill: oauth_user's consented-users count and oauth_obo's
+    # flush-cache action (gated on count>0 in the UI).
+    has_user_scoped = any(is_user_scoped_auth(s.get("auth_type")) for s in servers)
     status_task: asyncio.Task[dict[str, dict[str, dict[str, Any]]]] = asyncio.create_task(
         _collect_mcp_status(request)
     )
     count_task: asyncio.Task[dict[str, int]] | None = (
         asyncio.create_task(asyncio.to_thread(storage.count_mcp_consented_users_grouped_by_server))
-        if has_oauth_user
+        if has_user_scoped
         else None
     )
 
@@ -10006,11 +10289,11 @@ async def admin_list_mcp_servers(request: Request) -> JSONResponse:
             status = node_servers.get(s["name"])
             if status:
                 per_node[node_id] = status
-        # Phase 9: surface the consented-users-count pill for
-        # oauth_user rows.  Aggregate was pre-computed above with a
+        # Surface the count for both pool-backed types (oauth_user consents /
+        # oauth_obo minted-token cache). Aggregate was pre-computed above with a
         # single bulk GROUP BY query; we just look up here.
         consent_count: int | None = None
-        if s.get("auth_type") == "oauth_user":
+        if is_user_scoped_auth(s.get("auth_type")):
             consent_count = consent_counts.get(s["name"], 0)
         s = _mask_mcp_secrets(s, reveal)
         result.append(_mcp_server_to_detail(s, per_node, consent_count))
@@ -10109,8 +10392,24 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     # Helper returns None when key is absent — fall back to the default.
     auth_type = auth_type_value if auth_type_value is not None else "static"
 
-    # sec-1: oauth_user must use https:// (loopback http allowed for dev).
+    # Clean the OAuth text fields ONCE — reused by both the write-time validator
+    # and the persisted ``oauth_cols`` below, so the validated and persisted
+    # values (and the 2048 max_length) can't silently diverge.
+    clean_audience = _clean_oauth_text(body.get("oauth_audience"), max_length=2048)
+    clean_scopes = _clean_oauth_text(body.get("oauth_scopes"))
+
+    # sec-1: oauth_user/oauth_obo must use https:// (loopback http allowed for dev).
     err_resp = _enforce_oauth_user_https(auth_type, str(body.get("url", "")).strip())
+    if err_resp is not None:
+        return err_resp
+
+    # #551: oauth_obo needs an encryption key + an audience at write time.
+    err_resp = _enforce_oauth_obo_requirements(
+        request,
+        auth_type,
+        audience=clean_audience,
+        scopes=clean_scopes,
+    )
     if err_resp is not None:
         return err_resp
 
@@ -10143,6 +10442,24 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     headers_dict = body.get("headers", {})
     env_dict = body.get("env", {})
 
+    # Column policy — the SAME ``_oauth_columns_to_clear`` rule the update
+    # handler applies on a flip: persist only the OAuth columns the target
+    # auth_type actually uses, so a row created as oauth_obo can't carry a
+    # client_id / registration_mode / AS-URL straight into a later oauth_user
+    # flip. ``oauth_as_issuer_cached`` (nulled by the cleared set for a
+    # non-oauth_user type) IS a valid create parameter, so it passes through
+    # to ``create_mcp_server`` as its default None.
+    oauth_cols: dict[str, Any] = {
+        "oauth_client_id": _clean_oauth_text(body.get("oauth_client_id")),
+        "oauth_scopes": clean_scopes,
+        "oauth_audience": clean_audience,
+        "oauth_registration_mode": _clean_oauth_text(body.get("oauth_registration_mode")),
+        "oauth_authorization_server_url": _clean_oauth_text(
+            body.get("oauth_authorization_server_url"), max_length=2048
+        ),
+    }
+    oauth_cols.update(_oauth_columns_to_clear(auth_type))
+
     storage.create_mcp_server(
         server_id=server_id,
         name=name,
@@ -10156,13 +10473,7 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         enabled=bool(body.get("enabled", True)),
         created_by=audit_uid,
         auth_type=auth_type,
-        oauth_client_id=_clean_oauth_text(body.get("oauth_client_id")),
-        oauth_scopes=_clean_oauth_text(body.get("oauth_scopes")),
-        oauth_audience=_clean_oauth_text(body.get("oauth_audience"), max_length=2048),
-        oauth_registration_mode=_clean_oauth_text(body.get("oauth_registration_mode")),
-        oauth_authorization_server_url=_clean_oauth_text(
-            body.get("oauth_authorization_server_url"), max_length=2048
-        ),
+        **oauth_cols,
     )
 
     # Encrypt + persist the operator-supplied client secret via the dedicated
@@ -10195,7 +10506,13 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     )
 
     server = storage.get_mcp_server(server_id)
-    return JSONResponse(_mcp_server_to_detail(_mask_mcp_secrets(server or {})))
+    # Auto-reload nodes so the new server reaches them (and per-user pools
+    # re-prime for active sessions) without a separate /reload — scheduled after
+    # the response so the write isn't blocked on cluster fan-out.
+    return JSONResponse(
+        _mcp_server_to_detail(_mask_mcp_secrets(server or {})),
+        background=_schedule_mcp_reload(request),
+    )
 
 
 async def admin_get_mcp_server(request: Request) -> JSONResponse:
@@ -10313,48 +10630,113 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         if _oauth_url_key in body:
             updates[_oauth_url_key] = _clean_oauth_text(body[_oauth_url_key], max_length=2048)
 
-    # When auth_type is changed away from oauth_user, clear the OAuth
-    # columns so a stale client_id / audience can't leak back if the
-    # row is later flipped to a different oauth_user provider.
-    # ``oauth_client_secret_ct`` is owned by a dedicated write path
-    # (not the generic update); the matching clear-on-transition is
-    # applied below via ``token_store.set_oauth_client_secret(..., None)``
-    # (or a direct storage call when no encryption key is configured).
-    transitioning_away_from_oauth_user = (
-        updates.get("auth_type") in {"static", "none"} and existing.get("auth_type") == "oauth_user"
-    )
-    # Renaming an oauth_user row needs the same per-user-token purge as
+    old_auth = existing.get("auth_type")
+    new_auth = updates.get("auth_type")
+    # A flip is any auth_type transition. ``oauth_audience`` and ``oauth_scopes``
+    # keep their meaning only WITHIN an auth type — across oauth_user↔oauth_obo
+    # the audience is a resource indicator vs. an IdP-side app identifier, and
+    # the scopes are AS-consent scopes vs. an rfc8693 exchange scope — so on a
+    # flip they must NEVER carry from the old row; they are recomputed from the
+    # request body (or NULLed) for the target type below.
+    is_flip = new_auth is not None and new_auth != old_auth
+
+    if not is_flip:
+        # SAME-TYPE edit: a re-send of oauth_scopes / oauth_audience equal to the
+        # row's current value is a genuine no-op — drop it from ``updates`` so the
+        # admin form's unconditional re-send of pre-filled fields doesn't (a)
+        # trip the mint-cache purge triggers or (b) trip the entra scope
+        # rejection that would otherwise make a legacy-scoped row un-editable.
+        # (On a flip this comparison is meaningless — the old value is in the
+        # other auth model's semantics — so it is skipped.)
+        for _noop_key in ("oauth_scopes", "oauth_audience"):
+            if _noop_key in updates and (updates[_noop_key] or None) == (
+                existing.get(_noop_key) or None
+            ):
+                del updates[_noop_key]
+
+    # Scrub the OAuth columns the target auth_type does NOT use — on EVERY write,
+    # not just a flip. This is a SECURITY invariant, not a flip nicety: a
+    # same-type edit can still inject a column the type doesn't use (e.g. an API
+    # PUT of {"auth_type":"static","oauth_authorization_server_url":"…attacker…"}
+    # onto a static row), which — because oauth_user legitimately USES that
+    # column — would then survive a later flip to oauth_user and redirect every
+    # consenting user's OAuth traffic. The persisted OAuth columns must be a pure
+    # function of the target auth_type (the create handler enforces the same via
+    # ``_oauth_columns_to_clear``). ``oauth_client_secret_ct`` is owned by a
+    # dedicated write path (see below). ``target_auth`` is the effective
+    # post-update auth type — reused below by the write-time validators.
+    target_auth = new_auth if new_auth is not None else (old_auth or "static")
+    if is_flip and new_auth is not None and is_user_scoped_auth(new_auth):
+        # FLIP into a user-scoped type: the columns whose MEANING differs across
+        # oauth_user↔oauth_obo must be recomputed from the body — present → that
+        # value, absent → NULL — never inherited from the old model's row. For
+        # oauth_audience/oauth_scopes this is the semantic-boundary rule; for a
+        # flip INTO oauth_user the oauth_user-only columns (client_id /
+        # registration / AS-URL) are also recomputed, so a stale/injected value
+        # left on the pre-flip static/none/obo row cannot carry in (those models
+        # don't use these columns, so the operator supplies them fresh here).
+        updates["oauth_audience"] = updates.get("oauth_audience")
+        updates["oauth_scopes"] = updates.get("oauth_scopes")
+        if new_auth == "oauth_user":
+            for _user_col in (
+                "oauth_client_id",
+                "oauth_registration_mode",
+                "oauth_authorization_server_url",
+            ):
+                updates[_user_col] = updates.get(_user_col)
+    updates.update(_oauth_columns_to_clear(target_auth))
+    # Renaming a pool-backed row needs the same per-user-token purge as
     # delete: the tokens are keyed on the OLD ``server_name`` and a row
     # later created with that old name (with attacker-controlled URL)
     # would otherwise silently rebind them.
     name_changing = "name" in updates and existing.get("name", "") != updates["name"]
-    # URL change on an oauth_user row needs the same purge: bearer tokens
+    # Any auth_type transition touching a pool-backed type (oauth_user or
+    # oauth_obo) purges the per-user rows: leaving to static/none orphans them;
+    # oauth_user↔oauth_obo mixes semantically different rows (per-server-AS
+    # refresh tokens vs minted cache) and would otherwise leave a live grant at
+    # the old AS unrevoked and refresh-bearing rows in the mint cache.
+    auth_type_purge = is_flip and (is_user_scoped_auth(old_auth) or is_user_scoped_auth(new_auth))
+    # URL change on a pool-backed row needs the same purge: bearer tokens
     # are bound (via OAuth resource / audience) to the URL active at
-    # consent time, so sending them to a new URL is a token-binding
+    # mint/consent time, so sending them to a new URL is a token-binding
     # violation. A compromised admin who flips the URL to an attacker
     # endpoint would otherwise replay every user's bearer there silently.
-    # Re-consent forces fresh token issuance bound to the new resource.
     url_changing = (
-        existing.get("auth_type") == "oauth_user"
+        is_user_scoped_auth(old_auth)
         and "url" in updates
         and existing.get("url", "") != updates["url"]
     )
-    if updates.get("auth_type") and updates["auth_type"] != "oauth_user":
-        updates.update(
-            {
-                "oauth_client_id": None,
-                "oauth_scopes": None,
-                "oauth_audience": None,
-                "oauth_registration_mode": None,
-                "oauth_authorization_server_url": None,
-                "oauth_as_issuer_cached": None,
-            }
-        )
+    # Changing oauth_audience on a pool-backed row is a token-binding change too:
+    # minted obo bearers (and oauth_user tokens) are audience-scoped, so cached
+    # rows for the OLD audience must be purged or a privilege reduction silently
+    # doesn't take effect until they expire. (auth_type flips already purge, so
+    # only guard the same-type edit here.) Like ``scopes_changing`` below, the
+    # same-type no-op normalization above already dropped an equal re-sent value
+    # from ``updates``, so "in updates" already means a genuine change.
+    audience_changing = (
+        is_user_scoped_auth(old_auth) and not is_flip and "oauth_audience" in updates
+    )
+    # Changing oauth_scopes on an oauth_obo row is the same token-binding
+    # change under the rfc8693 profile: the exchange scope shapes the minted
+    # bearer's privileges, so cached rows minted with the OLD scopes must be
+    # purged or a scope narrowing silently doesn't take effect until token
+    # TTL — inconsistent with the audience purge above. oauth_user scope
+    # edits deliberately do NOT purge (consent scopes bind per-grant at the
+    # AS; step-up re-consent handles widening). The no-op normalization
+    # above guarantees "in updates" here means a genuine change.
+    scopes_changing = old_auth == "oauth_obo" and not is_flip and "oauth_scopes" in updates
+    # Leaving oauth_user (to static/none OR to oauth_obo, which doesn't use the
+    # per-server client secret) clears the encrypted secret column below.
+    leaving_oauth_user = (
+        old_auth == "oauth_user" and new_auth is not None and new_auth != "oauth_user"
+    )
 
     # bug-2 / sec-1: validate token-store availability and JSON shape BEFORE
     # ``storage.update_mcp_server`` so a missing key doesn't leave partial
-    # column changes persisted.
-    auth_type_now = updates.get("auth_type", existing.get("auth_type", "static"))
+    # column changes persisted. ``target_auth`` (above) is the effective
+    # post-update auth type — one derivation feeds both the column scrub and
+    # these validators so they can't disagree on the row's type.
+    auth_type_now = target_auth
     err_resp = _require_token_store_for_oauth_secret(request, body, auth_type=auth_type_now)
     if err_resp is not None:
         return err_resp
@@ -10366,18 +10748,43 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     if err_resp is not None:
         return err_resp
 
+    # #551: an oauth_obo row (whether newly flipped or edited) needs an
+    # encryption key + an audience — validated against the merged post-update
+    # audience. The entra-scope reject fires ONLY when this request actually
+    # CHANGES scopes ("oauth_scopes" in updates — the no-op normalization
+    # above already dropped a re-sent equal value), never on the carried-over
+    # existing value: otherwise a pre-existing scoped row under the entra
+    # profile becomes un-editable — the admin form always re-submits the
+    # pre-filled field, so every unrelated save would 400.
+    audience_now = updates.get("oauth_audience", existing.get("oauth_audience"))
+    scopes_being_set = updates.get("oauth_scopes") if "oauth_scopes" in updates else None
+    # Run the DEPLOYMENT-level OIDC checks only when this write is a NEW obo
+    # enablement (a flip INTO obo); a same-type edit of an existing obo server
+    # keeps only the per-server validity checks, so an operator can still
+    # disable / edit an obo server after OIDC was operator-disabled.
+    err_resp = _enforce_oauth_obo_requirements(
+        request,
+        auth_type_now,
+        audience=audience_now,
+        scopes=scopes_being_set,
+        check_oidc_deployment=is_flip,
+    )
+    if err_resp is not None:
+        return err_resp
+
     if updates:
         storage.update_mcp_server(server_id, **updates)
 
     audit_uid, ip = _audit_context(request)
 
-    # Purge per-user tokens + pending OAuth states keyed on the OLD
-    # name on rename, on ``oauth_user → static/none`` transition, or
-    # on URL change for an oauth_user row. All three cases would
-    # otherwise leave tokens orphaned-and-rebindable because the OAuth
-    # tables key on the mutable ``server_name`` and tokens are bound
-    # to the URL active at consent time.
-    if name_changing or transitioning_away_from_oauth_user or url_changing:
+    # Purge per-user tokens + pending OAuth states keyed on the OLD name on
+    # rename, on any pool-backed auth_type transition, on URL change, or on an
+    # audience / obo-scope change for a pool-backed row. All cases would
+    # otherwise leave tokens orphaned-and-rebindable or bound to a superseded
+    # URL/audience/scope set (the OAuth tables key on the mutable
+    # ``server_name`` and tokens are bound to the URL + audience + scopes
+    # active at mint/consent time).
+    if name_changing or auth_type_purge or url_changing or audience_changing or scopes_changing:
         purge_target = existing.get("name", "")
         if purge_target:
             try:
@@ -10389,11 +10796,11 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
                     exc_info=True,
                 )
 
-    # sec-2: when the row is leaving ``oauth_user``, also clear the encrypted
-    # client secret column.  Operators expect "disable OAuth" to revoke
-    # credentials; leaving stale ciphertext that resurfaces if the row is
-    # flipped back is surprising and a footgun.
-    if transitioning_away_from_oauth_user:
+    # sec-2: when the row is leaving ``oauth_user`` (to static/none or to
+    # oauth_obo), also clear the encrypted client secret column.  Operators
+    # expect "disable OAuth" to revoke credentials; leaving stale ciphertext
+    # that resurfaces if the row is flipped back is surprising and a footgun.
+    if leaving_oauth_user:
         token_store = getattr(request.app.state, "mcp_token_store", None)
         if token_store is not None:
             token_store.set_oauth_client_secret(server_id, None)
@@ -10452,7 +10859,13 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     )
 
     server = storage.get_mcp_server(server_id)
-    return JSONResponse(_mcp_server_to_detail(_mask_mcp_secrets(server or {})))
+    # Auto-reload nodes so the edit (incl. a pool auth_type flip) reaches them
+    # and active sessions re-prime — scheduled after the response so the write
+    # isn't blocked on cluster fan-out.
+    return JSONResponse(
+        _mcp_server_to_detail(_mask_mcp_secrets(server or {})),
+        background=_schedule_mcp_reload(request),
+    )
 
 
 async def admin_delete_mcp_server(request: Request) -> JSONResponse:
@@ -10504,11 +10917,91 @@ async def admin_delete_mcp_server(request: Request) -> JSONResponse:
         ip,
     )
 
-    return JSONResponse({"status": "ok"})
+    # Auto-reload nodes so they drop the removed server — scheduled after the
+    # response so the delete isn't blocked on cluster fan-out.
+    return JSONResponse({"status": "ok"}, background=_schedule_mcp_reload(request))
+
+
+# Guards concurrent construction of the console's own MCP client manager
+# (lifespan boot racing an admin-write fan-out, or two rapid fan-outs
+# while ``app.state.mcp_client`` is still None).  Two winners would each
+# start an mcp-loop daemon thread and a static connection set; the second
+# assignment clobbers the first ref and the loser leaks both forever.
+# The node's ``internal_mcp_reload`` lazy-construct carries exactly this
+# latent race (turnstone/server.py internal_mcp_reload) — the console
+# does not replicate it.  Same shape as ``_COORD_BOOTSTRAP_LOCK``.
+_CONSOLE_MCP_ENSURE_LOCK = threading.Lock()
+
+
+def _ensure_console_mcp_client(app: Any) -> dict[str, Any]:
+    """Reconcile — and lazily construct — the console's own MCP client manager.
+
+    The console hosts an ``MCPClientManager`` so coordinator-kind
+    workstreams get an MCP tool surface (#725).  Node parity throughout:
+    construction goes through ``create_mcp_client`` — the same catalog
+    resolution as a node host (DB rows, then ``mcp.config_path``, then
+    this host's config.toml; ``None`` when nothing is configured) — and
+    the reconcile arm runs whenever a manager exists, so running
+    coordinators track admin edits exactly like node sessions do.
+
+    This is the ONE lazy-construct/reconcile path for every post-boot
+    trigger — the admin-write reload fan-out and the operator
+    ``POST /reload`` — mirroring the node's ``internal_mcp_reload``.
+    Unlike the node's arm, the body holds a lock: two concurrent
+    triggers on a managerless console must not double-construct (the
+    node's unlocked equivalent is issue #873).
+
+    Plain SYNC function: construction connects to static servers and
+    ``reconcile_sync`` performs bounded sync waits, so every caller
+    (all async) MUST invoke via ``asyncio.to_thread``.
+
+    Returns a reconcile-shaped dict (``added``/``removed``/``updated``,
+    or ``skipped``) so the operator reload view reports the console
+    alongside the nodes.
+    """
+    with _CONSOLE_MCP_ENSURE_LOCK:
+        storage = getattr(app.state, "auth_storage", None)
+        if storage is None:
+            return {"skipped": "storage not initialized"}
+        mgr = getattr(app.state, "mcp_client", None)
+        if mgr is None:
+            from turnstone.core.mcp_client import create_mcp_client
+
+            cs = getattr(app.state, "config_store", None)
+            cfg_path = cs.get("mcp.config_path") if cs is not None else None
+            registry = getattr(app.state, "coord_registry", None)
+            mgr = create_mcp_client(
+                cfg_path or None,
+                storage=storage,
+                required=bool(registry and registry.has_dynamic_auth()),
+            )
+            if mgr is None:
+                return {"skipped": "no MCP servers configured"}
+            app.state.mcp_client = mgr
+            mgr.set_storage(storage)
+            mgr.set_app_state(app.state)
+        result = mgr.reconcile_sync(storage)
+        coord_mgr = getattr(app.state, "coord_mgr", None)
+        if coord_mgr is not None:
+            try:
+                for ws in coord_mgr.list_all():
+                    session = getattr(ws, "session", None)
+                    if session is not None:
+                        session.set_model_mint_client(mgr)
+            except Exception:
+                log.debug("console.model_mint_client_session_refresh_failed", exc_info=True)
+        return result
 
 
 async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
-    """Tell all nodes to re-read the mcp_servers DB table and reconcile."""
+    """Tell all nodes to re-read the mcp_servers DB table and reconcile.
+
+    Drain-style: awaited inline only by the operator-triggered ``POST /reload``,
+    which reports the per-node results and must fail loudly if the fan-out infra
+    is absent. Admin *writes* (create/update/delete/registry-install) never await
+    this — they schedule it best-effort via ``_schedule_mcp_reload`` so a write's
+    response isn't blocked on (nor failed by) cluster reachability.
+    """
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
     client: httpx.AsyncClient = request.app.state.proxy_client
@@ -10527,17 +11020,163 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
                     headers=headers,
                     timeout=30,
                 )
+                # A non-2xx reply is a failed reload, not a reached node (httpx
+                # does not raise on status); surface it as an error so _run warns.
+                resp.raise_for_status()
                 return node_id, resp.json()
             except Exception as exc:
                 log.debug("Failed to notify node %s for MCP reload", node_id, exc_info=True)
                 return node_id, {"error": str(exc)}
 
-    results = await asyncio.gather(*[_notify(n) for n in nodes])
+    async def _console() -> tuple[str, Any]:
+        # The console hosts its own MCP manager for coordinator sessions
+        # (#725) — ensure/reconcile it in the SAME gather as the node
+        # fan-out so EVERY producer (post-write background hooks and the
+        # operator POST /reload alike) covers it, and so the console's
+        # (up to ~30s) construct/connect work OVERLAPS the node HTTP
+        # window instead of stacking after it on the operator-inline
+        # reload path.  Keyed under the collector's console pseudo-node
+        # id: get_nodes hides that id from fan-out enumeration, so the
+        # key can neither collide with a real node nor self-HTTP.
+        # Deliberately OUTSIDE ``sem`` — that semaphore paces node POSTs,
+        # and a ~30s worker-thread hold would starve a slot.  Exceptions
+        # are caught HERE (the gather runs return_exceptions=False): a
+        # console failure must not abandon collected node results.  Class
+        # constant for the key, like the sibling arms: stub collectors
+        # may not carry the instance attr.
+        console_id = ClusterCollector.CONSOLE_PSEUDO_NODE_ID
+        try:
+            return (
+                console_id,
+                await asyncio.to_thread(_ensure_console_mcp_client, request.app),
+            )
+        except Exception as exc:
+            log.warning("console MCP self-reconcile failed", exc_info=True)
+            return console_id, {"error": str(exc)}
+
+    results = await asyncio.gather(*[_notify(n) for n in nodes], _console())
     return {nid: data for nid, data in results if data is not None}
 
 
+def _schedule_mcp_reload(request: Request) -> BackgroundTask:
+    """Best-effort node-reload fan-out to run AFTER an admin MCP write's 200.
+
+    Returned as a ``BackgroundTask`` — the "trigger, not drain" contract also
+    used by ``_cascade_cancel_to_children``: the admin write's response is never
+    blocked on the per-node fan-out (each node POST can hit a 30s timeout under
+    the fan-out semaphore), so a fan-out failure can't fail a write that already
+    committed.
+
+    There is no periodic node→DB reconcile — a node that misses this reload
+    keeps serving a stale MCP catalog until the next ``POST /reload`` (or a node
+    restart). So ``_run`` does NOT swallow failures: any unreached node (or a
+    systemic fan-out fault) is logged at WARNING (visible at the default INFO
+    level), and the per-node status view surfaces the divergence. Only
+    ``POST /reload`` awaits the fan-out inline, where draining and reporting
+    per-node results to the operator is the point.
+    """
+
+    async def _run() -> None:
+        try:
+            results = await _notify_nodes_mcp_reload(request)
+        except Exception:
+            log.warning(
+                "auto mcp-reload fan-out failed after admin write; nodes may serve a "
+                "stale MCP catalog until the next POST /reload",
+                exc_info=True,
+            )
+            return
+        # The console's ensure entry rides the same results dict but is
+        # NOT a node: its failures are already logged with console
+        # wording at their production sites, and counting it here would
+        # both warn with node-remediation prose for a console-local
+        # failure and inflate the denominator (a node-less install with
+        # a console error would log "1 of 1 node(s)").  Class constant,
+        # not request.app.state.collector: the accounting must not
+        # depend on runtime state the (possibly patched) fan-out never
+        # touched.
+        console_id = ClusterCollector.CONSOLE_PSEUDO_NODE_ID
+        node_results = {nid: data for nid, data in results.items() if nid != console_id}
+        unreached = sorted(
+            nid for nid, data in node_results.items() if isinstance(data, dict) and "error" in data
+        )
+        if unreached:
+            log.warning(
+                "auto mcp-reload did not reach %d of %d node(s) after admin write "
+                "(stale MCP catalog until next reload): %s",
+                len(unreached),
+                len(node_results),
+                ", ".join(unreached),
+            )
+
+    return BackgroundTask(_run)
+
+
+def _console_mcp_action_outcome(mgr: Any, action: str, name: str) -> dict[str, Any]:
+    """Run one per-server MCP action against the console's own manager.
+
+    COPY of the node endpoints' outcome classification
+    (``internal_mcp_refresh_one`` / ``internal_mcp_reconnect_one`` in
+    turnstone/server.py) minus the HTTP mapping — deliberately a copy,
+    not an extraction, so the node endpoint bodies stay untouched; the
+    equivalence is pinned by TestConsoleActionOutcomeParity in
+    tests/test_mcp_admin_api.py, which drives both sides with identical
+    managers and fails if either drifts.  See the node endpoints for the
+    full rationale comments (authoritative-outcome re-check;
+    error-beats-skip).
+
+    Sync + blocking (``refresh_sync``/``reconnect_sync`` park on manager
+    locks up to their caller timeouts) — call via ``asyncio.to_thread``.
+    """
+    from turnstone.core.mcp_utils import public_server_status
+
+    if action == "refresh":
+        try:
+            mgr.refresh_sync(server_name=name)
+        except Exception as exc:
+            log.warning("console MCP refresh failed for %s: %s", name, exc)
+            return {"status": "error", "error": "refresh failed"}
+        status = public_server_status(mgr, name)
+        if status.get("error"):
+            log.warning("console MCP refresh reported error for %s: %s", name, status["error"])
+            return {"status": "error", "error": "refresh failed", "server": status}
+        if mgr.last_refresh_outcome(name) == "skipped":
+            return {"status": "skipped", "server": status}
+        return {"status": "ok", "server": status}
+
+    try:
+        result = mgr.reconnect_sync(name)
+    except Exception as exc:
+        log.warning("console MCP reconnect failed for %s: %s", name, exc)
+        return {"status": "error", "error": "reconnect failed"}
+    if result.get("error"):
+        log.warning(
+            "console MCP reconnect reported error for %s: %s",
+            name,
+            result.get("error", ""),
+        )
+        return {
+            "status": "error",
+            "error": "reconnect failed",
+            "server": public_server_status(mgr, name),
+        }
+    return {"status": "ok", "server": public_server_status(mgr, name)}
+
+
 async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> dict[str, Any]:
-    """Tell all nodes to perform a per-server MCP action.
+    """Tell all nodes — and the console's own manager — to perform a per-server MCP action.
+
+    Console arm (#725): the console's manager serves coordinator
+    dispatch, so the operator's per-server recovery actions must reach
+    it like any node's — otherwise reconnecting a wedged server heals
+    every node while the surface coordinators actually dispatch through
+    stays wedged until a console restart.  The arm runs the pinned copy
+    of the node outcome classification (see
+    ``_console_mcp_action_outcome``), keyed under the collector's
+    console pseudo-node id, gated on manager PRESENCE (nothing here
+    reads settings — a live manager must stay operable).  Names the
+    console's catalog never carried (e.g. servers from a node's own
+    config file) report skipped, not error.
 
     *action* is the suffix of the internal endpoint — currently
     ``"refresh"`` or ``"reconnect"``.  Each node is hit at
@@ -10562,6 +11201,9 @@ async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> 
                     headers=headers,
                     timeout=30,
                 )
+                # A non-2xx reply is a failed action, not a reached node (httpx
+                # does not raise on status); surface it as an error to the operator.
+                resp.raise_for_status()
                 return node_id, resp.json()
             except Exception as exc:
                 log.debug(
@@ -10573,7 +11215,32 @@ async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> 
                 )
                 return node_id, {"error": str(exc)}
 
-    results = await asyncio.gather(*[_notify(n) for n in nodes])
+    def _console_action() -> dict[str, Any]:
+        # Sync body for the worker thread.
+        mgr = getattr(request.app.state, "mcp_client", None)
+        if mgr is None:
+            return {"skipped": "console MCP manager not running"}
+        # Membership via the public status API (covers static AND
+        # pool-backed names): a name only nodes know must skip, not
+        # error through reconnect_sync's "unknown server" arm.
+        if name not in mgr.get_all_server_status(None, aggregate=True):
+            return {"skipped": "not in console catalog"}
+        return _console_mcp_action_outcome(mgr, action, name)
+
+    async def _console() -> tuple[str, Any]:
+        # Gather sibling OUTSIDE ``sem`` (that semaphore paces node
+        # POSTs; a long worker-thread hold would starve a slot),
+        # self-caught so a console failure never abandons collected node
+        # results — mirroring the reload fan-out's console arm.  Class
+        # constant for the key: stub collectors may not carry the attr.
+        console_id = ClusterCollector.CONSOLE_PSEUDO_NODE_ID
+        try:
+            return console_id, await asyncio.to_thread(_console_action)
+        except Exception as exc:
+            log.warning("console MCP %s of %s failed", action, name, exc_info=True)
+            return console_id, {"error": str(exc)}
+
+    results = await asyncio.gather(*[_notify(n) for n in nodes], _console())
     return {nid: data for nid, data in results if data is not None}
 
 
@@ -10700,9 +11367,19 @@ async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
     existing = storage.get_mcp_server_by_name(name)
     if existing is None:
         return JSONResponse({"error": "No such server"}, status_code=404)
-    if existing.get("auth_type") != "oauth_user":
+    # Both pool-backed types populate mcp_user_tokens, but the semantics differ
+    # and must be honest (issue #551): for oauth_user, deleting the rows is a
+    # durable REVOCATION — users lose access until they re-consent. For
+    # oauth_obo, the per-server rows are a mint CACHE; the shared per-user
+    # credential survives (it is issuer-scoped, not per-server, and IdP-governed),
+    # so the next dispatch simply re-mints. Bulk-revoke on an obo server is
+    # therefore a cache FLUSH (force re-mint, e.g. after narrowing the audience),
+    # NOT a consent revocation — surfaced via a distinct audit event + response
+    # ``effect`` so an operator is never told access was cut when it re-mints.
+    is_obo = existing.get("auth_type") == "oauth_obo"
+    if not is_user_scoped_auth(existing.get("auth_type")):
         return JSONResponse(
-            {"error": "bulk-revoke is only valid for auth_type=oauth_user servers"},
+            {"error": "bulk-revoke is only valid for oauth_user or oauth_obo servers"},
             status_code=400,
         )
 
@@ -10719,7 +11396,7 @@ async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
     record_audit(
         storage,
         audit_uid,
-        "mcp_server.oauth.bulk_revoked",
+        "mcp_server.oauth.obo_cache_flushed" if is_obo else "mcp_server.oauth.bulk_revoked",
         "mcp_server",
         target_id,
         {
@@ -10727,6 +11404,7 @@ async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
             "rows_deleted": deleted,
             "consented_users_before": consented_before,
             "upstream_revoke_outcome": "bulk_admin_no_upstream",
+            "effect": "cache_flush_remints" if is_obo else "revoked_until_reconsent",
         },
         ip,
     )
@@ -10736,6 +11414,9 @@ async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
             "status": "ok",
             "rows_deleted": deleted,
             "consented_users_before": consented_before,
+            # Honest semantics: obo re-mints on next use (revoke at the IdP or
+            # unlink the identity to cut a user off); oauth_user needs re-consent.
+            "effect": "cache_flush_remints" if is_obo else "revoked_until_reconsent",
         }
     )
 
@@ -10840,7 +11521,14 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
             ip,
         )
 
-    return JSONResponse({"imported": imported, "skipped": skipped, "errors": errors})
+    # Conditional like the audit record above: import is the one write
+    # whose 200 can mean zero row changes (every name already present) —
+    # fan out only when rows actually changed, matching the CRUD
+    # siblings' newly-written-row semantics.
+    return JSONResponse(
+        {"imported": imported, "skipped": skipped, "errors": errors},
+        background=_schedule_mcp_reload(request) if imported else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -10856,6 +11544,461 @@ _REASONING_EFFORT_CHOICES = frozenset(
 )
 # Keep in sync with turnstone.core.providers._VALID_API_SURFACES.
 _API_SURFACE_CHOICES = frozenset({"chat", "responses"})
+
+
+def _model_auth_audience_allowlist(request: Request) -> frozenset[str]:
+    """Exact operator-approved resource audiences for dynamic model auth."""
+    config_store = getattr(request.app.state, "config_store", None)
+    raw = config_store.get("model.auth_audience_allowlist") if config_store is not None else ""
+    return frozenset(item.strip() for item in re.split(r"[,\n]", str(raw or "")) if item.strip())
+
+
+def _oidc_configured_for_model_auth(request: Request) -> bool:
+    """Whether ``[oidc]`` is configured, counting the healing state as yes.
+
+    Mirrors the MCP ``oauth_obo`` validator's disjunction: a host that booted
+    during a transient IdP outage is ``discovery_retryable`` and heals on the
+    next token validation, so it must not be refused config work meanwhile.
+    """
+    oidc_config = getattr(request.app.state, "oidc_config", None)
+    return bool(
+        getattr(oidc_config, "enabled", False) or getattr(oidc_config, "discovery_retryable", False)
+    )
+
+
+# Provably auth-NEUTRAL model-definition columns. The update gate below is
+# built by EXCLUSION — fail-safe defaults + complete mediation: any OTHER
+# column whose VALUE changes on a row that is or becomes dynamic is an
+# auth-relevant change requiring admin.mcp plus row validation, so a new
+# column fails CLOSED until classified here (pinned by
+# test_model_definition_schema_auth_classification). Every entry claims
+# "changing this column can neither redirect where a minted credential is
+# sent nor re-arm minting that a disable or revocation stopped": the four
+# sampling/shaping knobs hit the same endpoint with the same credential,
+# and the two reasoning toggles only select what history surfaces.
+MODEL_AUTH_NEUTRAL_FIELDS = frozenset(
+    {
+        "context_window",
+        "temperature",
+        "max_tokens",
+        "reasoning_effort",
+        "surface_persisted_reasoning",
+        "replay_reasoning_to_model",
+    }
+)
+
+# The two cross-field refusal messages, shared verbatim by the create and
+# update twins (their guard CONDITIONS differ — raw body vs post-merge pair —
+# but the text must not drift). Mode lists come from the frozenset so a
+# fourth dynamic mode cannot make either message lie.
+_AUDIENCE_REQUIRED_ERROR = (
+    "obo_audience is required when auth_mode is dynamic "
+    f"({'/'.join(sorted(DYNAMIC_MODEL_AUTH_MODES))})"
+)
+_AUDIENCE_FORBIDS_STATIC_ERROR = (
+    "obo_audience requires a dynamic auth_mode "
+    f"({'/'.join(sorted(DYNAMIC_MODEL_AUTH_MODES))}); "
+    "omit it when auth_mode is 'static'"
+)
+# The scopes staging guard's refusal, shared by both twins like its audience
+# siblings above. Mode list derived, same rationale.
+_SCOPES_REQUIRE_EXCHANGE_MODE_ERROR = (
+    "obo_scopes is only used by auth_mode "
+    f"({'/'.join(sorted(SCOPES_MODEL_AUTH_MODES))}); "
+    "omit it for other modes"
+)
+# Over-length scopes are refused, not truncated: a silently shortened scope
+# list changes what the exchange leg requests. Shared by both twins.
+_SCOPES_TOO_LONG_ERROR = f"obo_scopes exceeds {MODEL_AUTH_TEXT_MAX_LEN} characters"
+
+
+def _canonical_capabilities(raw: Any) -> str | None:
+    """Canonical form of a ``capabilities`` blob, or ``None`` when unparseable.
+
+    Canonicalized through ``canonical_caps_value`` — the ONE normalization
+    this column's two comparators share, so this guard and the calibrate
+    confinement guard cannot disagree on an edge. Equality on the result
+    ignores exactly the serialization noise the shelf introduces (key order,
+    whitespace, integral-float spelling) while preserving every value-level
+    difference, including bool-vs-int.
+    """
+    try:
+        parsed = json.loads(str(raw or "") or "{}")
+    except ValueError:
+        return None
+    return canonical_caps_value(parsed)
+
+
+def _capabilities_value_changed(stored: Any, submitted: Any) -> bool:
+    """Whether a submitted ``capabilities`` blob VALUE-differs from the row's.
+
+    Canonicalized compare, so serialization noise on a full-form shelf save
+    does not gate while value-level changes still do; pinned by
+    test_reserialized_capabilities_do_not_defeat_pure_disable and
+    test_capabilities_value_change_still_gates_dynamic_row.
+
+    An unparseable STORED blob compares as CHANGED (fail closed). The ONE
+    exception is the update twin's pure-disable derivation, which treats it
+    as not-blocking (see :func:`_derive_auth_gate`).
+    """
+    stored_canonical = _canonical_capabilities(stored)
+    return stored_canonical is None or stored_canonical != _canonical_capabilities(submitted)
+
+
+@dataclass(frozen=True)
+class ModelAuthGateDecision:
+    """The update twin's auth-gate facts, derived purely from (row, updates).
+
+    Produced only by :func:`_derive_auth_gate`; the handler maps fields to
+    responses and never re-derives. Exclusivity invariants, each directly
+    unit-pinned:
+
+    - ``pure_disable`` implies ``not pair_changed`` and
+      ``not auth_config_changed`` — the carve-out never coexists with a
+      gated change.
+    - ``pure_disable`` implies ``not audience_required_violation`` — the
+      audience-required refusal yields to de-escalation.
+    - ``enabled_armed`` implies ``not pure_disable`` — arming and
+      disarming are directional opposites.
+    - ``posture_event`` is exactly ``pair_changed or enabled_armed``.
+
+    ``scopes_value_changed`` is the gate's scopes comparator — exposed
+    because it is also a mint-cache purge trigger (a scope change re-shapes
+    the bearer the alias's rows hold), and the handler must fire the purge
+    on exactly the comparison the gate made, never a re-derivation that
+    could drift.
+    """
+
+    eff_auth_mode: str
+    eff_audience: str
+    audience_required_violation: bool
+    static_new_audience_violation: bool
+    scopes_staging_violation: bool
+    scopes_value_changed: bool
+    pair_changed: bool
+    dynamic_involved: bool
+    enabled_armed: bool
+    pure_disable: bool
+    auth_config_changed: bool
+    posture_event: bool
+
+
+def _derive_auth_gate(existing: dict[str, Any], updates: dict[str, Any]) -> ModelAuthGateDecision:
+    """Derive every auth-gate fact the update twin consumes, purely.
+
+    ``existing`` is the stored row, ``updates`` the validated + normalized
+    presence-keyed column ladder the handler built from the body. No
+    request, no I/O, so the gate semantics are testable without endpoint
+    scaffolding.
+
+    The effective pair merges updates over the row, with both existing-side
+    values normalized the same way a submission is — auth_mode ""-residue
+    reads as static, and the stored audience passes through
+    ``_clean_oauth_text`` — or every full-form save on such a row reads as
+    a pair change. Two-arg ``.get`` on the updates side, not ``or``: a
+    deliberate ""-clear of obo_audience must still win over the stored
+    value.
+
+    Default-deny (fail-safe defaults): enumerate the provably NEUTRAL
+    columns and treat every other VALUE change as auth-relevant whenever
+    the row is or becomes dynamic. Value-diff, not key-presence — the admin
+    UI always submits the full form (pinned:
+    test_unchanged_dynamic_auth_fields_do_not_require_admin_mcp).
+    ``enabled`` compares bool-normalized, ``capabilities`` compares
+    canonical forms, and the pair is EXCLUDED from the value-diff loop
+    because ``pair_changed`` is its dedicated normalization-correct
+    comparator; the remaining gated columns are TEXT and compare
+    None-as-"".
+
+    PURE DISABLE: the only non-neutral change is ``enabled`` true→false.
+    De-escalation is the one monotone exception to default-deny — a
+    de-listed audience must never block its own disarm, so admin.models
+    suffices and the validator is skipped entirely. Re-enabling re-arms
+    minting and stays gated + posture-validated (``enabled_armed`` feeds
+    ``posture_event``); a disable BUNDLED with any other gated change still
+    gates. For THIS derivation only, an unparseable STORED capabilities
+    blob does not block the disarm — the row is leaving every registry
+    (pinned: test_corrupt_stored_capabilities_does_not_block_pure_disable).
+    ``not pair_changed`` is implied but stated, so the predicate cannot
+    silently widen.  The audience-required refusal yields to the disarm for
+    the same reason: a row already STORED dynamic with an empty audience
+    (DB-direct writes) fails the post-merge check on every submission, so
+    without the exemption it could never be disabled (pinned:
+    test_empty_audience_dynamic_row_disarms_under_admin_models).
+    """
+    old_auth_mode = str(existing.get("auth_mode") or "static")
+    old_audience = (
+        _clean_oauth_text(existing.get("obo_audience"), max_length=MODEL_AUTH_TEXT_MAX_LEN) or ""
+    )
+    eff_auth_mode = str(updates.get("auth_mode", old_auth_mode))
+    eff_audience = str(updates.get("obo_audience", old_audience))
+    # The staging guard, mirrored on the create twin: a row whose effective
+    # mode is static must not store a NEW non-empty audience, or an
+    # unvalidated value (the validator returns at static, never reaching the
+    # allow-list) is staged for a later flip to inherit. VALUE CHANGE only,
+    # so a legacy row carrying stale residue keeps saving.
+    static_new_audience_violation = (
+        eff_auth_mode == "static"
+        and "obo_audience" in updates
+        and bool(updates["obo_audience"])
+        and str(updates["obo_audience"]) != old_audience
+    )
+    # The scopes twin of the staging guard: a mode that never reads scopes
+    # must not store a NEW value for a later mode flip to inherit. VALUE
+    # CHANGE only, so residue re-saves keep working — and a pure disable can
+    # never trip this (an unchanged or omitted scopes field is no violation,
+    # and a changed one already forecloses the carve-out via the gated-change
+    # loop below; pinned:
+    # test_pure_disable_with_stored_scopes_stays_carved_out).
+    # The stored-side baseline is the UNCAPPED shared sanitize: a DB-direct
+    # raw stored value must compare equal to its own collapsed re-save (the
+    # update ladder normalizes the incoming side), or every full-form
+    # submit — including the disarm — misreads residue as a change. The cap
+    # deliberately does NOT apply here: a capped baseline would let the
+    # capped SPELLING of over-cap residue compare as "no change", so an
+    # admin.models-only caller could rewrite a registry-refused value into
+    # a loadable, mintable one under the escalation gate's radar. Over-cap
+    # residue can never equal a storable submission, so any write to it is
+    # auth-gated; the wedge protection for untouched residue lives in the
+    # parser's omit-unchanged arm, not in this compare.
+    old_scopes = sanitize_backend_auth_scopes(existing.get("obo_scopes"))
+    # THE scopes comparator — the staging guard and the gated-change loop
+    # below both consume it, so the two predicates cannot drift on what
+    # counts as a value change.
+    scopes_value_changed = "obo_scopes" in updates and str(updates["obo_scopes"]) != old_scopes
+    scopes_staging_violation = (
+        eff_auth_mode not in SCOPES_MODEL_AUTH_MODES
+        and scopes_value_changed
+        and bool(updates["obo_scopes"])
+    )
+    # One derivation, two consumers: the outer gate and the validator's
+    # posture tier.
+    pair_changed = eff_auth_mode != old_auth_mode or eff_audience != old_audience
+    dynamic_involved = (
+        old_auth_mode in DYNAMIC_MODEL_AUTH_MODES or eff_auth_mode in DYNAMIC_MODEL_AUTH_MODES
+    )
+    # Named booleans, not a set: the consumers need direction and
+    # exclusivity, facts a collapsed any() cannot carry.
+    enabled_flip = "enabled" in updates and bool(existing.get("enabled")) != bool(
+        updates["enabled"]
+    )
+    enabled_armed = enabled_flip and bool(updates["enabled"])
+    caps_changed = "capabilities" in updates and _capabilities_value_changed(
+        existing.get("capabilities"), updates["capabilities"]
+    )
+    # obo_scopes joins the pair and capabilities in the loop's exclusion
+    # list: each excluded column has a dedicated normalization-correct
+    # comparator (scopes_value_changed above), and the raw-string loop
+    # would misread a DB-direct stored value's collapsed re-save as a
+    # change.
+    non_caps_gated_changed = (
+        any(
+            key not in ("enabled", "capabilities", "auth_mode", "obo_audience", "obo_scopes")
+            and key not in MODEL_AUTH_NEUTRAL_FIELDS
+            and str(existing.get(key) or "") != str(value or "")
+            for key, value in updates.items()
+        )
+        or scopes_value_changed
+    )
+    other_gated_changed = non_caps_gated_changed or caps_changed
+    caps_blocks_disarm = (
+        caps_changed and _canonical_capabilities(existing.get("capabilities")) is not None
+    )
+    pure_disable = (
+        enabled_flip
+        and not bool(updates["enabled"])
+        and not non_caps_gated_changed
+        and not caps_blocks_disarm
+        and not pair_changed
+    )
+    # A dynamic effective pair without an audience is unmintable and refused
+    # — except for the pure disable, whose de-escalation must never be
+    # blocked (the row is leaving the registry; nothing is armed).
+    audience_required_violation = (
+        eff_auth_mode in DYNAMIC_MODEL_AUTH_MODES and not eff_audience and not pure_disable
+    )
+    auth_config_changed = pair_changed or (
+        dynamic_involved and (other_gated_changed or enabled_flip) and not pure_disable
+    )
+    return ModelAuthGateDecision(
+        eff_auth_mode=eff_auth_mode,
+        eff_audience=eff_audience,
+        audience_required_violation=audience_required_violation,
+        static_new_audience_violation=static_new_audience_violation,
+        scopes_staging_violation=scopes_staging_violation,
+        scopes_value_changed=scopes_value_changed,
+        pair_changed=pair_changed,
+        dynamic_involved=dynamic_involved,
+        enabled_armed=enabled_armed,
+        pure_disable=pure_disable,
+        auth_config_changed=auth_config_changed,
+        posture_event=pair_changed or enabled_armed,
+    )
+
+
+def _validate_dynamic_model_auth(
+    request: Request,
+    *,
+    auth_mode: str,
+    audience: str,
+    posture_event: bool = True,
+    pair_changed: bool = True,
+) -> JSONResponse | None:
+    """Validate a dynamic model-auth config at the write choke point.
+
+    A structural sibling of the MCP ``oauth_obo`` validator, in two tiers:
+
+    **Row validity — always runs when the mode is dynamic.** Exactly one
+    check: the audience must be operator-approved. Value-based, so a revoked
+    audience blocks even a base-URL-only edit (pinned:
+    test_delisted_audience_blocks_base_url_edit). One exception, on the
+    caller's side: a PURE DISABLE never calls this validator at all, so
+    de-escalation is not blocked by an audience that has left the allow-list
+    (pinned: test_pure_disable_with_admin_mcp_skips_validator_on_delisted_audience).
+
+    **Deployment posture — runs only on a ``posture_event``**: when this
+    request CHOOSES the ``(auth_mode, obo_audience)`` pair rather than
+    inheriting it, or RE-ARMS a disabled dynamic row (pinned:
+    test_keyless_reenable_of_dynamic_row_returns_503). Checks, in sibling
+    order: token store present, OIDC configured, grant profile valid. A
+    same-pair edit is never posture-blocked — an existing row must not be
+    held hostage to posture that changed after it was saved; the mint warns
+    at runtime instead, exactly as the MCP contract documents (pinned:
+    test_base_url_edit_allowed_despite_typod_profile).
+
+    The mode/profile PAIRING is narrower still — a pair-CHOOSE rule, gated
+    on ``pair_changed``: re-arming an untouched pair keeps the row's
+    standing, whatever profile the deployment now runs (its mint refuses at
+    runtime with ``grant_profile_mismatch``, fallback-eligible by ruling),
+    while any request that picks the pair must pick one this deployment can
+    mint.
+
+    Every refusal names its actual cause and echoes what the operator
+    configured. A missing token store is 503 (deployment fault,
+    remedy-and-retry), matching the MCP sibling; config choices are 400.
+
+    DELIBERATELY a mirror of :func:`_enforce_oauth_obo_requirements`, not an
+    extraction from it. One accepted divergence: the sibling additionally
+    gates on ``capture_user_credential``, which the model mint never reads
+    (pinned: test_entra_obo_allowed_without_user_credential_capture). Any
+    rule change here must be weighed against the sibling, and vice versa.
+    """
+    if auth_mode == "static":
+        return None
+
+    # --- Row validity: every write that touches a dynamic config -----------
+    # ONLY the allow-list lives here: a revoked audience must never be
+    # re-aimable at a new base_url, whichever field the operator edited. The
+    # profile checks are deployment config, not row facts, so they sit in the
+    # posture tier below — matching the MCP sibling.
+    if audience not in _model_auth_audience_allowlist(request):
+        return JSONResponse(
+            {
+                "error": (
+                    "obo_audience is not in the operator-configured model.auth_audience_allowlist"
+                )
+            },
+            status_code=400,
+        )
+
+    # --- Deployment posture: pair chosen by this request, or re-arming -----
+    if not posture_event:
+        return None
+    # Function-local import, same as the MCP validator above: oidc and
+    # mcp_oauth reference each other lazily, so this stays off the module
+    # import graph.
+    from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
+
+    # Check ORDER mirrors the MCP sibling: token store first, then
+    # OIDC-configured, then profile semantics — so a no-SSO host is told
+    # "single sign-on is not set up" rather than being steered at a profile
+    # knob whose emptiness is a symptom (pinned by
+    # test_no_sso_posture_refusal_names_sso_not_profile).
+    if getattr(request.app.state, "mcp_token_store", None) is None:
+        # 503, not 400: a missing encryption key is a deployment fault the
+        # operator remedies and retries — the MCP sibling's classification
+        # for the identical state (_OAUTH_TOKEN_STORE_503_MSG).
+        return JSONResponse(
+            {
+                "error": (
+                    f"auth_mode {auth_mode!r} mints and caches encrypted tokens, but "
+                    f"{STARTUP_KEY_REQUIRED_HINT}"
+                )
+            },
+            status_code=503,
+        )
+    if not _oidc_configured_for_model_auth(request):
+        return JSONResponse(
+            {
+                "error": (
+                    f"auth_mode {auth_mode!r} requires a configured [oidc] deployment; "
+                    "single sign-on is not set up"
+                )
+            },
+            status_code=400,
+        )
+    profile = _obo_profile(request)
+    if profile not in OBO_GRANT_PROFILES:
+        # Echo the configured value — the typo is the diagnosis. Mirrors the
+        # MCP validator's unknown-profile reject rather than coercing at load.
+        return JSONResponse(
+            {
+                "error": (
+                    f"[oidc] obo_grant_profile={profile!r} is not a valid grant profile "
+                    f"({', '.join(sorted(OBO_GRANT_PROFILES))}); dynamic model auth "
+                    "cannot mint until it is fixed"
+                )
+            },
+            status_code=400,
+        )
+    if pair_changed:
+        # Type-pairing: every dynamic mode names its grant dialect, so
+        # "mode matches deployment profile" is one derived rule instead of a
+        # per-mode special case. Only a pair CHOICE reaches this, so legacy
+        # rows persisted under the pre-pairing overload keep accepting
+        # same-pair edits and re-arms (pinned:
+        # test_base_url_edit_allowed_on_legacy_entra_obo_rfc8693_row,
+        # test_legacy_cross_profile_row_reenables_unchanged).
+        required = MODEL_AUTH_MODE_PROFILES.get(auth_mode)
+        if required is None:
+            # Fail-closed IN code, not by map absence: a dynamic mode nobody
+            # paired must be refused here with its remedy named — the
+            # registry drift test stays as the belt.
+            return JSONResponse(
+                {
+                    "error": (
+                        f"auth_mode {auth_mode!r} has no registered grant-profile "
+                        "pairing; add it to MODEL_AUTH_MODE_PROFILES before use"
+                    )
+                },
+                status_code=400,
+            )
+        elif profile != required:
+            if auth_mode in APP_IDENTITY_MODEL_AUTH_MODES:
+                remedy = "; RFC 8693 client-credentials is not supported"
+            else:
+                alternates = "/".join(
+                    sorted(
+                        mode
+                        for mode, mode_profile in MODEL_AUTH_MODE_PROFILES.items()
+                        if mode_profile == profile and mode not in APP_IDENTITY_MODEL_AUTH_MODES
+                    )
+                )
+                remedy = (
+                    f"; delegated tokens under this profile use auth_mode {alternates!r}"
+                    if alternates
+                    else ""
+                )
+            return JSONResponse(
+                {
+                    "error": (
+                        f"auth_mode {auth_mode!r} requires [oidc] obo_grant_profile="
+                        f"{required!r} (configured: {profile!r}){remedy}"
+                    )
+                },
+                status_code=400,
+            )
+    return None
 
 
 def _validate_api_surface(caps: Any) -> str | None:
@@ -10941,9 +12084,10 @@ def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
 
     - new coordinator sessions see the new state at create-time;
     - active coordinator sessions auto-pick up the swap at next ``send()``
-      via ``ChatSession._refresh_model_from_registry`` (the per-send
-      check compares ``cfg.model`` against ``self.model`` and re-resolves
-      on mismatch).
+      via ``ChatSession._refresh_model_from_registry``: the per-send check
+      compares the registry's reload generation as well as ``cfg.model``
+      against ``self.model``, so the swap propagates even when an alias
+      keeps its backend model id (base-URL or auth redirects included).
 
     Errors are logged + swallowed.  The DB write that triggered this
     refresh has already succeeded, and the explicit reload button
@@ -10951,6 +12095,12 @@ def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
     (e.g. admin deleted the alias that ``registry.default`` points at)
     leave the existing registry intact rather than tearing down a
     working coordinator.
+
+    The swap runs through the chokepoint in ``ModelRegistry.reload``: a
+    keyless console must not acquire dynamic aliases through a peer
+    console's DB write or a reload click, so that refusal keeps the
+    last-good registry and is recorded via
+    :func:`_record_coord_key_refusal`.
     """
     from turnstone.core.model_registry import load_model_registry
 
@@ -10983,11 +12133,24 @@ def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
             new_registry.default,
             new_registry.fallback,
             new_registry.agent_model,
+            app_state=app_state,
             task_model=new_registry.task_model,
             task_effort=new_registry.task_effort,
         )
+    except DynamicAuthKeyError as exc:
+        # The swap chokepoint refused (dynamic aliases, no key): the live
+        # coordinator keeps its last-good registry. The ERROR log is the
+        # observable here, but the string is still set so a later subsystem
+        # outage names the real blocker instead of a stale cause.
+        _record_coord_key_refusal(app_state, str(exc))
     except Exception:
         log.warning("console.coord_registry_refresh_reload_failed", exc_info=True)
+    else:
+        # A completed swap is the registry passing its own admission check,
+        # so any earlier refusal no longer describes it. Same staleness rule
+        # as the refusal arm, in the recovery direction (pinned:
+        # test_refresh_clears_key_refusal_after_recovery).
+        app_state.coord_registry_error = ""
     finally:
         # Defensive — load_model_registry doesn't eagerly create clients
         # (ModelRegistry.__init__ leaves _clients/_providers empty; they
@@ -11058,6 +12221,10 @@ def _maybe_bootstrap_coord_subsystem(app: Any, storage: Any) -> None:
         except Exception:
             log.warning("console.coord_bootstrap_load_failed", exc_info=True)
             return
+        # Same refusal as the lifespan twin: a CRUD write must not revive
+        # a keyless coordinator and erase the remediation banner.
+        if _refuse_keyless_registry(app.state, coord_registry):
+            return
         try:
             # ``_bootstrap_coord_subsystem`` stamps ``coord_registry``
             # and clears ``coord_registry_error`` itself as the final
@@ -11116,6 +12283,10 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
+    # NOT allow_service_bypass=False: every sibling model-definition endpoint
+    # keeps the bypass, so refusing it here alone would break read-modify-write
+    # automation while leaving the writes wide open. Tightening this is a
+    # decision for the whole endpoint family, not one read.
     err = require_permission(request, "admin.models")
     if err:
         return err
@@ -11132,44 +12303,39 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
         m["source"] = "db"
         result.append(_mask_model_secrets(m))
 
-    # Merge config-sourced models visible on nodes but not in DB
+    # Merge config-sourced models visible on nodes but not in DB. One flat
+    # pass first (first node reporting an alias wins, matching node_statuses
+    # order) so the synthetic-entry loop below does not rescan every node's
+    # payload per alias.
     config_aliases: set[str] = set()
+    node_alias_info: dict[str, dict[str, Any]] = {}
     for node_models in node_statuses.values():
-        for alias in node_models:
-            if alias not in db_aliases:
-                config_aliases.add(alias)
+        for alias, nm in node_models.items():
+            if alias in db_aliases:
+                continue
+            config_aliases.add(alias)
+            if nm and alias not in node_alias_info:
+                node_alias_info[alias] = nm
     for alias in sorted(config_aliases):
         # Build a synthetic read-only entry from node-reported data
-        model_name = ""
-        provider = "openai"
-        context_window = 0
-        cfg_temperature = None
-        cfg_max_tokens = None
-        cfg_reasoning_effort = None
-        for node_models in node_statuses.values():
-            nm = node_models.get(alias)
-            if nm:
-                model_name = nm.get("model", "")
-                provider = nm.get("provider", "openai")
-                context_window = nm.get("context_window", 0)
-                cfg_temperature = nm.get("temperature")
-                cfg_max_tokens = nm.get("max_tokens")
-                cfg_reasoning_effort = nm.get("reasoning_effort")
-                break
+        nm = node_alias_info.get(alias) or {}
         result.append(
             {
                 "definition_id": "",
                 "alias": alias,
-                "model": model_name,
-                "provider": provider,
+                "model": nm.get("model", ""),
+                "provider": nm.get("provider", "openai"),
                 "base_url": "",
                 "api_key": "",
-                "context_window": context_window,
+                "context_window": nm.get("context_window", 0),
                 "capabilities": "{}",
                 "enabled": True,
-                "temperature": cfg_temperature,
-                "max_tokens": cfg_max_tokens,
-                "reasoning_effort": cfg_reasoning_effort,
+                "temperature": nm.get("temperature"),
+                "max_tokens": nm.get("max_tokens"),
+                "reasoning_effort": nm.get("reasoning_effort"),
+                "auth_mode": nm.get("auth_mode", "static"),
+                "obo_audience": nm.get("obo_audience", ""),
+                "obo_scopes": nm.get("obo_scopes", ""),
                 "source": "config",
                 "created_by": "",
                 "created": "",
@@ -11201,7 +12367,57 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
     else:
         default_alias = ""
 
+    # Deliberately NO auth constraints here: serving the allow-list and grant
+    # profile under admin.models (or to a service token via the bypass) hands
+    # out the enumeration the write siblings were reordered to prevent. The
+    # shelf fetches them from the admin.mcp-gated auth-constraints route.
     return JSONResponse({"models": result, "default_alias": default_alias})
+
+
+async def admin_model_auth_constraints(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/model-definitions/auth-constraints.
+
+    The shelf's affordance data: the operator-approved audiences (rendered as
+    datalist suggestions) and the deployment grant profile (labels the
+    ``entra_app`` option and decides whether the Backend-auth section shows
+    at all on a no-SSO deployment).
+
+    Gated on ``admin.mcp`` as DEFENSE IN DEPTH, not confidentiality — each
+    row's CHOSEN audience is already readable under ``admin.models`` on the
+    list/get siblings. What the gate covers is the DEPLOYMENT-WIDE
+    enumeration: the full approved audience set, including audiences no row
+    has chosen, is not served to a cheaper scope than the write that uses it.
+
+    Affordance, not gate: the shelf must fail OPEN on any failure to fetch
+    this (free-text audience input, no modes disabled). The write validator
+    is the authority; this exists so the common path never meets its 400s.
+    """
+    from turnstone.core.auth import require_permission
+
+    err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+    if err:
+        return err
+    return JSONResponse(
+        {
+            "auth_audience_allowlist": sorted(_model_auth_audience_allowlist(request)),
+            "auth_grant_profile": (
+                _obo_profile(request) if _oidc_configured_for_model_auth(request) else ""
+            ),
+            # Server-derived, so the shelf's dynamic-mode affordances track
+            # the server's classification by data rather than a hand-kept
+            # mirror across the language seam; the client's hand-list is only
+            # the fail-open fallback for a missing/failed fetch.
+            "dynamic_auth_modes": sorted(DYNAMIC_MODEL_AUTH_MODES),
+            # Same contract for the scopes input's visibility and the mode
+            # options' profile pairing (which options grey out for THIS
+            # deployment's grant profile).
+            "scopes_auth_modes": sorted(SCOPES_MODEL_AUTH_MODES),
+            # And for the model list's auth badge: app-identity modes render
+            # as a deployment identity, every other dynamic mode as per-user.
+            "app_identity_auth_modes": sorted(APP_IDENTITY_MODEL_AUTH_MODES),
+            "auth_mode_profiles": dict(sorted(MODEL_AUTH_MODE_PROFILES.items())),
+        }
+    )
 
 
 async def admin_create_model_definition(request: Request) -> JSONResponse:
@@ -11254,12 +12470,26 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     base_url = str(body.get("base_url", "")).strip()
     api_key = str(body.get("api_key", "")).strip()
     ctx_raw = body.get("context_window", 32768)
+    # json admits NaN/Infinity literals, which pass the isinstance check but
+    # crash int(); refuse non-finite floats as invalid values instead.
+    if isinstance(ctx_raw, float) and not math.isfinite(ctx_raw):
+        return JSONResponse({"error": "context_window must be a finite number"}, status_code=400)
     context_window = max(0, int(ctx_raw)) if isinstance(ctx_raw, (int, float)) else 0
     caps = body.get("capabilities", {})
+    if not isinstance(caps, dict):
+        # Mirror of the update twin's refusal: coercing a null or the STRING
+        # shape GET returns to "{}" silently drops server_compat, thinking
+        # keys and reranker calibration on a clone-via-GET script. Only a
+        # PRESENT non-object is refused (twin parity pinned:
+        # test_create_and_update_twins_agree_on_non_dict_capabilities).
+        return JSONResponse(
+            {"error": "capabilities must be an object; omit for defaults"},
+            status_code=400,
+        )
     err_msg = _validate_api_surface(caps)
     if err_msg:
         return JSONResponse({"error": err_msg}, status_code=400)
-    capabilities = json.dumps(caps) if isinstance(caps, dict) else "{}"
+    capabilities = json.dumps(caps)
     enabled = bool(body.get("enabled", True))
 
     # Per-model sampling overrides (None = use global default)
@@ -11295,6 +12525,50 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     surface_persisted_reasoning = bool(body.get("surface_persisted_reasoning", True))
     replay_reasoning_to_model = bool(body.get("replay_reasoning_to_model", False))
 
+    auth_mode = str(body.get("auth_mode", "static")).strip() or "static"
+    if auth_mode not in _MODEL_AUTH_MODES:
+        return JSONResponse({"error": f"Invalid auth_mode: {auth_mode!r}"}, status_code=400)
+    obo_audience = (
+        _clean_oauth_text(body.get("obo_audience"), max_length=MODEL_AUTH_TEXT_MAX_LEN) or ""
+    )
+    if auth_mode in DYNAMIC_MODEL_AUTH_MODES and not obo_audience:
+        return JSONResponse({"error": _AUDIENCE_REQUIRED_ERROR}, status_code=400)
+    # The staging guard, mirrored on the update twin: a static row must not
+    # STORE an audience, or an admin.models-only caller (the escalation gate
+    # below is skipped entirely for static) parks an unvalidated one for a
+    # later flip to inherit. A request-shape 400, so it may precede the
+    # permission gate — it discriminates only on the request's own fields.
+    if auth_mode == "static" and obo_audience:
+        return JSONResponse({"error": _AUDIENCE_FORBIDS_STATIC_ERROR}, status_code=400)
+    # Scopes twin of the staging guard, same request-shape rationale: only a
+    # scope-reading mode may store scopes. Over-length input is REFUSED
+    # (audience keeps its truncate posture — the allow-list membership check
+    # backstops whatever a truncation produces; scopes have no such list).
+    # No stored row exists yet, so the parser's omit-unchanged arm never
+    # applies here: over-length always refuses.
+    obo_scopes_value, scopes_err = _parse_obo_scopes_field(body.get("obo_scopes"))
+    if scopes_err is not None:
+        return scopes_err
+    obo_scopes = obo_scopes_value or ""
+    if obo_scopes and auth_mode not in SCOPES_MODEL_AUTH_MODES:
+        return JSONResponse({"error": _SCOPES_REQUIRE_EXCHANGE_MODE_ERROR}, status_code=400)
+    if auth_mode != "static":
+        # Redeeming an operator-chosen audience is the same capability as
+        # configuring oauth_audience on MCP; service credentials do not bypass
+        # it. Runs BEFORE the config validation below, whose 400s describe
+        # deployment posture and allow-list contents this caller must not
+        # enumerate one guess at a time.
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
+    dynamic_auth_error = _validate_dynamic_model_auth(
+        request,
+        auth_mode=auth_mode,
+        audience=obo_audience,
+    )
+    if dynamic_auth_error is not None:
+        return dynamic_auth_error
+
     storage.create_model_definition(
         definition_id=definition_id,
         alias=alias,
@@ -11311,15 +12585,27 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         reasoning_effort=reasoning_effort,
         surface_persisted_reasoning=surface_persisted_reasoning,
         replay_reasoning_to_model=replay_reasoning_to_model,
+        auth_mode=auth_mode,
+        obo_audience=obo_audience,
+        obo_scopes=obo_scopes,
     )
 
+    # Record the auth pair, as the update path already does: it is a
+    # capability-escalating choice, so the audit trail must cover the request
+    # that INTRODUCES it, not only later edits.
+    audit_detail: dict[str, Any] = {"alias": alias}
+    if auth_mode != "static":
+        audit_detail["auth_mode"] = auth_mode
+        audit_detail["obo_audience"] = obo_audience
+        if obo_scopes:
+            audit_detail["obo_scopes"] = obo_scopes
     record_audit(
         storage,
         audit_uid,
         "model_definition.create",
         "model_definition",
         definition_id,
-        {"alias": alias},
+        audit_detail,
         ip,
     )
 
@@ -11328,7 +12614,12 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     # model promotes the coord subsystem from "not initialized" to ready
     # without a console restart.  No-op when already built.
     await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
+    await asyncio.to_thread(_ensure_console_mcp_client, request.app)
     _emit_models_changed(request)
+    # Same refused-swap surfacing as the update twin (see its comment): the
+    # row is stored, but a keyless console's live registry may have refused
+    # to adopt it, so the shelf warns instead of toasting success.
+    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
 
     created = storage.get_model_definition(definition_id)
     if created is None:
@@ -11336,7 +12627,10 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
             {"error": f"Model alias '{alias}' already exists (concurrent insert)"},
             status_code=409,
         )
-    return JSONResponse(_mask_model_secrets(created))
+    payload = _mask_model_secrets(created)
+    if registry_warning:
+        payload["registry_warning"] = registry_warning
+    return JSONResponse(payload)
 
 
 async def admin_get_model_definition(request: Request) -> JSONResponse:
@@ -11419,13 +12713,28 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
             updates["api_key"] = api_key
     if "context_window" in body:
         ctx_raw = body["context_window"]
+        # Twin of the create guard: a NaN/Infinity literal passes the
+        # isinstance check but crashes int(); refuse it as invalid.
+        if isinstance(ctx_raw, float) and not math.isfinite(ctx_raw):
+            return JSONResponse(
+                {"error": "context_window must be a finite number"}, status_code=400
+            )
         updates["context_window"] = max(0, int(ctx_raw)) if isinstance(ctx_raw, (int, float)) else 0
     if "capabilities" in body:
         caps = body["capabilities"]
+        if not isinstance(caps, dict):
+            # Coercing a null or the STRING shape GET returns to "{}"
+            # silently erases server_compat, thinking_mode and reranker
+            # calibration on a read-modify-write; an absent key already
+            # means "leave unchanged" (this ladder is presence-keyed).
+            return JSONResponse(
+                {"error": "capabilities must be an object; omit to leave unchanged"},
+                status_code=400,
+            )
         err_msg = _validate_api_surface(caps)
         if err_msg:
             return JSONResponse({"error": err_msg}, status_code=400)
-        updates["capabilities"] = json.dumps(caps) if isinstance(caps, dict) else "{}"
+        updates["capabilities"] = json.dumps(caps)
     if "enabled" in body:
         updates["enabled"] = bool(body["enabled"])
 
@@ -11477,13 +12786,90 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
     if "replay_reasoning_to_model" in body:
         updates["replay_reasoning_to_model"] = bool(body["replay_reasoning_to_model"])
 
+    if "auth_mode" in body:
+        am = str(body["auth_mode"]).strip() or "static"
+        if am not in _MODEL_AUTH_MODES:
+            return JSONResponse({"error": f"Invalid auth_mode: {am!r}"}, status_code=400)
+        updates["auth_mode"] = am
+    if "obo_audience" in body:
+        updates["obo_audience"] = (
+            _clean_oauth_text(body["obo_audience"], max_length=MODEL_AUTH_TEXT_MAX_LEN) or ""
+        )
+    if "obo_scopes" in body:
+        # Same refusal as the create twin — over-length scope lists never
+        # truncate into the store (see the audience-asymmetry note there) —
+        # via the shared parser, whose omit-unchanged arm drops the key when
+        # the submission merely echoes over-length DB-direct residue: the
+        # gate below then sees no scopes change and the stored value
+        # survives verbatim, so the residue row stays disarmable and
+        # full-form-resavable.
+        scopes_value, scopes_err = _parse_obo_scopes_field(
+            body["obo_scopes"], stored=existing.get("obo_scopes")
+        )
+        if scopes_err is not None:
+            return scopes_err
+        if scopes_value is not None:
+            updates["obo_scopes"] = scopes_value
+    # Every gate fact derives purely in _derive_auth_gate, whose docstring
+    # carries the rulings; this handler only maps fields to responses.
+    gate = _derive_auth_gate(existing, updates)
+    # Cross-field: a dynamic mode needs an audience, validated on the
+    # POST-merge state so a request touching only one of the pair still
+    # checks against the other.
+    if gate.audience_required_violation:
+        return JSONResponse({"error": _AUDIENCE_REQUIRED_ERROR}, status_code=400)
+    if gate.static_new_audience_violation:
+        return JSONResponse({"error": _AUDIENCE_FORBIDS_STATIC_ERROR}, status_code=400)
+    if gate.scopes_staging_violation:
+        return JSONResponse({"error": _SCOPES_REQUIRE_EXCHANGE_MODE_ERROR}, status_code=400)
+    if gate.auth_config_changed:
+        # Permission first: the validation 400s below describe deployment OIDC
+        # posture and allow-list membership, which a caller lacking this scope
+        # must not be able to probe.
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
+        # An edit leaving the pair untouched still needs the scope above — it
+        # can redirect or re-arm a live bearer — but is not held to deployment
+        # posture it did not choose.
+        dynamic_auth_error = _validate_dynamic_model_auth(
+            request,
+            auth_mode=gate.eff_auth_mode,
+            audience=gate.eff_audience,
+            posture_event=gate.posture_event,
+            pair_changed=gate.pair_changed,
+        )
+        if dynamic_auth_error is not None:
+            return dynamic_auth_error
+
     if updates:
         storage.update_model_definition(definition_id, **updates)
+        old_alias = str(existing.get("alias") or "")
+        alias_changed = "alias" in updates and updates["alias"] != old_alias
+        if alias_changed or gate.pair_changed or gate.scopes_value_changed:
+            # A rename orphans the OLD alias's identity keys outright; a
+            # re-aim or scope change leaves rows whose bearer was minted for
+            # the superseded shape. Either way the rows purge under the old
+            # alias — the mint-side freshness gate refuses stale rows
+            # regardless, so this is at-rest hygiene, not the serving
+            # guarantee.
+            _purge_model_mint_cache(storage, definition_id, old_alias)
 
     audit_uid, ip = _audit_context(request)
     audit_detail = dict(updates)
     if "api_key" in audit_detail:
         audit_detail["api_key"] = "(updated)"
+    if gate.auth_config_changed:
+        # Make the gate decision reconstructable from the audit row alone.
+        # Inserted FIRST: the audit tab renders only a detail's first three
+        # keys, past which a full-form save buries an appended marker
+        # (pinned: test_auth_markers_render_in_audit_detail_first_keys).
+        audit_detail = {"auth_gated": True, **audit_detail}
+    elif gate.dynamic_involved and gate.pure_disable:
+        # The carve-out's own marker — auth_gated would claim a gate that
+        # deliberately did not run, but a disarm is still an auth-relevant
+        # event the trail must reconstruct. Same first-position insert.
+        audit_detail = {"auth_disarmed": True, **audit_detail}
     record_audit(
         storage,
         audit_uid,
@@ -11494,13 +12880,26 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         ip,
     )
 
+    registry_warning = ""
     if updates:
         await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
         await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
+        await asyncio.to_thread(_ensure_console_mcp_client, request.app)
         _emit_models_changed(request)
+        # The DB write is committed either way, but THIS console's live
+        # registry swap may have been refused (keyless host + dynamic rows).
+        # The refresh's refusal arm records ``coord_registry_error`` and its
+        # success arm clears it, so a non-empty value here means the running
+        # coordinator did NOT adopt this write. With the subsystem UP the 503
+        # remediation path never renders, so surfacing it on the response is
+        # the only evidence the shelf can show.
+        registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
 
     model_def = storage.get_model_definition(definition_id)
-    return JSONResponse(_mask_model_secrets(model_def or {}))
+    payload = _mask_model_secrets(model_def or {})
+    if registry_warning:
+        payload["registry_warning"] = registry_warning
+    return JSONResponse(payload)
 
 
 async def admin_delete_model_definition(request: Request) -> JSONResponse:
@@ -11521,6 +12920,12 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
     if existing is None:
         return JSONResponse({"error": "Model definition not found"}, status_code=404)
 
+    # Purge the definition's mint-cache rows before the row goes away —
+    # after the delete, nothing owns the alias's identity keys and their
+    # encrypted bearers would persist at rest until another definition
+    # claimed the alias.
+    _purge_model_mint_cache(storage, definition_id, str(existing.get("alias") or ""))
+
     storage.delete_model_definition(definition_id)
 
     audit_uid, ip = _audit_context(request)
@@ -11538,7 +12943,14 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
     await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
     _emit_models_changed(request)
 
-    return JSONResponse({"status": "ok", "definition_id": definition_id})
+    # Same refused-swap surfacing as the create/update twins: the row is gone
+    # from the DB, but a keyless console's refused swap keeps SERVING the
+    # deleted alias to running and new coordinator sessions.
+    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    payload: dict[str, Any] = {"status": "ok", "definition_id": definition_id}
+    if registry_warning:
+        payload["registry_warning"] = registry_warning
+    return JSONResponse(payload)
 
 
 async def admin_model_reload(request: Request) -> JSONResponse:
@@ -11567,7 +12979,14 @@ async def admin_model_reload(request: Request) -> JSONResponse:
     _emit_models_changed(request)
 
     results = await _notify_nodes_model_reload(request)
-    return JSONResponse({"status": "ok", "results": results})
+    # This route's whole purpose is "make the live registry match the DB", so
+    # a refused console swap is the one outcome it must not report as
+    # unqualified success. Same surfacing as the create/update twins.
+    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    payload: dict[str, Any] = {"status": "ok", "results": results}
+    if registry_warning:
+        payload["registry_warning"] = registry_warning
+    return JSONResponse(payload)
 
 
 def _global_rerank_instruction(app_state: Any) -> str:
@@ -11726,10 +13145,15 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
     Probe a saved reranker model's /rerank endpoint with the labelled set,
     persist the three calibration fields onto its capabilities, and return a
     verdict. A calibration failure is graceful (``error`` set, ``separated``
-    False, nothing persisted) — never a 500.
+    False, nothing persisted) — never a 500. The one 500 this route returns
+    is the confinement refusal below, where the merge wrote outside its
+    calibration-keys contract: an internal fault, not a calibration outcome.
     """
     from turnstone.core.auth import require_permission
-    from turnstone.core.rerank_calibrate import merge_calibration_into_caps
+    from turnstone.core.rerank_calibrate import (
+        calibration_confinement_violations,
+        merge_calibration_into_caps,
+    )
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
@@ -11787,10 +13211,73 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
         )
 
     # Merge the calibration fields into the stored capabilities JSON.
-    storage.update_model_definition(
-        definition_id,
-        capabilities=merge_calibration_into_caps(existing.get("capabilities"), cal),
-    )
+    #
+    # ``capabilities`` is a GATED column on the model-definition write path
+    # (its server_compat half selects the provider factory), yet this write
+    # runs under admin.models: safe because merge_calibration_into_caps is
+    # structurally confined to the probe-derived calibration keys and cannot
+    # reach server_compat or carry request-controlled JSON (pinned:
+    # test_calibrate_merge_confined_to_calibration_fields). ENFORCED, not
+    # merely pinned (complete mediation on the column's second producer):
+    # the merge is verified to have changed nothing outside its contract and
+    # the write refused otherwise, so a future merge edit cannot smuggle a
+    # gated change past the admin.mcp gate this endpoint deliberately lacks
+    # (pinned: test_calibrate_refuses_merge_that_writes_out_of_band_keys).
+    #
+    # RE-READ the row at persist time, then write CONDITIONALLY: the probe
+    # above holds no lock and can run for up to 90 seconds, so a capabilities
+    # write landing in that window (an admin.mcp-gated PUT — the very writes
+    # the gate protects) must survive this merge. The fresh read only NARROWS
+    # the window; what closes it is the conditional persist
+    # (``expected_capabilities``), where a write landing between read and
+    # update misses the compare and the loop re-merges onto the newer value.
+    # Bounded retries, so under sustained write pressure the calibration
+    # yields with a 409 rather than last-writer-winning over a gated edit
+    # (pinned: test_concurrent_capabilities_put_survives_calibrate and
+    # test_calibrate_cas_retries_when_write_lands_between_reread_and_persist).
+    persisted = False
+    for _ in range(3):
+        current = storage.get_model_definition(definition_id)
+        if current is None:
+            # The row was deleted while the probe ran; same not-found
+            # classification as the head-of-handler check.
+            return JSONResponse({"error": "Model definition not found"}, status_code=404)
+        merged_caps = merge_calibration_into_caps(current.get("capabilities"), cal)
+        violations = calibration_confinement_violations(
+            current.get("capabilities"), merged_caps, cal
+        )
+        if violations:
+            log.error(
+                "model_calibrate.confinement_violation definition_id=%s keys=%s",
+                definition_id,
+                ",".join(violations),
+            )
+            return JSONResponse(
+                {
+                    "error": (
+                        "calibration merge changed capabilities keys outside its "
+                        f"contract ({', '.join(violations)}); write refused"
+                    )
+                },
+                status_code=500,
+            )
+        if storage.update_model_definition(
+            definition_id,
+            capabilities=merged_caps,
+            expected_capabilities=current.get("capabilities"),
+        ):
+            persisted = True
+            break
+    if not persisted:
+        return JSONResponse(
+            {
+                "error": (
+                    "capabilities changed concurrently on every persist attempt; "
+                    "calibration not saved — retry once the edits settle"
+                )
+            },
+            status_code=409,
+        )
 
     audit_uid, ip = _audit_context(request)
     record_audit(
@@ -11810,17 +13297,22 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
     await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
     _emit_models_changed(request)
 
-    return JSONResponse(
-        {
-            "separated": cal.separated,
-            "suggested_threshold": cal.suggested_threshold,
-            "raw_scale": cal.raw_scale,
-            "relevant": [cal.relevant_min, cal.relevant_max],
-            "irrelevant": [cal.irrelevant_min, cal.irrelevant_max],
-            "applied": True,
-            "error": "",
-        }
-    )
+    # Same refused-swap surfacing as the create/update twins: the
+    # calibration is stored, but a keyless console's live registry may
+    # have refused to adopt it.
+    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    payload = {
+        "separated": cal.separated,
+        "suggested_threshold": cal.suggested_threshold,
+        "raw_scale": cal.raw_scale,
+        "relevant": [cal.relevant_min, cal.relevant_max],
+        "irrelevant": [cal.irrelevant_min, cal.irrelevant_max],
+        "applied": True,
+        "error": "",
+    }
+    if registry_warning:
+        payload["registry_warning"] = registry_warning
+    return JSONResponse(payload)
 
 
 async def admin_model_capabilities(request: Request) -> JSONResponse:
@@ -13802,6 +15294,13 @@ def create_app(
         events_replay=_coord_events_replay,
         create_supports_attachments=True,
         create_supports_user_id_override=False,
+        # Coordinator creates honour ``server.require_project`` exactly like
+        # interactive creates — the operator's own token gets no exemption.
+        # Distinct seam: the sessions a coordinator SPAWNS stay exempt via
+        # the ``token_source == "coordinator"`` branch inside
+        # ``require_project_denies_create``; that covers child spawns on
+        # nodes, not creating the coordinator itself.
+        create_gate_require_project=True,
         create_validate_request=_coord_create_validate_request,
         create_build_kwargs=_coord_create_build_kwargs,
         create_post_install=_coord_create_post_install,
@@ -14278,6 +15777,12 @@ def create_app(
                     ),
                     # System: Model Definitions
                     Route("/api/admin/model-definitions", admin_list_model_definitions),
+                    # Static path — must precede the {definition_id} routes or
+                    # Starlette matches it as definition_id="auth-constraints".
+                    Route(
+                        "/api/admin/model-definitions/auth-constraints",
+                        admin_model_auth_constraints,
+                    ),
                     Route(
                         "/api/admin/model-definitions",
                         admin_create_model_definition,

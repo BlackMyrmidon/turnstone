@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from turnstone.core.oidc import OIDCConfig
 
 from turnstone.core.log import get_logger
+from turnstone.core.mcp_client import try_prime_user_pools
 from turnstone.core.oidc import (
     OIDC_STATE_TTL_SECONDS,
     OIDCError,
@@ -44,6 +45,7 @@ from turnstone.core.oidc import (
     exchange_code,
     fetch_jwks,
     generate_pkce_verifier,
+    maybe_rediscover_oidc,
     provision_oidc_user,
     validate_id_token,
 )
@@ -467,6 +469,76 @@ def ensure_project_attachable(
         return (403, "project access could not be verified")
 
 
+# ---------------------------------------------------------------------------
+# server.require_project — opt-in, default-off gate refusing projectless
+# creates on the gated mounts (interactive on nodes, coordinator on the
+# console). One predicate is the ONLY flag read (gate + advisory both call
+# it) so authoritative and advisory logic cannot drift.
+# ---------------------------------------------------------------------------
+
+# Discriminator on the node's 400 body. The console cluster-create proxy
+# surfaces ONLY this coded 400 to the operator and masks every other node
+# outcome to a sanitized 502, so this string is a shared contract — import it
+# on both sides rather than re-spelling the literal.
+REQUIRE_PROJECT_CODE = "require_project"
+
+# Operator-facing 400 message. Deliberately generic: a projectless, private,
+# dangling, or nonexistent fork source must all yield this IDENTICAL text, or
+# the message itself becomes a cross-tenant oracle.
+REQUIRE_PROJECT_ERROR = (
+    "This deployment requires every new chat to be filed under a project. "
+    "Choose a project and try again."
+)
+
+
+def require_project_enabled(config_store: Any) -> bool:
+    """Return True iff the ``server.require_project`` gate is switched on.
+
+    The SINGLE flag read, shared by the authoritative create gate and the
+    advisory ``list_projects`` field so the two cannot diverge in logic.
+    Fail-open: a missing config store (storage unwired) reads as off. The
+    ConfigStore returns the registered SettingDef default (``False``) on a
+    cache miss — so an unset flag is off, not ``None`` — but only because the
+    SettingDef IS registered; forgetting it silently disables the feature.
+    """
+    return config_store is not None and bool(config_store.get("server.require_project"))
+
+
+def require_project_denies_create(config_store: Any, auth: Any, project_id: Any) -> bool:
+    """Return True to REFUSE a gated create under ``server.require_project``.
+
+    Serves both gated mounts: interactive creates on nodes and coordinator
+    creates on the console. Refuses only when the gate is on, the caller is
+    not exempt automation, and no project is attached. The gate counts a
+    project as attached only when ``project_id`` is a non-empty string after
+    stripping; absent, empty, whitespace-only, or a non-string body value
+    (int / bool / list / dict) all read as "no project." Treating a
+    non-string as absent matches how ``_coord_create_build_kwargs`` persists
+    it (``None``) and stops a truthy non-string like ``project_id: 123`` from
+    stringifying past the gate and minting a projectless session while the
+    create stores no project.
+    Exempt identities: the ``service`` scope (channel gateway,
+    scheduler) and the sessions a coordinator spawns
+    (``token_source == "coordinator"`` — minted per coordinator session for
+    its child spawns and sends; no current path lets that token CREATE a
+    coordinator, so the exemption is child-spawn-only in practice. If a
+    coordinator tool ever gains the ability to create coordinators, decide
+    then whether that path should stay exempt). NOT exempt on any admin
+    permission — ``admin.coordinator`` is a human-operator permission and
+    would leak every operator through the gate, including the console
+    coordinator launcher this gate now covers. ``console-proxy`` (the normal
+    proxied human) is deliberately NOT exempt: it carries the human's own
+    scopes, which never include ``service``.
+    """
+    if not require_project_enabled(config_store):
+        return False
+    if auth is not None and auth.has_scope("service"):
+        return False
+    if getattr(auth, "token_source", "") == "coordinator":
+        return False
+    return not (project_id if isinstance(project_id, str) else "").strip()
+
+
 def _permissions_to_scopes(permissions: set[str]) -> frozenset[str]:
     """Derive legacy scopes from a granular permission set."""
     scopes: set[str] = set()
@@ -628,6 +700,7 @@ APPROVE_PATHS: frozenset[str] = frozenset(
     {
         "/api/_internal/config-reload",
         "/api/_internal/mcp-reload",
+        "/api/_internal/model-auth-cache-invalidate",
         "/api/_internal/model-reload",
     }
 )
@@ -978,6 +1051,15 @@ def required_scope(method: str, path: str) -> str:
         normalized.startswith("/api/_internal/mcp-refresh/")
         or normalized.startswith("/api/_internal/mcp-reconnect/")
     ):
+        return "approve"
+
+    # The node's model-status readout carries per-alias backend-auth
+    # configuration (auth mode, OBO audience, exchange scopes) — data the
+    # console serves only behind admin permissions — so this GET is
+    # classified with the admin endpoints instead of falling to the read
+    # default. Service tokens carry ``approve``, so the console collector's
+    # fan-out and scheduler lanes pass unchanged.
+    if normalized == "/api/_internal/model-status":
         return "approve"
 
     # Write endpoints
@@ -1898,6 +1980,14 @@ async def handle_oidc_authorize(request: Request, audience: str) -> Response:
     from starlette.responses import JSONResponse, RedirectResponse
 
     oidc_config = getattr(request.app.state, "oidc_config", None)
+    if oidc_config is not None and not oidc_config.enabled:
+        # Self-heal a transient boot-time discovery outage: the LOGIN path is a
+        # rediscovery trigger too, not just the obo mint path. Without this, a
+        # single-node install (or one where every node booted during the outage)
+        # would keep login dark until an operator restart — the exact symptom
+        # maybe_rediscover_oidc exists to fix. No-op unless discovery_retryable.
+        await maybe_rediscover_oidc(request.app.state)
+        oidc_config = getattr(request.app.state, "oidc_config", None)
     if not oidc_config or not oidc_config.enabled:
         return JSONResponse({"error": "OIDC not configured"}, status_code=404)
 
@@ -1988,6 +2078,12 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
     from starlette.responses import JSONResponse, RedirectResponse
 
     oidc_config = getattr(request.app.state, "oidc_config", None)
+    if oidc_config is not None and not oidc_config.enabled:
+        # Self-heal a transient boot-time discovery outage on the login path too
+        # (see handle_oidc_authorize). A user mid-flow whose authorize landed on
+        # a recovered node can still complete the callback here.
+        await maybe_rediscover_oidc(request.app.state)
+        oidc_config = getattr(request.app.state, "oidc_config", None)
     if not oidc_config or not oidc_config.enabled:
         return JSONResponse({"error": "OIDC not configured"}, status_code=404)
 
@@ -2108,6 +2204,52 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
         log.exception("OIDC callback error")
         _record_oidc_failure()
         return RedirectResponse("/?oidc_error=Authentication+failed", status_code=302)
+
+    # Capture the IdP refresh token as the user's single OBO credential
+    # (issue #551).  Best-effort: capture failure must not block login —
+    # the mint path surfaces a missing credential on the reconnect rail.
+    if oidc_config.capture_user_credential:
+        idp_refresh_token = tokens.get("refresh_token")
+        token_store = getattr(request.app.state, "mcp_token_store", None)
+        if not isinstance(idp_refresh_token, str) or not idp_refresh_token:
+            log.info(
+                "oidc.capture: no refresh_token in token response (user=%s) — "
+                "check the IdP allows offline_access for this client",
+                user["user_id"],
+            )
+        elif token_store is None:
+            log.warning(
+                "oidc.capture: enabled but no token encryption key configured — "
+                "credential NOT captured (user=%s)",
+                user["user_id"],
+            )
+        else:
+            try:
+                await asyncio.to_thread(
+                    token_store.upsert_oidc_credential,
+                    user["user_id"],
+                    oidc_config.issuer,
+                    refresh_token=idp_refresh_token,
+                )
+            except Exception:
+                log.exception("oidc.capture: failed to persist credential")
+            else:
+                # Re-login is the OBO restore moment (#836): a dropped
+                # obo catalog (credential unlinked / mint rejected) has
+                # no consent flow to heal through, so warm this user's
+                # pools now — live sessions pick the tools back up via
+                # their listeners. Gated on a LIVE session: routine SSO
+                # re-logins by users with nothing open must not fan out
+                # mints and transport connects at deployment scale.
+                # Fire-and-forget; a failure changes nothing about login
+                # (the credential is already persisted; the JWT is not
+                # yet issued) — the helper owns the swallow.
+                try_prime_user_pools(
+                    getattr(request.app.state, "mcp_client", None),
+                    user["user_id"],
+                    require_live_listener=True,
+                    context="oidc-capture",
+                )
 
     # Load permissions and issue Turnstone JWT
     perms = await asyncio.to_thread(_load_user_permissions, storage, user["user_id"])

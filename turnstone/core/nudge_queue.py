@@ -15,7 +15,23 @@ Channels:
     * ``"tool"`` — only drains at tool-result seams.
     * ``"any"``  — drains at whichever seam fires first (used for
       wake-trigger-driven nudges that should not be pinned to a
-      specific drain seam).
+      specific drain seam) AND counts toward the idle-wake gate
+      (:data:`WAKE_PENDING`).
+    * ``"quiet"`` — drains at whichever seam fires first, but does NOT
+      count toward the idle-wake gate.  A user cancel demotes pending
+      ``"any"`` entries here: the external event (watch fire,
+      background-shell exit) is still delivered at the next seam, but it
+      must not wake the workstream the user just stopped.
+    * ``"wake"`` — delivers ONLY via the idle wake.  A member of
+      :data:`WAKE_PENDING` and of no drain set: invisible to
+      ``USER_DRAIN``, ``TOOL_DRAIN``, and the wake path's quiet
+      ride-along.  The idle-nudge producer
+      (``CoordinatorIdleObserver``) uses it because its entries speak
+      about an IDLE state — delivered at a user or tool seam they would
+      describe a moment that no longer exists.  A user cancel DROPS
+      pending ``"wake"`` entries rather than demoting them to
+      ``"quiet"``: demotion would hand them to exactly the seams this
+      channel exists to be invisible to.
 
 Drain preserves FIFO order; non-matching entries stay queued.  Each
 entry can carry an optional ``valid_until`` predicate that drain
@@ -40,19 +56,44 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-Channel = Literal["user", "tool", "any"]
-_VALID_CHANNELS: frozenset[str] = frozenset({"user", "tool", "any"})
+Channel = Literal["user", "tool", "any", "quiet", "wake"]
+_VALID_CHANNELS: frozenset[str] = frozenset({"user", "tool", "any", "quiet", "wake"})
 
 # Module-level filter constants — most callers want one of these and
 # pre-allocating spares us a frozenset construction at every drain seam.
-USER_DRAIN: frozenset[str] = frozenset({"user", "any"})
-TOOL_DRAIN: frozenset[str] = frozenset({"tool", "any"})
+USER_DRAIN: frozenset[str] = frozenset({"user", "any", "quiet"})
+TOOL_DRAIN: frozenset[str] = frozenset({"tool", "any", "quiet"})
+# The idle-wake GATE (``IdleNudgeWatcher``): which pending channels justify
+# waking an idle workstream.  Deliberately excludes ``"quiet"`` — entries a
+# user cancel demoted must ride the next legitimate seam/wake, never cause
+# one, or Stop is followed seconds later by an autonomous resume.
+# ``"wake"`` is a member here and NOWHERE else: the wake is both the only
+# seam that may deliver those entries and a seam they justify.
+WAKE_PENDING: frozenset[str] = frozenset({"user", "any", "wake"})
+# The wake-only channel, named once: the idle-nudge producer's enqueue
+# target, the abandoned-generation drop set (dropped, never demoted — see
+# the channel table above), and the interjection handoff's drop set.
+WAKE_CHANNEL: Channel = "wake"
+# The quiet channel, named once: the demotion target for external events a
+# user cancel must not let re-wake the workstream, and the ride-along drain
+# the wake path uses after its WAKE_PENDING pass.
+QUIET_CHANNEL: Channel = "quiet"
+QUIET_DRAIN: frozenset[str] = frozenset({QUIET_CHANNEL})
 
 
-class _Entry(NamedTuple):
+class Entry(NamedTuple):
+    """One queued nudge.  Public so consumers of
+    :meth:`NudgeQueue.drain_entries` can give entries back via
+    :meth:`NudgeQueue.requeue` — which preserves ``valid_until`` AND the
+    original ``seq`` (a plain :meth:`NudgeQueue.enqueue` would assign a
+    fresh seq and re-order a recovered older notice after newer events).
+    ``seq`` is the queue-global insertion number multi-channel drains sort
+    on to restore chronology."""
+
     nudge_type: str
     text: str
     channel: Channel
+    seq: int = 0
     valid_until: Callable[[], bool] | None = None
     # Producer-supplied optional fields that ride alongside ``text`` when
     # drained — used by ``watch_triggered`` to carry ``watch_name`` /
@@ -70,8 +111,16 @@ class NudgeQueue:
     """Single-session FIFO queue with channel-tagged entries."""
 
     def __init__(self) -> None:
-        self._items: deque[_Entry] = deque()
+        self._items: deque[Entry] = deque()
+        self._seq = 0
         self._lock = threading.Lock()
+        # Monotonic count of :meth:`drain_entries` invocations, exposed
+        # via :meth:`drain_pass`.  Every ``valid_until`` predicate a
+        # given ``drain_entries`` call evaluates observes the same
+        # value, and the next call observes a larger one — the identity
+        # a consumer needs to memoise an expensive shared read for
+        # exactly one drain pass (no wall-clock TTL).
+        self._drain_pass = 0
 
     def enqueue(
         self,
@@ -105,7 +154,8 @@ class NudgeQueue:
         if channel not in _VALID_CHANNELS:
             raise ValueError(f"channel={channel!r}; expected one of {sorted(_VALID_CHANNELS)}")
         with self._lock:
-            self._items.append(_Entry(nudge_type, text, channel, valid_until, metadata))
+            self._seq += 1
+            self._items.append(Entry(nudge_type, text, channel, self._seq, valid_until, metadata))
 
     def drain(
         self, channels: frozenset[str] | set[str]
@@ -122,7 +172,20 @@ class NudgeQueue:
         without delivering it.  Already-removed-from-queue either way —
         dropped entries don't ride a future drain.
         """
+        return [(e.nudge_type, e.text, e.metadata) for e in self.drain_entries(channels)]
+
+    def drain_entries(self, channels: frozenset[str] | set[str]) -> list[Entry]:
+        """Like :meth:`drain` but returns the surviving :class:`Entry`
+        records whole — ``seq`` for cross-channel chronology merges and
+        ``valid_until`` so a consumer that must give an entry back (the
+        wake path's failed-send re-enqueue) can do so without stripping
+        its staleness predicate.
+        """
         with self._lock:
+            # New pass FIRST, empty or not: a pass-scoped predicate memo
+            # keyed on :meth:`drain_pass` must never see two invocations
+            # share a value.
+            self._drain_pass += 1
             if not self._items:
                 return []
             # Fast path: every entry matches → swap deque rather than
@@ -131,10 +194,10 @@ class NudgeQueue:
             # ``USER_DRAIN`` / ``TOOL_DRAIN`` (channel + "any") and
             # most queues hold only one channel's entries at a time.
             if all(entry.channel in channels for entry in self._items):
-                candidates: list[_Entry] = list(self._items)
+                candidates: list[Entry] = list(self._items)
                 self._items = deque()
             else:
-                kept: deque[_Entry] = deque()
+                kept: deque[Entry] = deque()
                 candidates = []
                 for entry in self._items:
                     if entry.channel in channels:
@@ -150,14 +213,14 @@ class NudgeQueue:
         # every child closed) and logs at ``info``; a raised exception
         # is a wiring bug (predicate is misbehaving) and stays at
         # ``warning`` with ``exc_info`` so the traceback surfaces.
-        out: list[tuple[str, str, dict[str, Any] | None]] = []
+        out: list[Entry] = []
         for entry in candidates:
             if entry.valid_until is None:
-                out.append((entry.nudge_type, entry.text, entry.metadata))
+                out.append(entry)
                 continue
             try:
                 if entry.valid_until():
-                    out.append((entry.nudge_type, entry.text, entry.metadata))
+                    out.append(entry)
                     continue
                 log.info(
                     "nudge_queue.predicate_dropped",
@@ -181,16 +244,93 @@ class NudgeQueue:
                 )
         return out
 
+    def drain_pass(self) -> int:
+        """The current :meth:`drain_entries` invocation count.
+
+        A ``valid_until`` predicate runs inside exactly one drain pass,
+        so a consumer that must answer one expensive question COHERENTLY
+        for every entry that pass evaluates (the coordinator observer's
+        children read) keys its memo on ``(scope, drain_pass())`` — the
+        same value within a pass, a different value across passes, and
+        no wall clock anywhere.  Predicates evaluate outside the queue
+        lock, so taking it briefly here cannot deadlock.
+        """
+        with self._lock:
+            return self._drain_pass
+
     def __len__(self) -> int:
-        """Current depth.  Used by the future IdleNudgeWatcher gate."""
+        """Current depth.  Tests and introspection; the idle-wake gate
+        reads :meth:`has_pending` instead."""
         with self._lock:
             return len(self._items)
 
     def clear(self) -> int:
-        """Drop every entry; return the count cleared.  Used in cancel paths."""
+        """Drop every entry regardless of channel; return the count cleared.
+
+        No longer on the cancel path — abandoned generations use
+        :meth:`clear_channels` + :meth:`demote_channel` so external events
+        survive.  Kept for tests and for full-reset callers that truly mean
+        "everything".
+        """
         with self._lock:
             n = len(self._items)
             self._items.clear()
+            return n
+
+    def requeue(self, entry: Entry, *, channel: Channel | None = None) -> None:
+        """Give a drained :class:`Entry` back to the queue, KEEPING its seq.
+
+        A plain :meth:`enqueue` would assign a fresh (higher) seq, so a
+        failed delivery's re-queued OLDER notice would sort after events
+        that arrived during the failed attempt — running poll counters
+        backwards at the next seq-merged wake.  Insertion is positioned by
+        seq so plain FIFO drains stay chronological too.  ``channel``
+        overrides the entry's channel (the wake path demotes ``"any"`` →
+        ``"quiet"``); ``valid_until`` and ``metadata`` ride unchanged.
+        """
+        dst = channel if channel is not None else entry.channel
+        if dst not in _VALID_CHANNELS:
+            raise ValueError(f"channel={dst!r}; expected one of {sorted(_VALID_CHANNELS)}")
+        restored = entry._replace(channel=dst)
+        with self._lock:
+            for i, existing in enumerate(self._items):
+                if existing.seq > restored.seq:
+                    self._items.insert(i, restored)
+                    return
+            self._items.append(restored)
+
+    def demote_channel(self, src: Channel, dst: Channel) -> int:
+        """Atomically re-tag every ``src``-channel entry as ``dst``; return
+        the count.  Order, text, metadata and ``valid_until`` are preserved
+        — only drain/wake eligibility changes.  The cancel path uses this to
+        take ``"any"`` entries out of the idle-wake gate (→ ``"quiet"``)
+        without dropping the external events they announce.
+        """
+        if dst not in _VALID_CHANNELS:
+            raise ValueError(f"channel={dst!r}; expected one of {sorted(_VALID_CHANNELS)}")
+        with self._lock:
+            demoted = 0
+            for i, entry in enumerate(self._items):
+                if entry.channel == src:
+                    self._items[i] = entry._replace(channel=dst)
+                    demoted += 1
+            return demoted
+
+    def clear_channels(self, channels: frozenset[str] | set[str]) -> int:
+        """Drop entries whose channel is in ``channels``; return the count.
+
+        The abandoned-generation paths use this instead of :meth:`clear`:
+        ``"tool"``/``"user"`` advisories are generation-scoped commentary
+        (a stale ``repeat`` nudge must not bleed into the next send), but
+        ``"any"``-channel entries are EXTERNAL events — a watch fire or a
+        background-shell exit that happened during the doomed generation
+        still happened, and dropping it would silently break the "you will
+        be notified" contract those producers promised the model.
+        """
+        with self._lock:
+            kept = deque(e for e in self._items if e.channel not in channels)
+            n = len(self._items) - len(kept)
+            self._items = kept
             return n
 
     def count_by_type(self, nudge_type: str, channel: Channel | None = None) -> int:

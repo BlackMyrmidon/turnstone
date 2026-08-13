@@ -27,8 +27,10 @@ from typing import Any
 
 from openai import OpenAI
 
+from turnstone.core.model_turn import cap_tool_calls, model_turn, resolve_lane
 from turnstone.core.providers import LLMProvider, create_provider
 from turnstone.core.session import ChatSession
+from turnstone.core.trajectory import Turn, final_assistant_text
 from turnstone.eval.core import (
     _MCP_ONLY_TOOLS,
     BOLD,
@@ -224,6 +226,23 @@ Output the modified optimizer instructions only.\
 """
 
 
+def _strip_markdown_fence(text: str) -> str:
+    """Unwrap a markdown-fenced block from MODEL output.
+
+    THE fence rule, in one place: a complete ``` pair yields its innards
+    (discarding any prose outside the fences); an unterminated opening
+    fence drops just the fence line.  Callers apply this to normalized
+    model output ONLY — never to an ``or``-fallback value, which must
+    survive verbatim.
+    """
+    fence_match = re.search(r"```[^\n]*\n(.*?)```", text, re.DOTALL)
+    if fence_match:
+        return fence_match.group(1).strip()
+    if text.startswith("```"):
+        return "\n".join(text.split("\n")[1:]).strip()
+    return text
+
+
 def _diversify_prompts(
     client: Any,
     model: str,
@@ -237,6 +256,11 @@ def _diversify_prompts(
     user_prompt is always included as the first variant.
     """
     prov = provider or create_provider("openai")
+    # Sampling is not pinned and NOT coupled to run_optimization's
+    # --temperature/--reasoning-effort (those knobs belong to the model
+    # under test): this registry-less lane omits both fields and the
+    # diversifier model's serving defaults rule.
+    lane = resolve_lane(prov, client, model)
     result: dict[str, list[str]] = {}
 
     for ci, case in enumerate(cases):
@@ -291,29 +315,13 @@ def _diversify_prompts(
         )
 
         try:
-            cr = prov.create_completion(
-                client=client,
-                model=model,
-                messages=[
-                    {"role": "system", "content": DIVERSIFIER_SYSTEM},
-                    {"role": "user", "content": user_content},
-                ],
+            cr = model_turn(
+                lane,
+                [Turn.system(DIVERSIFIER_SYSTEM), Turn.user(user_content)],
                 max_tokens=8192,
-                temperature=0.8,
-                reasoning_effort="low",
             )
             raw = (cr.content or "").strip()
-            # Strip reasoning tags
-            raw = re.sub(
-                r"<(?:think|reasoning)>.*?</(?:think|reasoning)>",
-                "",
-                raw,
-                flags=re.DOTALL,
-            ).strip()
-            # Strip markdown fences
-            fence_match = re.search(r"```[^\n]*\n(.*?)```", raw, re.DOTALL)
-            if fence_match:
-                raw = fence_match.group(1).strip()
+            raw = _strip_markdown_fence(raw)
 
             new_variants = json.loads(raw)
             if isinstance(new_variants, list) and all(isinstance(v, str) for v in new_variants):
@@ -447,30 +455,17 @@ def _observe_and_update_optimizer(
     )
 
     prov = provider or create_provider("openai")
-    cr = prov.create_completion(
-        client=client,
-        model=model,
-        messages=[
-            {"role": "system", "content": OBSERVER_SYSTEM},
-            {"role": "user", "content": user_content},
-        ],
+    cr = model_turn(
+        resolve_lane(prov, client, model),
+        [Turn.system(OBSERVER_SYSTEM), Turn.user(user_content)],
         max_tokens=8192,
-        temperature=0.3,
-        reasoning_effort="low",
     )
 
-    result = cr.content or optimizer_system
-    result = re.sub(
-        r"<(?:think|reasoning)>.*?</(?:think|reasoning)>",
-        "",
-        result,
-        flags=re.DOTALL,
-    ).strip()
-
-    # Strip markdown code fences if wrapped
-    fence_match = re.search(r"```[^\n]*\n(.*?)```", result, re.DOTALL)
-    if fence_match:
-        result = fence_match.group(1).strip()
+    # Normalize the MODEL's output first (strip, then unfence), and only
+    # then fall back: a no-answer pass — empty, whitespace-only, or
+    # fence-with-nothing — keeps the current observer system VERBATIM,
+    # never wiped and never itself fence-stripped.
+    result = _strip_markdown_fence((cr.content or "").strip()) or optimizer_system
 
     # Reject degenerate outputs (>200% of input length)
     if len(result) > len(optimizer_system) * 2.0:
@@ -762,63 +757,42 @@ def _run_analyst(
         )
 
     prov = provider or create_provider("openai")
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": analyst_system},
-        {"role": "user", "content": user_content},
+    turns: list[Turn] = [
+        Turn.system(analyst_system),
+        Turn.user(user_content),
     ]
 
-    # Multi-turn loop: let the analyst call tools up to 5 rounds
+    # Multi-turn loop: let the analyst call tools up to 5 rounds.
+    # Sampling is not pinned and not coupled to the test model's knobs —
+    # this registry-less lane omits both fields (serving defaults rule).
+    lane = resolve_lane(prov, client, model)
     max_turns = 5
     for _turn in range(max_turns):
-        cr = prov.create_completion(
-            client=client,
-            model=model,
-            messages=messages,
+        mtr = model_turn(
+            lane,
+            turns,
             tools=_ANALYST_TOOLS,
             max_tokens=8192,
-            temperature=0.3,
-            reasoning_effort="medium",
         )
 
-        assistant_msg: dict[str, Any] = {
-            "role": "assistant",
-            "content": cr.content or None,
-        }
-        if cr.tool_calls:
-            assistant_msg["tool_calls"] = cr.tool_calls[:5]
-        messages.append(assistant_msg)
+        # Same degenerate-repetition cap as before (shared guard — see
+        # model_turn.cap_tool_calls for the native-lane-drop rationale).
+        capped, assistant_turn = cap_tool_calls(mtr, 5)
+        turns.append(assistant_turn)
 
-        if not cr.tool_calls:
+        if not capped:
             break
 
         # Execute tool calls
-        for tc in assistant_msg["tool_calls"]:
+        for tc in capped:
             func_name = tc["function"]["name"]
             output = _exec_analyst_tool(func_name, tc["function"]["arguments"])
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": output,
-                }
-            )
+            turns.append(Turn.tool(tc["id"], output))
 
-    # Extract final text response
-    result = ""
-    for msg in reversed(messages):
-        if msg["role"] == "assistant" and msg.get("content"):
-            result = msg["content"]
-            break
-
-    # Strip reasoning tags if present
-    result = re.sub(
-        r"<(?:think|reasoning)>.*?</(?:think|reasoning)>",
-        "",
-        result,
-        flags=re.DOTALL,
-    ).strip()
-
-    return result
+    # The analysis is the analyst's FINAL say only — the no-walk-back read
+    # (an all-reasoning or silent final turn yields "" and the analyst
+    # section is skipped, never an earlier mid-loop narration).
+    return final_assistant_text(turns)
 
 
 TOOL_OPTIMIZER_SYSTEM = """\
@@ -920,27 +894,13 @@ def _propose_tool_overrides(
     )
 
     prov = provider or create_provider("openai")
-    cr = prov.create_completion(
-        client=client,
-        model=model,
-        messages=[
-            {"role": "system", "content": TOOL_OPTIMIZER_SYSTEM},
-            {"role": "user", "content": user_content},
-        ],
+    cr = model_turn(
+        resolve_lane(prov, client, model),
+        [Turn.system(TOOL_OPTIMIZER_SYSTEM), Turn.user(user_content)],
         max_tokens=8192,
-        temperature=0.3,
-        reasoning_effort="medium",
     )
 
-    raw = (cr.content or "").strip()
-    # Strip reasoning tags
-    raw = re.sub(
-        r"<(?:think|reasoning)>.*?</(?:think|reasoning)>", "", raw, flags=re.DOTALL
-    ).strip()
-    # Strip markdown fences
-    fence_match = re.search(r"```[^\n]*\n(.*?)```", raw, re.DOTALL)
-    if fence_match:
-        raw = fence_match.group(1).strip()
+    raw = _strip_markdown_fence((cr.content or "").strip())
 
     try:
         new_overrides = json.loads(raw)
@@ -1067,38 +1027,18 @@ def _propose_prompt_modification(
     )
 
     prov = provider or create_provider("openai")
-    cr = prov.create_completion(
-        client=client,
-        model=model,
-        messages=[
-            {"role": "system", "content": optimizer_system},
-            {"role": "user", "content": user_content},
-        ],
+    cr = model_turn(
+        resolve_lane(prov, client, model),
+        [Turn.system(optimizer_system), Turn.user(user_content)],
         max_tokens=16384,
-        temperature=0.6,
-        reasoning_effort="medium",
     )
 
-    new_prompt = cr.content or current_prompt
-
-    # Strip reasoning tags if present
-    new_prompt = re.sub(
-        r"<(?:think|reasoning)>.*?</(?:think|reasoning)>",
-        "",
-        new_prompt,
-        flags=re.DOTALL,
-    ).strip()
-
-    # Strip markdown code fences if the model wrapped the prompt.
-    # Also discard any explanation text outside the fences.
-    fence_match = re.search(r"```[^\n]*\n(.*?)```", new_prompt, re.DOTALL)
-    if fence_match:
-        new_prompt = fence_match.group(1).strip()
-    elif new_prompt.startswith("```"):
-        # Opening fence without closing — strip just the first line
-        new_prompt = "\n".join(new_prompt.split("\n")[1:]).strip()
-
-    return new_prompt
+    # Normalize the MODEL's output first (strip, then unfence), and only
+    # then fall back: a no-answer pass — empty, whitespace-only, or
+    # fence-with-nothing — keeps the current prompt VERBATIM (reads as
+    # "no changes" downstream; never an empty-prompt tree node, and the
+    # fence-strip must never run on the fallback itself).
+    return _strip_markdown_fence((cr.content or "").strip()) or current_prompt
 
 
 def _simple_diff(old: str, new: str) -> str:
@@ -1204,9 +1144,9 @@ def run_optimization(
     initial_prompt: str | None = None,
     n_runs: int | None = 3,
     max_iterations: int = 5,
-    temperature: float = 0.7,
+    temperature: float | None = None,
     max_tokens: int = 32768,
-    reasoning_effort: str = "medium",
+    reasoning_effort: str | None = None,
     output_file: str = "eval_results.json",
     context_window: int = 131072,
     verbose: bool = False,
@@ -1894,8 +1834,11 @@ def main() -> None:
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.7,
-        help="Sampling temperature (default: 0.7)",
+        default=None,
+        help="Sampling temperature for the model under test. Omitted from "
+        "the wire by default so the alias / stored setting / serving "
+        "default applies; meta lanes — diversifier/observer/analyst/"
+        "optimizers — always inherit their own model's serving defaults",
     )
     parser.add_argument(
         "--max-tokens",
@@ -1905,9 +1848,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--reasoning-effort",
-        default="medium",
-        choices=["low", "medium", "high"],
-        help="Reasoning effort (default: medium)",
+        default=None,
+        help="Reasoning effort for the model under test, forwarded "
+        "verbatim — the model's chat template is the sole authority on "
+        "valid tokens. Omitted from the wire by default; meta lanes "
+        "inherit their own model's defaults",
     )
     parser.add_argument(
         "--context-window",

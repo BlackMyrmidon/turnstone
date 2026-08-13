@@ -7,6 +7,8 @@ import time
 from typing import Any
 from unittest.mock import MagicMock
 
+from tests._session_helpers import as_stream
+from tests._session_helpers import mock_completion_result as _mock_result
 from turnstone.core import fence
 from turnstone.core.judge import JudgeConfig
 from turnstone.core.output_guard_judge import (
@@ -15,29 +17,30 @@ from turnstone.core.output_guard_judge import (
     OutputJudgeVerdict,
     _extract_json,
 )
+from turnstone.core.providers._protocol import ModelCapabilities
 
 
 def _make_provider(
     content: str = "", *, delay: float = 0.0, raises: Exception | None = None
 ) -> Any:
-    """Build a mock LLMProvider whose create_completion returns the given content."""
+    """Build a mock LLMProvider whose create_streaming returns the given content."""
     provider = MagicMock()
     provider.provider_name = "openai"
-    # The judge reads context_window at construction for its oversize guard.
-    caps = MagicMock()
-    caps.context_window = 200_000
-    provider.get_capabilities = MagicMock(return_value=caps)
+    # The judge reads context_window at construction for its oversize
+    # guard.  A REAL ModelCapabilities, never a MagicMock: every mock
+    # attribute is truthy, so any boolean capability the code consults
+    # (the drain's ``server_parses_reasoning`` scan gate, and whatever
+    # field lands next) would silently flip behavior for the suite.
+    provider.get_capabilities = MagicMock(return_value=ModelCapabilities(context_window=200_000))
 
-    def _create_completion(**_kwargs: Any) -> Any:
+    def _create_streaming(**_kwargs: Any) -> Any:
         if delay:
             time.sleep(delay)
         if raises is not None:
             raise raises
-        result = MagicMock()
-        result.content = content
-        return result
+        return as_stream(_mock_result(content))
 
-    provider.create_completion = _create_completion
+    provider.create_streaming = _create_streaming
     return provider
 
 
@@ -66,6 +69,78 @@ def _make_judge(
     )
     judge._create_client = lambda: client  # type: ignore[method-assign]
     return judge
+
+
+class TestCapabilityThreading:
+    """#823: the output-guard judge threads resolved capabilities to
+    create_streaming, like every other sampling lane."""
+
+    @staticmethod
+    def _recording_provider() -> tuple[Any, dict[str, Any]]:
+        captured: dict[str, Any] = {}
+
+        def _cc(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return as_stream(_mock_result('{"risk_level": "none", "flags": []}'))
+
+        provider = MagicMock()
+        provider.provider_name = "openai"
+        provider.get_capabilities = MagicMock(
+            return_value=ModelCapabilities(context_window=200_000)
+        )
+        provider.create_streaming = MagicMock(side_effect=_cc)
+        return provider, captured
+
+    def test_fallback_threads_session_capabilities(self) -> None:
+        provider, captured = self._recording_provider()
+        sess_caps = ModelCapabilities(context_window=40_000, effort_passthrough=True)
+        client = MagicMock(base_url="http://s", api_key="k")
+        judge = OutputGuardJudge(
+            config=JudgeConfig(output_guard_llm=True),  # no alias → fallback
+            session_provider=provider,
+            session_client=client,
+            session_model="m",
+            session_capabilities=sess_caps,
+        )
+        judge._create_client = lambda: client  # type: ignore[method-assign]
+        assert judge._capabilities is sess_caps
+        v = judge.evaluate("a small, safe output", func_name="bash", call_id="c1")
+        assert v.succeeded
+        assert captured["capabilities"] is sess_caps
+
+    def test_alias_merges_operator_capabilities(self) -> None:
+        provider, captured = self._recording_provider()
+        provider.get_capabilities = MagicMock(return_value=ModelCapabilities(supports_tools=True))
+        cfg = MagicMock()
+        cfg.context_window = 64_000
+        cfg.capabilities = {"supports_tools": False}
+        registry = MagicMock()
+        registry.has_alias.return_value = True
+        registry.resolve_binding.return_value = (
+            MagicMock(base_url="http://a", api_key="k"),
+            "local-9b",
+            cfg,
+            provider,
+            0,
+        )
+        # The unified lane resolver (model_turn.resolve_capabilities) fetches
+        # the config itself rather than taking resolve_binding()'s copy.
+        registry.get_config.return_value = cfg
+        client = MagicMock(base_url="http://s", api_key="k")
+        judge = OutputGuardJudge(
+            config=JudgeConfig(output_guard_llm=True, output_guard_model="og"),
+            session_provider=_make_provider(),
+            session_client=client,
+            session_model="m",
+            session_capabilities=ModelCapabilities(context_window=100_000),
+            model_registry=registry,
+        )
+        judge._create_client = lambda: client  # type: ignore[method-assign]
+        assert judge._capabilities.supports_tools is False  # operator override applied
+        v = judge.evaluate("a small, safe output", func_name="bash", call_id="c1")
+        assert v.succeeded
+        assert captured["capabilities"] is judge._capabilities
+        assert captured["capabilities"].supports_tools is False
 
 
 class TestVerdictDataclass:
@@ -285,35 +360,44 @@ class TestOversizeGuard:
         local model and would leave the guard blind to overflow."""
         provider = _make_provider(content='{"risk_level": "none", "flags": []}')
         # provider caps report the fictitious 200k; the guard must ignore it.
-        provider.get_capabilities = MagicMock(return_value=MagicMock(context_window=200_000))
+        provider.get_capabilities = MagicMock(
+            return_value=ModelCapabilities(context_window=200_000)
+        )
         judge = OutputGuardJudge(
             config=JudgeConfig(output_guard_llm=True),  # no output_guard_model
             session_provider=provider,
             session_client=MagicMock(base_url="http://test", api_key="k"),
             session_model="test-model",
-            context_window=40_000,  # the session's real window
+            # The session's real window rides in the resolved caps the caller
+            # passes; the guard must key off it, not provider.get_capabilities().
+            session_capabilities=ModelCapabilities(context_window=40_000),
         )
         assert judge._judge_context_window == 40_000
 
     def test_zero_window_coerced_away_on_both_paths(self) -> None:
         """A config.toml context_window=0 (present but unusable) must not zero
         the guard: coerce to the session window (alias path) / the default."""
-        from turnstone.core.output_guard_judge import _DEFAULT_JUDGE_CONTEXT_WINDOW
+        from turnstone.core.judge import _DEFAULT_JUDGE_CONTEXT_WINDOW
 
         # Alias path: ModelConfig.context_window == 0 → session window.
         cfg = MagicMock()
         cfg.context_window = 0
         registry = MagicMock()
         registry.has_alias.return_value = True
-        registry.resolve.return_value = (MagicMock(base_url="http://a", api_key="k"), "m", cfg)
-        registry.get_provider.return_value = _make_provider()
+        registry.resolve_binding.return_value = (
+            MagicMock(base_url="http://a", api_key="k"),
+            "m",
+            cfg,
+            _make_provider(),
+            0,
+        )
         alias_judge = OutputGuardJudge(
             config=JudgeConfig(output_guard_llm=True, output_guard_model="og"),
             session_provider=_make_provider(),
             session_client=MagicMock(base_url="http://s", api_key="s"),
             session_model="m",
             model_registry=registry,
-            context_window=64_000,
+            session_capabilities=ModelCapabilities(context_window=64_000),
         )
         assert alias_judge._judge_context_window == 64_000
 
@@ -353,8 +437,13 @@ class TestAliasResolution:
         alias_client = MagicMock(base_url="http://alias", api_key="alias-key")
         alias_provider = MagicMock()
         alias_provider.provider_name = "anthropic"
-        registry.resolve.return_value = (alias_client, "claude-haiku-4-5", None)
-        registry.get_provider.return_value = alias_provider
+        registry.resolve_binding.return_value = (
+            alias_client,
+            "claude-haiku-4-5",
+            None,
+            alias_provider,
+            0,
+        )
         config = JudgeConfig(
             output_guard_llm=True,
             output_guard_model="my-judge",
@@ -552,3 +641,25 @@ class TestExtractJson:
             " (note: not valid JSON, missing braces and quote handling)"
         )
         assert _extract_json(broken) is None
+
+
+class TestInlineReasoningSeam:
+    """#965 per-lane pins: guard content arrives IR-clean from the drain."""
+
+    def test_draft_verdict_inside_think_cannot_shadow_real_verdict(self) -> None:
+        judge = _make_judge(
+            content=(
+                '<think>draft: {"risk_level": "high", "flags": ["exfil"]}</think>'
+                '{"risk_level": "none", "flags": []}'
+            )
+        )
+        v = judge.evaluate("tool output", func_name="bash", call_id="c1")
+        assert v.succeeded
+        assert v.risk_level == "none"
+        assert v.flags == ()
+
+    def test_think_only_response_is_empty_response_error(self) -> None:
+        judge = _make_judge(content="<think>all deliberation, no verdict</think>")
+        v = judge.evaluate("tool output", func_name="bash", call_id="c1")
+        assert not v.succeeded
+        assert v.error == "empty_response"

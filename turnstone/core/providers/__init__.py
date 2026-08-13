@@ -10,16 +10,23 @@ from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
 from turnstone.core.providers._protocol import (
     CompletionResult,
+    IncompleteStreamError,
     LLMProvider,
     ModelCapabilities,
     StreamChunk,
     ToolCallDelta,
     UsageInfo,
+    accumulate_tool_call_delta,
+    drain_stream,
+    merge_usage,
+    thinking_off_template_kwargs,
+    transport_guarded,
 )
 from turnstone.core.providers._xai import XAI_DEFAULT_BASE_URL, XAIProvider
 
 __all__ = [
     "CompletionResult",
+    "IncompleteStreamError",
     "LLMProvider",
     "ModelCapabilities",
     "OpenAIChatCompletionsProvider",
@@ -29,10 +36,15 @@ __all__ = [
     "ToolCallDelta",
     "UsageInfo",
     "XAIProvider",
+    "accumulate_tool_call_delta",
     "create_client",
     "create_provider",
+    "drain_stream",
     "list_known_models",
     "lookup_model_capabilities",
+    "merge_usage",
+    "thinking_off_template_kwargs",
+    "transport_guarded",
 ]
 
 # Singleton instances (stateless, safe to share).

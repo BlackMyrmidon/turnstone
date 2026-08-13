@@ -28,13 +28,19 @@ schema plus turnstone-specific metadata keys:
 }
 ```
 
-**Metadata keys** (stripped before sending the schema to the model):
+**Metadata keys** (stripped before sending the schema to the model; the full
+set lives in `_META_KEYS` in `turnstone/core/tools.py`):
 
-| Key            | Type | Meaning |
-|----------------|------|---------|
-| `task_agent`   | bool | Tool is available to task sub-agents. |
-| `auto_approve` | bool | Tool runs without user confirmation (read-only, safe operations). |
-| `primary_key`  | str  | When the model sends a bare string instead of JSON args, map it to this parameter name. |
+| Key              | Type | Meaning |
+|------------------|------|---------|
+| `task_agent`     | bool | Tool is available to task sub-agents. |
+| `coordinator`    | bool | Tool is available to coordinator sessions. Without `interactive: true` alongside it, this reads as coord-only and the tool is stripped from interactive sessions. |
+| `interactive`    | bool | Opt a `coordinator: true` tool back into interactive sessions (dual-kind tools like `memory`). |
+| `auto_approve`   | bool | Tool runs without user confirmation (read-only, safe operations). |
+| `primary_key`    | str  | When the model sends a bare string instead of JSON args, map it to this parameter name. |
+| `kind_variants`  | dict | Per-kind description / parameter-schema overlays so each session kind sees only the surface it can use (see `memory.json`). |
+| `cwd_note`       | str  | Sentence appended to the description at session build time with `{working_dir}` substituted — declare on tools whose semantics depend on the process working directory (see `bash.json`, `apply_cwd_context`). |
+| `workspace_note` | str  | Companion sentence naming the operator-configured workspace directory, `{workspace_dir}` substituted; dropped when no workspace is configured. |
 
 ---
 
@@ -779,13 +785,20 @@ MCP tool lists stay up-to-date without restart through two mechanisms:
 1. **Push notifications** -- MCP servers that declare `tools.listChanged: true` in
    their capabilities send `notifications/tools/list_changed` when their tool list
    changes. `MCPClientManager` registers a `message_handler` on each `ClientSession`
-   that triggers an immediate refresh for that server.
+   that triggers an immediate refresh for that server (debounced per server and
+   notification kind, and run off the receive loop). A refresh that fails while
+   the connection stays up is retried automatically on the next health-loop tick
+   until one completes.
 
 2. **Manual** -- `/mcp refresh` re-fetches tools from all servers immediately.
    `/mcp refresh <server>` targets a single server. If a server has disconnected,
    manual refresh attempts reconnection. The console admin panel exposes the
    same controls (refresh / reconnect buttons per server) for cluster-wide
    fan-out.
+
+Reconnects (health-loop, dispatch-driven, or operator-forced) always end in a
+full catalog rediscovery, so a server that changed its tools while disconnected
+comes back current.
 
 When tools change, `MCPClientManager` rebuilds its merged tool list using copy-on-write
 (new list/dict objects assigned atomically) and notifies all active `ChatSession`
@@ -857,13 +870,16 @@ catalog.
 
 ### Refresh
 
-Resource lists stay current through the same three-tier mechanism as tool lists:
+Resource lists stay current through the same mechanisms as tool lists:
 
 1. **Push** -- Servers declaring `resources.listChanged: true` send
-   `notifications/resources/list_changed`, triggering an immediate refresh.
-2. **Periodic** -- Servers without push are polled on the configured refresh
-   interval (default 4 hours, same timer as tools).
-3. **Manual** -- `/mcp refresh` re-fetches resources alongside tools.
+   `notifications/resources/list_changed`, triggering an immediate refresh
+   (with the same failed-refresh retry on the health-loop tick).
+2. **Manual** -- `/mcp refresh` re-fetches resources alongside tools.
+
+Servers without push support are refreshed whenever they reconnect (every
+reconnect ends in full rediscovery) or when an operator refreshes manually;
+there is no periodic polling.
 
 ---
 

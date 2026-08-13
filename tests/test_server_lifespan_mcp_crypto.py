@@ -15,6 +15,7 @@ from cryptography.fernet import Fernet
 
 import turnstone.core.config as cfg_mod
 from turnstone.core.mcp_crypto import (
+    STARTUP_KEY_REQUIRED_HINT,
     MCPTokenCipher,
     MCPTokenStore,
     initialize_mcp_crypto_state,
@@ -98,6 +99,42 @@ class TestInitializeMcpCryptoState:
         assert "mcp_token_encryption_keys" in messages
         assert re.search(r"mcp_token_encryption_key(?!s)", messages) is not None
 
+    def test_registry_dynamic_auth_requires_key(
+        self, backend, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A wired registry reporting dynamic auth demands the key (node shape)."""
+        _patch_security(monkeypatch, {})
+
+        state = types.SimpleNamespace(registry=types.SimpleNamespace(has_dynamic_auth=lambda: True))
+        with (
+            caplog.at_level("ERROR", logger="turnstone.core.mcp_crypto"),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            initialize_mcp_crypto_state(state, node_id="n1")
+        assert exc_info.value.code == 1
+        messages = " ".join(r.message for r in caplog.records)
+        assert "dynamic_model_auth" in messages
+        assert STARTUP_KEY_REQUIRED_HINT in messages
+
+    def test_raw_dynamic_model_row_alone_does_not_abort_boot(
+        self, backend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The registry, not a raw row, is the oracle: config.toml can shadow
+        a dynamic row with a static alias, so the row alone must not abort."""
+        backend.create_model_definition(
+            definition_id="m-dyn",
+            alias="gateway",
+            model="gpt-4o",
+            auth_mode="entra_obo",
+            obo_audience="api://approved",
+        )
+        _patch_security(monkeypatch, {})
+
+        # Bare state — exactly what the console has when this guard runs.
+        state = types.SimpleNamespace()
+        initialize_mcp_crypto_state(state, node_id="console")
+        assert state.mcp_token_store is None
+
     def test_startup_aborts_with_invalid_key(
         self, backend, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -111,3 +148,52 @@ class TestInitializeMcpCryptoState:
         ):
             initialize_mcp_crypto_state(state, node_id="n1")
         assert exc_info.value.code == 1
+
+    def test_capture_key_guard_fires_even_when_oidc_discovery_failed(
+        self, backend, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Review finding: the capture-credential key guard must NOT depend on
+        oidc_config.enabled. A node that boots while the IdP is unreachable comes
+        up enabled=False (discovery_retryable=True); gating the guard on enabled
+        would silently skip the loud boot-time failure exactly then, and runtime
+        rediscovery later re-enables OIDC so the first login persists a refresh
+        token with no key. capture_user_credential=True + no key must SystemExit
+        regardless of the (transient) discovery state — no oauth_obo rows exist,
+        so only the capture guard can catch this."""
+        _patch_security(monkeypatch, {})  # no encryption key
+        # enabled=False models a boot-time discovery failure; capture opt-in on.
+        state = types.SimpleNamespace(
+            oidc_config=types.SimpleNamespace(
+                enabled=False,
+                issuer="https://idp.example.com",
+                capture_user_credential=True,
+                discovery_retryable=True,
+            )
+        )
+        with (
+            caplog.at_level("ERROR", logger="turnstone.core.mcp_crypto"),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            initialize_mcp_crypto_state(state, node_id="n1")
+        assert exc_info.value.code == 1
+        messages = " ".join(record.message for record in caplog.records)
+        assert "capture_user_credential" in messages
+
+    def test_capture_with_key_starts_even_when_oidc_disabled(
+        self, backend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The converse: capture opt-in WITH a key installed boots cleanly even
+        while discovery is down — the cipher/store land so a later rediscovery's
+        first capture has somewhere encrypted to persist."""
+        _patch_security(monkeypatch, {"mcp_token_encryption_key": Fernet.generate_key().decode()})
+        state = types.SimpleNamespace(
+            oidc_config=types.SimpleNamespace(
+                enabled=False,
+                issuer="https://idp.example.com",
+                capture_user_credential=True,
+                discovery_retryable=True,
+            )
+        )
+        initialize_mcp_crypto_state(state, node_id="n1")
+        assert isinstance(state.mcp_token_cipher, MCPTokenCipher)
+        assert isinstance(state.mcp_token_store, MCPTokenStore)

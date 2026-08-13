@@ -840,6 +840,13 @@ model_definitions = sa.Table(
     sa.Column("reasoning_effort", sa.Text, nullable=True),
     sa.Column("surface_persisted_reasoning", sa.Integer, nullable=False, server_default="1"),
     sa.Column("replay_reasoning_to_model", sa.Integer, nullable=False, server_default="0"),
+    # Backend-gateway credential mode. "static" sends api_key; "entra_obo" /
+    # "rfc8693_obo" mint a delegated-user token and "entra_app" a shared app
+    # token for ``obo_audience`` at call time (migration 068). ``obo_scopes``
+    # is the rfc8693 exchange-leg scope request (migration 069).
+    sa.Column("auth_mode", sa.Text, nullable=False, server_default="static"),
+    sa.Column("obo_audience", sa.Text, nullable=False, server_default=""),
+    sa.Column("obo_scopes", sa.Text, nullable=False, server_default=""),
     sa.Column("created_by", sa.Text, nullable=False, server_default=""),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),
@@ -951,6 +958,23 @@ oidc_pending_states = sa.Table(
     sa.Column("code_verifier", sa.Text, nullable=False),
     sa.Column("audience", sa.Text, nullable=False),
     sa.Column("created_at", sa.Text, nullable=False),
+)
+
+# One captured IdP refresh token per (user, issuer) — the single credential
+# that `auth_type='oauth_obo'` MCP servers redeem on demand (issue #551).
+# Deliberately separate from `oidc_identities`: this row is a Fernet-encrypted
+# secret with hot rotation writes on the mint path, while identity rows are
+# freely-read metadata.  Keyed (user_id, issuer) — the mint path enters with
+# user_id; issuer future-proofs multi-IdP (OIDCConfig is single-issuer today).
+oidc_user_credentials = sa.Table(
+    "oidc_user_credentials",
+    metadata,
+    sa.Column("user_id", sa.Text, nullable=False),
+    sa.Column("issuer", sa.Text, nullable=False),
+    sa.Column("refresh_token_ct", sa.LargeBinary, nullable=False),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("last_refreshed", sa.Text, nullable=False),
+    sa.PrimaryKeyConstraint("user_id", "issuer"),
 )
 
 # ---------------------------------------------------------------------------

@@ -9,17 +9,21 @@ stamped-at-create isolation from later persona edits.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._session_helpers import make_result
 from turnstone.core.personas import PersonaSnapshot, snapshot_from_persona
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage
 from turnstone.core.storage._utils import PERSONA_MUTABLE
 from turnstone.core.tools import TASK_AGENT_TOOLS
 from turnstone.core.workstream import WorkstreamKind
+
+if TYPE_CHECKING:
+    from turnstone.core.model_turn import ModelTurnResult
 
 
 def _snap(
@@ -333,18 +337,17 @@ class TestMemoryOff:
         summary = SimpleNamespace(content="## Open tasks\nfinish it", finish_reason="stop")
         n = {"i": 0}
 
-        def stream(*_a: Any, **_k: Any) -> dict[str, str]:
+        def stream(*_a: Any, **_k: Any) -> ModelTurnResult:
             n["i"] += 1
             if n["i"] == 1:
                 session._compaction_advised = True  # advisory fired this turn
-                return {"role": "assistant", "content": "pausing to compact"}
-            return {"role": "assistant", "content": "all done"}
+                return make_result(content="pausing to compact")
+            return make_result(content="all done")
 
         def est(*_a: Any, **_k: Any) -> int:
             return 9_999 if n["i"] <= 1 else 10  # over threshold only on the stop turn
 
         with (
-            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(session, "_stream_response", side_effect=stream),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
@@ -1506,3 +1509,39 @@ class TestPersonaDiscovery:
         item = session._prepare_spawn_workstream("c1", {"persona": "nope"})
         assert item.get("error")
         assert "Available for interactive: engineer (default), writer" in item["error"]
+
+
+class TestNudgeToolVisibility:
+    """``_nudges_enabled`` generalises from "the memory tool" to
+    ``NUDGE_REQUIRED_TOOL``, so the class split is pinned at the
+    ChatSession level and not only inside the observer."""
+
+    def test_idle_tasks_gated_on_the_tasks_tool(self, tmp_db, mock_openai_client) -> None:
+        # Every branch of the idle_tasks body is a tasks(...) call, so a
+        # persona hiding that tool must suppress it — the same rule the
+        # memory nudges follow, via one map instead of a hardcoded name.
+        session = _session(
+            mock_openai_client,
+            persona_snapshot=_snap(tools=frozenset({"read_file"}), memory=True),
+        )
+        session._memory_config.nudges = True
+        assert not session._nudges_enabled("idle_tasks")
+
+    def test_idle_tasks_allowed_when_tasks_visible(self, tmp_db, mock_openai_client) -> None:
+        session = _session(
+            mock_openai_client,
+            persona_snapshot=_snap(tools=frozenset({"tasks"}), memory=True),
+        )
+        session._memory_config.nudges = True
+        assert session._nudges_enabled("idle_tasks")
+
+    def test_idle_children_is_not_tool_gated(self, tmp_db, mock_openai_client) -> None:
+        # LIVENESS: the body names wait_for_workstream, but the wake
+        # itself is the point and the body has a non-tool branch beside
+        # it.  A persona hiding the tool must not strand the coordinator.
+        session = _session(
+            mock_openai_client,
+            persona_snapshot=_snap(tools=frozenset({"read_file"}), memory=True),
+        )
+        session._memory_config.nudges = True
+        assert session._nudges_enabled("idle_children")

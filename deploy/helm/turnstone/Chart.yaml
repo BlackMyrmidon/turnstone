@@ -2,11 +2,11 @@ apiVersion: v2
 name: turnstone
 description: Multi-node AI orchestration platform with tool use, agent routing, and cluster simulation
 type: application
-version: 0.1.0
+version: 0.2.0
 appVersion: "0.3.0"
 
 dependencies:
   - name: postgresql
-    version: ~18.7.0
+    version: ~18.8.0
     repository: https://charts.bitnami.com/bitnami
     condition: postgresql.enabled

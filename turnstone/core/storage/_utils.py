@@ -642,8 +642,16 @@ MODEL_DEFINITION_MUTABLE = frozenset(
         "reasoning_effort",
         "surface_persisted_reasoning",
         "replay_reasoning_to_model",
+        "auth_mode",
+        "obo_audience",
+        "obo_scopes",
     }
 )
+# Sentinel for ``update_model_definition``'s optional conditional-write
+# compare: distinguishes "no compare requested" (every ordinary caller)
+# from "compare against NULL". Shared by both backends so the calibrate
+# retry loop reads one contract.
+CAPS_COMPARE_UNSET: object = object()
 PROJECT_MUTABLE = frozenset({"name", "visibility", "state", "parent_project_id"})
 PROMPT_POLICY_MUTABLE = frozenset({"name", "content", "tool_gate", "priority", "enabled"})
 # ``name`` (the slug create requests reference) is deliberately immutable —
@@ -909,6 +917,7 @@ def reconstruct_messages(
     attachments_by_msg: dict[int, list[dict[str, Any]]] | None = None,
     *,
     repair: bool = True,
+    include_compaction: bool = False,
 ) -> list[dict[str, Any]]:
     """Reconstruct OpenAI message format from stored conversation rows.
 
@@ -946,12 +955,21 @@ def reconstruct_messages(
     the user sees the actual partial state — refreshing during tool execution
     otherwise silently drops the trailing turn from the UI.
     """
-    # Drop compaction checkpoint markers: they are resume-only artifacts (the
-    # persisted summary that lets a reopened session rehydrate a bounded context,
-    # see reconstruct_turns_checkpointed), not real conversation turns, so
-    # /history, export, and search show the true transcript without an injected
-    # summary.
-    rows = [r for r in rows if not _is_compaction_marker(r)]
+    # Compaction checkpoint markers are resume artifacts (the persisted summary
+    # that lets a reopened session rehydrate a bounded context, see
+    # reconstruct_turns_checkpointed), not real conversation turns — dropped by
+    # default so export and search show the true transcript without an injected
+    # summary.  ``include_compaction=True`` (the /history display path) instead
+    # re-rows each marker as a first-class ``system`` row IN PLACE: assistant
+    # rows drop ``_source``/``meta`` on reconstruction, but a system row keeps
+    # both, so the marker flows through the standard operator-context
+    # projection (``_source="compaction"`` + ``meta`` = watermark/token
+    # counts) and the frontend renders its compaction card at the point in
+    # the transcript where the compaction actually happened.
+    if include_compaction:
+        rows = [(r[0], "system", *r[2:]) if _is_compaction_marker(r) else r for r in rows]
+    else:
+        rows = [r for r in rows if not _is_compaction_marker(r)]
     turns = reconstruct_turns(rows, ws_id, attachments_by_msg)
     if repair:
         turns = recover_trajectory(turns)

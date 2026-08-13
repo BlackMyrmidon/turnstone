@@ -151,7 +151,9 @@ class TestCompatWireShape:
         must never surface as wire ``extra_body`` — a leaked key would change
         every real-Anthropic request that threads a thinking override.
         Negative-tested: fails when the ``_INTERNAL_EXTRA_PARAMS`` exclusion
-        is removed from ``_build_thinking_and_kwargs``.
+        is removed from ``_build_thinking_and_kwargs``.  The effort knob is
+        explicit: unset effort means thinking OFF (the budget override
+        modifies a thinking block, it never creates one).
         """
         provider = AnthropicProvider()
         client = _capture_client()
@@ -160,6 +162,7 @@ class TestCompatWireShape:
                 client=client,
                 model="claude-sonnet-4-5",
                 messages=[{"role": "user", "content": "hi"}],
+                reasoning_effort="medium",
                 extra_params={"thinking_budget_tokens": 2048},
             )
         )
@@ -228,12 +231,20 @@ class TestCompatReasoningControl:
         assert "thinking" not in kwargs
         assert kwargs["temperature"] == 0.6  # never forced to 1.0 on compat
 
-    @pytest.mark.parametrize("knob", ["none", ""])
-    def test_manual_toggle_off(self, knob: str) -> None:
-        """Effort "none"/empty disables thinking — native manual-mode parity;
-        no effort key rides when thinking is off."""
-        kwargs = self._stream_kwargs(self._MANUAL_CAPS, knob)
+    def test_manual_toggle_explicit_off(self) -> None:
+        """The explicit "none" knob disables thinking — native manual-mode
+        parity; no effort key rides when thinking is off."""
+        kwargs = self._stream_kwargs(self._MANUAL_CAPS, "none")
         assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+        assert "thinking" not in kwargs
+
+    def test_manual_unset_injects_nothing(self) -> None:
+        """An UNSET knob (no rung of the assignment scheme resolved a
+        value) injects no toggle at all — the template's own default
+        rules, matching "if not set, we don't send it".  Distinct from
+        the explicit "none" off-switch above."""
+        kwargs = self._stream_kwargs(self._MANUAL_CAPS, "")
+        assert "extra_body" not in kwargs
         assert "thinking" not in kwargs
 
     def test_adaptive_always_on(self) -> None:
@@ -302,6 +313,19 @@ class TestCompatReasoningControl:
             "foo": 1,
         }
 
+    def test_utility_pin_survives_adaptive_injection(self) -> None:
+        """The exact pair ``lane_without_thinking`` relies on: an adaptive
+        model's injection always sends ``true``, but the utility lanes'
+        pinned ``false`` is already present in extra_params and existing
+        keys win — the pin reaches the wire."""
+        caps = dataclasses.replace(self._MANUAL_CAPS, thinking_mode="adaptive")
+        kwargs = self._stream_kwargs(
+            caps,
+            "high",
+            extra_params={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+
     def test_caller_extra_params_not_mutated(self) -> None:
         """The session's extra_params dict must never be written through."""
         extra = {"chat_template_kwargs": {"foo": 1}}
@@ -321,20 +345,19 @@ class TestCompatReasoningControl:
             "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"}
         }
 
-    def test_create_completion_same_injection(self) -> None:
-        """The non-streaming path shares _build_thinking_and_kwargs."""
+    def test_create_streaming_same_injection(self) -> None:
+        """The public streaming entry shares _build_thinking_and_kwargs."""
         client = MagicMock()
-        final = MagicMock(content=[], stop_reason="end_turn")
-        stream = MagicMock()
-        stream.get_final_message.return_value = final
-        client.messages.stream.return_value.__enter__.return_value = stream
+        client.messages.stream.return_value.__enter__.return_value = iter([])
         with patch("turnstone.core.providers._anthropic._ensure_anthropic"):
-            self.provider.create_completion(
-                client=client,
-                model="qwen3.6-27b",
-                messages=[{"role": "user", "content": "hi"}],
-                reasoning_effort="none",
-                capabilities=self._MANUAL_CAPS,
+            list(
+                self.provider.create_streaming(
+                    client=client,
+                    model="qwen3.6-27b",
+                    messages=[{"role": "user", "content": "hi"}],
+                    reasoning_effort="none",
+                    capabilities=self._MANUAL_CAPS,
+                )
             )
         kwargs = client.messages.stream.call_args[1]
         assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
@@ -470,11 +493,16 @@ class TestCompatSessionPlumbing:
         assert caps.supports_vision is False
 
     def test_session_extra_params_gate(self, tmp_db: Any) -> None:
-        """server_compat extra_body forwards for the compat lane, not real Anthropic."""
+        """server_compat extra_body forwards for the compat lane, not real Anthropic.
+
+        The gate lives in ``model_turn.provider_extra_params`` (the session's
+        delegate wrapper retired with the #832 fold — the lane resolver is the
+        one caller now, so the pin asserts the module function directly).
+        """
         from turnstone.core.model_registry import ModelConfig, ModelRegistry
+        from turnstone.core.model_turn import provider_extra_params
         from turnstone.core.providers import create_provider
 
-        session = _make_session(reasoning_effort="medium")
         cfg = ModelConfig(
             alias="vllm-messages",
             base_url="http://localhost:8000",
@@ -483,14 +511,15 @@ class TestCompatSessionPlumbing:
             provider="anthropic-compatible",
             server_compat={"extra_body": {"chat_template_kwargs": {"thinking": False}}},
         )
-        session._registry = ModelRegistry(models={"vllm-messages": cfg}, default="vllm-messages")
-        session._model_alias = "vllm-messages"
+        registry = ModelRegistry(models={"vllm-messages": cfg}, default="vllm-messages")
 
-        session._provider = create_provider("anthropic-compatible")
-        assert session._provider_extra_params() == {"chat_template_kwargs": {"thinking": False}}
+        compat = create_provider("anthropic-compatible")
+        assert provider_extra_params(compat, registry, "vllm-messages") == {
+            "chat_template_kwargs": {"thinking": False}
+        }
 
-        session._provider = create_provider("anthropic")
-        assert session._provider_extra_params() is None
+        real = create_provider("anthropic")
+        assert provider_extra_params(real, registry, "vllm-messages") is None
 
 
 # ===========================================================================

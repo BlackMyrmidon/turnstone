@@ -4,13 +4,13 @@ import contextlib
 import json
 import threading
 import time
-from dataclasses import dataclass, field
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._session_helpers import arm_session, make_session
+from turnstone.core.providers import StreamChunk, ToolCallDelta
 from turnstone.core.session import (
-    ChatSession,
     GenerationCancelled,
     _CancelRef,
     _tool_turn_meta,
@@ -37,6 +37,9 @@ class NullUI:
         pass
 
     def on_turn_committed(self):
+        pass
+
+    def on_stream_discarded(self):
         pass
 
     def on_thinking_start(self):
@@ -96,18 +99,11 @@ class NullUI:
 
 
 def _make_session(ui=None, **kwargs):
-    """Helper to construct a ChatSession with minimal setup."""
-    defaults = dict(
-        client=MagicMock(),
-        model="test-model",
-        ui=ui or NullUI(),
-        instructions=None,
-        temperature=0.5,
-        max_tokens=4096,
-        tool_timeout=30,
-    )
-    defaults.update(kwargs)
-    return ChatSession(**defaults)
+    """Wrap the shared session factory; this suite defaults to its
+    recording NullUI.  The defaults live in
+    tests/_session_helpers.make_session — duplicating them here is
+    exactly the drift its docstring warns about."""
+    return make_session(ui=ui or NullUI(), **kwargs)
 
 
 class TestCancelEvent:
@@ -141,58 +137,32 @@ class TestCancelEvent:
         session = _make_session(ui=ui)
         session.cancel()  # Set stale flag
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = "stop"
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
+        fake_stream = iter([StreamChunk(content_delta="Hello", finish_reason="stop")])
 
-        fake_stream = iter([FakeChunk(content_delta="Hello", finish_reason="stop")])
-
-        with (
-            patch.object(session, "_create_stream_with_retry", return_value=fake_stream),
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            session.send("test")
+        arm_session(session, fake_stream)
+        session.send("test")
 
         # Should complete normally — cancel flag was cleared
         assert "idle" in ui.states
 
 
 class TestCancelDuringStreaming:
-    """Cancel while _stream_response is iterating chunks."""
+    """Cancel while the streaming consumer is observing chunks."""
 
     def test_preserves_partial_content(self, tmp_db):
         """Partial content already streamed should be preserved in messages."""
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = ""
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         def cancelling_stream():
             """Yield a few chunks then cancel."""
-            yield FakeChunk(content_delta="Hello ")
-            yield FakeChunk(content_delta="world")
+            yield StreamChunk(content_delta="Hello ")
+            yield StreamChunk(content_delta="world")
             session.cancel()
-            yield FakeChunk(content_delta=" — this should not appear")
+            yield StreamChunk(content_delta=" — this should not appear")
 
-        with (
-            patch.object(session, "_create_stream_with_retry", return_value=cancelling_stream()),
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            session.send("test")
+        arm_session(session, cancelling_stream())
+        session.send("test")
 
         # Session should be idle (not error)
         assert ui.states[-1] == "idle"
@@ -222,55 +192,27 @@ class TestCancelDuringToolExecution:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = ""
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
-        @dataclass
-        class FakeToolDelta:
-            index: int = 0
-            id: str = ""
-            name: str = ""
-            arguments_delta: str = ""
-
         # First call: return content with a tool call
         def stream_with_tool():
-            yield FakeChunk(
-                tool_call_deltas=[FakeToolDelta(index=0, id="tc_1", name="bash")],
-                finish_reason="",
+            yield StreamChunk(
+                tool_call_deltas=[ToolCallDelta(index=0, id="tc_1", name="bash")],
             )
-            yield FakeChunk(
-                tool_call_deltas=[FakeToolDelta(index=0, arguments_delta='{"command":"echo hi"}')],
+            yield StreamChunk(
+                tool_call_deltas=[ToolCallDelta(index=0, arguments_delta='{"command":"echo hi"}')],
                 finish_reason="tool_calls",
             )
-
-        call_count = 0
-
-        def fake_create_stream(msgs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return stream_with_tool()
-            # Should not be called a second time since cancel happens before phase 3
-            raise AssertionError("Should not stream again after cancel")
 
         def cancel_before_execute(tool_calls):
             """Simulate cancel happening before tool execution."""
             session.cancel()
             raise GenerationCancelled()
 
-        with (
-            patch.object(session, "_create_stream_with_retry", side_effect=fake_create_stream),
-            patch.object(session, "_full_messages", return_value=[]),
-            patch.object(session, "_execute_tools", side_effect=cancel_before_execute),
-        ):
+        arm_session(session, stream_with_tool())
+        with patch.object(session, "_execute_tools", side_effect=cancel_before_execute):
             session.send("run something")
+
+        # The stream must not be re-created after the cancel landed.
+        assert session._provider.create_streaming.call_count == 1
 
         # Session should be idle
         assert ui.states[-1] == "idle"
@@ -294,22 +236,9 @@ class TestCancelWhenIdle:
         session.cancel()
         # Next send should work normally (cancel cleared at start)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = "stop"
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
-        fake_stream = iter([FakeChunk(content_delta="ok", finish_reason="stop")])
-        with (
-            patch.object(session, "_create_stream_with_retry", return_value=fake_stream),
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            session.send("hello")
+        fake_stream = iter([StreamChunk(content_delta="ok", finish_reason="stop")])
+        arm_session(session, fake_stream)
+        session.send("hello")
 
         # Should complete normally
         assistant_msgs = [m for m in dicts_from_turns(session.messages) if m["role"] == "assistant"]
@@ -324,43 +253,30 @@ class TestCancelThreadSafety:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = ""
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         barrier = threading.Event()
 
         def slow_stream():
-            yield FakeChunk(content_delta="Start")
+            yield StreamChunk(content_delta="Start")
             barrier.set()  # Signal that streaming has started
             time.sleep(2)  # Simulate slow streaming
-            yield FakeChunk(content_delta=" end", finish_reason="stop")
+            yield StreamChunk(content_delta=" end", finish_reason="stop")
 
-        with (
-            patch.object(session, "_create_stream_with_retry", return_value=slow_stream()),
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            # Run send() in a thread
-            error = []
+        arm_session(session, slow_stream())
+        # Run send() in a thread
+        error = []
 
-            def run():
-                try:
-                    session.send("test")
-                except Exception as e:
-                    error.append(e)
+        def run():
+            try:
+                session.send("test")
+            except Exception as e:
+                error.append(e)
 
-            t = threading.Thread(target=run)
-            t.start()
-            barrier.wait(timeout=5)
-            # Cancel from main thread
-            session.cancel()
-            t.join(timeout=5)
+        t = threading.Thread(target=run)
+        t.start()
+        barrier.wait(timeout=5)
+        # Cancel from main thread
+        session.cancel()
+        t.join(timeout=5)
 
         assert not error
         assert ui.states[-1] == "idle"
@@ -400,42 +316,29 @@ class TestStreamFlushBeforeToolCalls:
         ui = TrackingUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = ""
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
-        @dataclass
-        class FakeToolDelta:
-            index: int = 0
-            id: str = ""
-            name: str = ""
-            arguments_delta: str = ""
-
         def stream_content_then_tool():
-            # Content long enough to leave chars in pending buffer
-            # (_MAX_TAG_LEN = 13, so _drain_pending retains last 13 chars)
-            yield FakeChunk(content_delta="Hello world, this is a test message")
-            yield FakeChunk(
-                tool_call_deltas=[FakeToolDelta(index=0, id="tc_1", name="bash")],
+            # Content long enough to leave chars in the tag-scan carry
+            # buffer (ThinkTagSplitter retains the last MAX_TAG_LEN = 12
+            # chars until a flush)
+            yield StreamChunk(content_delta="Hello world, this is a test message")
+            yield StreamChunk(
+                tool_call_deltas=[ToolCallDelta(index=0, id="tc_1", name="bash")],
             )
-            yield FakeChunk(
-                tool_call_deltas=[FakeToolDelta(index=0, arguments_delta='{"command":"echo hi"}')],
+            yield StreamChunk(
+                tool_call_deltas=[ToolCallDelta(index=0, arguments_delta='{"command":"echo hi"}')],
                 finish_reason="tool_calls",
             )
 
+        # Two scripted turns: the tool round-trip makes send() loop, and
+        # the follow-up turn must carry a real finish reason — the strict
+        # finish gate (RULED, #832) rejects an exhausted iterator that
+        # used to commit as an empty turn.
+        arm_session(
+            session,
+            stream_content_then_tool(),
+            iter([StreamChunk(finish_reason="stop")]),
+        )
         with (
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                return_value=stream_content_then_tool(),
-            ),
-            patch.object(session, "_full_messages", return_value=[]),
             # Prevent real tool execution (e.g., bash) during this test.
             patch.object(session, "_execute_tools", return_value=([], None)),
         ):
@@ -479,42 +382,29 @@ class TestStreamAbort:
         session.cancel()  # Should not raise
         assert session._cancel_event.is_set()
 
-    def test_cancel_ref_populated_after_first_chunk(self, tmp_db):
-        """_cancel_ref is populated by the provider after the first chunk
-        arrives (lazy generator evaluation)."""
+    def test_stream_handle_registered_during_stream_cleared_after(self, tmp_db):
+        """The per-attempt ref's eager append registers the SDK handle in
+        ``_cancel_stream`` before the first chunk is consumed — the handle
+        ``cancel()`` closes to unblock a stuck read — and send()'s finally
+        clears it."""
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = "stop"
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
+        seen: dict = {}
 
-        sdk_stream = MagicMock()
+        def observing_stream():
+            # Runs at first next(): the armed handle must ALREADY be
+            # registered (append happens inside create_streaming, before
+            # the iterator is handed back).
+            seen["handle_at_first_chunk"] = session._cancel_stream
+            yield StreamChunk(content_delta="hi", finish_reason="stop")
 
-        def fake_provider_stream():
-            # Simulate provider appending to cancel_ref before first yield
-            session._cancel_ref.append(sdk_stream)
-            yield FakeChunk(content_delta="hi", finish_reason="stop")
+        provider = arm_session(session, observing_stream())
+        session.send("test")
 
-        with (
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                return_value=fake_provider_stream(),
-            ),
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            session.send("test")
-
+        assert seen["handle_at_first_chunk"] is provider._armed_handle
         # After stream completes, cancel_stream should be cleared
         assert session._cancel_stream is None
-        assert len(session._cancel_ref) == 0
 
     def test_transport_error_during_cancel_becomes_generation_cancelled(self, tmp_db):
         """When cancel() closes the stream, the resulting transport error
@@ -522,30 +412,13 @@ class TestStreamAbort:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = ""
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         def stream_that_errors():
-            yield FakeChunk(content_delta="Hello")
+            yield StreamChunk(content_delta="Hello")
             session._cancel_event.set()
             raise ConnectionError("stream closed")
 
-        with (
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                return_value=stream_that_errors(),
-            ),
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            session.send("test")
+        arm_session(session, stream_that_errors())
+        session.send("test")
 
         # Should complete as cancelled, not error
         assert "idle" in ui.states
@@ -564,42 +437,36 @@ class TestStreamAbort:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = ""
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         def stream_that_errors():
-            yield FakeChunk(content_delta="Hello")
+            yield StreamChunk(content_delta="Hello")
             raise ValueError("unexpected error")
 
-        with (
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                return_value=stream_that_errors(),
-            ),
-            patch.object(session, "_full_messages", return_value=[]),
-            pytest.raises(ValueError, match="unexpected error"),
-        ):
+        arm_session(session, stream_that_errors())
+        with pytest.raises(ValueError, match="unexpected error"):
             session.send("test")
 
-    def test_check_cancelled_between_retries(self, tmp_db):
-        """_try_stream checks for cancellation between retry attempts."""
+    def test_pre_set_cancel_no_mint_no_dispatch(self, tmp_db):
+        """A Stop already set when the streaming phase is entered issues NO
+        request and — on a dynamically authenticated alias — mints NO
+        credential (the #972 pre-dispatch rule on the interactive path).
+        A mint on a cache miss is a network round trip under the
+        cluster-wide advisory lock, so an abandoned turn must not pay one:
+        the resolver runs inside ``model_turn`` after its entry abort
+        read, and the ladder's loop-top check precedes even the lane
+        build."""
         session = _make_session()
-        session.cancel()
+        session._cancel_event.set()
+        resolver = MagicMock(return_value=None)
+        provider = arm_session(session, iter(()))
 
-        with pytest.raises(GenerationCancelled):
-            session._try_stream(
-                client=MagicMock(),
-                model="test",
-                msgs=[],
-            )
+        with (
+            patch.object(session, "_model_backend_auth_token", resolver),
+            pytest.raises(GenerationCancelled),
+        ):
+            session._stream_response(0)
+
+        resolver.assert_not_called()
+        provider.create_streaming.assert_not_called()
 
 
 class TestCancelRef:
@@ -611,7 +478,7 @@ class TestCancelRef:
         mock_stream = MagicMock()
         assert session._cancel_stream is None
 
-        session._cancel_ref.append(mock_stream)
+        _CancelRef(session).append(mock_stream)
 
         assert session._cancel_stream is mock_stream
 
@@ -621,7 +488,7 @@ class TestCancelRef:
         session.cancel()  # Set cancel event before stream is created
 
         mock_stream = MagicMock()
-        session._cancel_ref.append(mock_stream)
+        _CancelRef(session).append(mock_stream)
 
         mock_stream.close.assert_called_once()
 
@@ -630,7 +497,7 @@ class TestCancelRef:
         session = _make_session()
         mock_stream = MagicMock()
 
-        session._cancel_ref.append(mock_stream)
+        _CancelRef(session).append(mock_stream)
 
         mock_stream.close.assert_not_called()
         assert session._cancel_stream is mock_stream
@@ -643,43 +510,94 @@ class TestCancelRef:
         mock_stream = MagicMock()
         mock_stream.close.side_effect = RuntimeError("already closed")
 
-        session._cancel_ref.append(mock_stream)  # Should not raise
+        _CancelRef(session).append(mock_stream)  # Should not raise
 
-    def test_cancel_ref_is_cancel_ref_instance(self, tmp_db):
-        """ChatSession._cancel_ref is a _CancelRef instance."""
+    def test_no_shared_cancel_ref_attribute(self, tmp_db):
+        """The long-lived shared ref is GONE (#832): every model-call site
+        builds a fresh per-attempt, generation-scoped _CancelRef, so a
+        force-cancelled generation's ref reads aborted via supersession.
+        The pin holds the line against a gen-0 shared instance returning."""
         session = _make_session()
-        assert isinstance(session._cancel_ref, _CancelRef)
+        assert not hasattr(session, "_cancel_ref")
 
     def test_cancel_ref_cleared_after_stream_ends(self, tmp_db):
-        """_cancel_ref is cleared in the send() finally block after streaming."""
+        """send()'s finally clears _cancel_stream after streaming (the
+        handle registered by the per-attempt ref's eager append must not
+        linger into tool execution, where cancel() would close a dead
+        handle instead of nothing)."""
         ui = NullUI()
         session = _make_session(ui=ui)
-        mock_stream = MagicMock()
-        session._cancel_ref.append(mock_stream)
-        assert len(session._cancel_ref) == 1
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = "stop"
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
+        arm_session(session, iter([StreamChunk(content_delta="hi", finish_reason="stop")]))
+        session.send("test")
 
-        with (
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                return_value=iter([FakeChunk(content_delta="hi", finish_reason="stop")]),
-            ),
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            session.send("test")
+        # During the stream the armed handle was registered; after send()
+        # completes the finally block cleared it.
+        assert session._cancel_stream is None
 
-        # After send() completes, _cancel_ref is cleared in the finally block
-        assert len(session._cancel_ref) == 0
+
+class TestOnFirstAppendHook:
+    """``_CancelRef.on_first_append`` — the request-accepted observation
+    point (#832): health success, the creation-vs-midstream classifier,
+    and the usage-slot resets all key on it."""
+
+    def test_fires_once_and_arms(self, tmp_db):
+        session = _make_session()
+        fired = []
+        ref = _CancelRef(session, on_first_append=lambda: fired.append(1))
+        assert not ref.armed
+        ref.append(MagicMock())
+        ref.append(MagicMock())
+        assert fired == [1]
+        assert ref.armed
+
+    def test_superseded_append_neither_fires_nor_registers(self, tmp_db):
+        """A superseded ref's zombie stream is closed on arrival and must
+        neither fire the hook (an orphan must not record health or reset
+        the successor's usage slots) nor hijack ``_cancel_stream`` from
+        the successor generation's live stream."""
+        session = _make_session()
+        session._generation = 5
+        fired = []
+        ref = _CancelRef(session, 4, on_first_append=lambda: fired.append(1))
+        zombie = MagicMock()
+        ref.append(zombie)
+        assert fired == []
+        assert not ref.armed
+        zombie.close.assert_called_once()
+        assert session._cancel_stream is None
+
+
+class TestForceCancelOrphanNoReissue:
+    """A force-cancelled generation's mid-stream death is never re-issued
+    on the orphan's behalf.  A gen-0 ref would read ``aborted`` False
+    after a force-cancel (the successor installs a fresh unset event and
+    gen 0 never reads superseded), and the retry machinery would spend
+    tokens for a generation nobody owns."""
+
+    def test_orphan_death_not_reissued_no_ui_finalize(self, tmp_db):
+        ui = NullUI()
+        session = _make_session(ui=ui)
+
+        def dying_orphan_stream():
+            yield StreamChunk(content_delta="old ")
+            # Force-cancel: a successor claims the generation (bumped
+            # counter + fresh UNSET event) while this stream is mid-body.
+            session._claim_generation()
+            raise ConnectionError("connection reset")
+
+        provider = arm_session(session, dying_orphan_stream())
+        my_generation = session._claim_generation()
+        ends_before = ui.stream_ends
+
+        with pytest.raises(GenerationCancelled):
+            session._stream_response(my_generation)
+
+        # ONE dispatch — the death was not re-issued for the orphan.
+        assert provider.create_streaming.call_count == 1
+        # The orphan touched no UI finalize (a stream_end here would
+        # clobber the successor generation's in-flight stream state).
+        assert ui.stream_ends == ends_before
 
 
 class TestForceCancelGeneration:
@@ -706,8 +624,8 @@ class TestForceCancelGeneration:
 
         # We can't trivially test the full threading scenario in a unit test,
         # so directly verify that _check_cancelled raises when my_generation
-        # is stale, which is what guards _stream_response against orphaned
-        # (force-cancelled) threads continuing to mutate messages.
+        # is stale — the per-chunk check the streaming consumer runs, which
+        # guards orphaned (force-cancelled) threads out of mutating messages.
         session._generation = 5
         with pytest.raises(GenerationCancelled):
             session._check_cancelled(my_generation=4)  # orphaned generation
@@ -717,27 +635,10 @@ class TestForceCancelGeneration:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = "stop"
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         original_event = session._cancel_event
 
-        with (
-            patch.object(
-                session,
-                "_create_stream_with_retry",
-                return_value=iter([FakeChunk(content_delta="hi", finish_reason="stop")]),
-            ),
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            session.send("test")
+        arm_session(session, iter([StreamChunk(content_delta="hi", finish_reason="stop")]))
+        session.send("test")
 
         # After send() completes, _cancel_event should be a NEW Event
         # (not the same object as before the call).
@@ -754,39 +655,26 @@ class TestForceCancelThreaded:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = ""
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         barrier = threading.Event()
         old_done = threading.Event()
 
         def slow_stream():
-            yield FakeChunk(content_delta="Old content")
+            yield StreamChunk(content_delta="Old content")
             barrier.set()  # signal: first chunk delivered
             time.sleep(2)  # simulate stuck stream
-            yield FakeChunk(content_delta=" more", finish_reason="stop")
+            yield StreamChunk(content_delta=" more", finish_reason="stop")
 
         # Start generation 1 (will get stuck)
-        with (
-            patch.object(session, "_create_stream_with_retry", return_value=slow_stream()),
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
+        arm_session(session, slow_stream())
 
-            def run_old():
-                with contextlib.suppress(Exception):
-                    session.send("old message")
-                old_done.set()
+        def run_old():
+            with contextlib.suppress(Exception):
+                session.send("old message")
+            old_done.set()
 
-            t1 = threading.Thread(target=run_old, daemon=True)
-            t1.start()
-            assert barrier.wait(timeout=5), "stream did not start"
+        t1 = threading.Thread(target=run_old, daemon=True)
+        t1.start()
+        assert barrier.wait(timeout=5), "stream did not start"
 
         # Force cancel: simulate what the server does
         session.cancel()
@@ -809,43 +697,28 @@ class TestForceCancelThreaded:
         ui = NullUI()
         session = _make_session(ui=ui)
 
-        @dataclass
-        class FakeChunk:
-            content_delta: str = ""
-            reasoning_delta: str = ""
-            tool_call_deltas: list = field(default_factory=list)
-            usage: None = None
-            finish_reason: str = "stop"
-            info_delta: str = ""
-            provider_blocks: list = field(default_factory=list)
-
         barrier = threading.Event()
 
         def stuck_stream():
-            yield FakeChunk(content_delta="stuck")
+            yield StreamChunk(content_delta="stuck", finish_reason="stop")
             barrier.set()
             time.sleep(2)
-            yield FakeChunk(content_delta=" end", finish_reason="stop")
+            yield StreamChunk(content_delta=" end", finish_reason="stop")
 
         # Start stuck generation
-        with (
-            patch.object(session, "_create_stream_with_retry", return_value=stuck_stream()),
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            t = threading.Thread(target=lambda: session.send("old"), daemon=True)
-            t.start()
-            assert barrier.wait(timeout=5), "stream did not start"
+        arm_session(session, stuck_stream())
+        t = threading.Thread(target=lambda: session.send("old"), daemon=True)
+        t.start()
+        assert barrier.wait(timeout=5), "stream did not start"
 
         # Force cancel
         session.cancel()
 
         # New generation should work
-        fresh_stream = iter([FakeChunk(content_delta="Fresh response")])
-        with (
-            patch.object(session, "_create_stream_with_retry", return_value=fresh_stream),
-            patch.object(session, "_full_messages", return_value=[]),
-        ):
-            session.send("new message")
+        arm_session(
+            session, iter([StreamChunk(content_delta="Fresh response", finish_reason="stop")])
+        )
+        session.send("new message")
 
         # The new generation should have completed successfully
         assert "idle" in ui.states
@@ -1232,3 +1105,300 @@ class TestEffectStatusPersistence:
         turns = reconstruct_turns([sys_row], "ws1")
         assert turns[0].meta.extra.get("source_meta") == {"watch_name": "x"}
         assert turns[0].effect_status is None
+
+
+class TestNeverArmedStopLeavesNoRow:
+    def test_stop_during_creation_persists_nothing(self, tmp_db):
+        """A Stop landing while creation is still connecting — nothing
+        armed, zero tokens streamed — must not write an assistant row: a
+        marker-only row would replay to the model as context on every
+        later turn.  (An ARMED zero-token Stop still records its marker
+        via record_cancelled_partial — TestCancelDuringStreaming pins
+        that side.)"""
+        ui = NullUI()
+        session = _make_session(ui=ui)
+        provider = arm_session(session)  # provider shell; create scripted below
+
+        def create_cancel_then_fail(**kwargs):
+            session._cancel_event.set()
+            raise ConnectionError("connect blew up mid-dial")
+
+        provider.create_streaming = MagicMock(side_effect=create_cancel_then_fail)
+        session.send("test")
+
+        assert ui.states[-1] == "idle"
+        assert any("cancelled" in i.lower() for i in ui.infos)
+        assistant = [m for m in dicts_from_turns(session.messages) if m["role"] == "assistant"]
+        assert assistant == []
+
+
+class TestOrphanArmDutiesGate:
+    def test_superseded_arrival_in_toctou_window_fires_no_duties(self, tmp_db):
+        """The ref's supersession read and the arm hook are two lockless
+        steps; a force-cancel can claim a new generation between them.
+        The duties self-gate on the generation, so even an append whose
+        supersession read went stale cannot null the successor's usage
+        slots or record health for the abandoned lane."""
+        from turnstone.core.session import _StreamTurnConsumer
+
+        session = _make_session()
+        consumer = _StreamTurnConsumer(session, my_generation=1)
+        tracker = MagicMock()
+
+        class _StaleReadRef(_CancelRef):
+            # The stale supersession read the accepted bytecode-width
+            # window produces — the hook itself must hold the line.
+            def _superseded(self) -> bool:
+                return False
+
+        ref = _StaleReadRef(session, 1, on_first_append=consumer.on_stream_armed)
+        consumer.begin_attempt(ref, tracker, MagicMock())
+
+        session._generation = 1
+        sentinel = {"prompt_tokens": 7}
+        session._last_usage = sentinel
+        session._assistant_pending_tokens = 42
+
+        # The force-cancel claims a newer generation before the append.
+        session._generation = 2
+        ref.append(MagicMock())
+
+        assert session._last_usage is sentinel
+        assert session._assistant_pending_tokens == 42
+        tracker.record_success.assert_not_called()
+
+    def test_unscoped_generation_still_runs_arm_duties(self, tmp_db):
+        """Generation 0 means UNSCOPED, the convention ``_check_cancelled``
+        and ``_CancelRef._superseded`` share: the ref fires the hook for a
+        direct seam caller, so the hook's own gate must not refuse it.  A
+        bare ``!=`` compare skips the duties on any session whose
+        generation was ever claimed, silently recycling the previous
+        turn's usage into this turn's estimate and losing the lane's
+        health success."""
+        from turnstone.core.session import _StreamTurnConsumer
+
+        session = _make_session()
+        session._generation = 3  # a prior send claimed generations
+        consumer = _StreamTurnConsumer(session, my_generation=0)
+        tracker = MagicMock()
+        ref = _CancelRef(session, 0, on_first_append=consumer.on_stream_armed)
+        consumer.begin_attempt(ref, tracker, MagicMock())
+
+        session._last_usage = {"prompt_tokens": 99}
+        session._assistant_pending_tokens = 42
+        ref.append(MagicMock())
+
+        assert session._last_usage is None
+        assert session._assistant_pending_tokens == 0
+        tracker.record_success.assert_called_once()
+
+
+class TestOlderSitesAskTheSharedPredicate:
+    """The two supersession sites that PREDATE the shared predicate ask it
+    too, so generation 0 stays unscoped at both.
+
+    Each carried its own inline copy of the formula, so the drift the
+    helper exists to prevent had two live places to start from.  A bare
+    ``!=`` in either reads a direct seam caller (generation 0) as an
+    orphan: ``_check_cancelled`` would raise a cancel on a live turn, and
+    ``_compaction_event`` would stamp a live compaction ``superseded`` —
+    which suppresses its end notice, so the operator watching a real
+    compaction fail would be told nothing at all.
+    """
+
+    def test_check_cancelled_leaves_an_unscoped_generation_alone(self, tmp_db):
+        session = _make_session()
+        session._generation = 7
+        session._check_cancelled(0)  # unscoped — a direct seam caller
+        session._check_cancelled(7)  # the live generation
+        with pytest.raises(GenerationCancelled):
+            session._check_cancelled(2)  # a real orphan
+
+    def test_compaction_event_calls_an_unscoped_generation_live(self, tmp_db):
+        class _Recorder(NullUI):
+            def __init__(self):
+                super().__init__()
+                self.events = []
+
+            def on_compaction(self, event):
+                self.events.append(event)
+
+        ui = _Recorder()
+        session = _make_session(ui=ui)
+        session._generation = 7
+        failed_end = {"phase": "end", "ok": False, "reason": "cancelled", "trigger": "manual"}
+        session._compaction_event(0, dict(failed_end))
+        session._compaction_event(2, dict(failed_end))
+
+        assert ui.events[0]["superseded"] is False
+        assert ui.events[0]["notice"] is True  # the operator is told
+        assert ui.events[1]["superseded"] is True
+        assert ui.events[1]["notice"] is False
+
+
+class TestSupersessionVerdictAgreement:
+    """Every arm of one streaming turn must reach the SAME supersession
+    verdict for the same generation shape.  Generation 0 is unscoped, so
+    on a session whose generation was claimed earlier a Stop and a Ctrl-C
+    must both finalize the display — a per-arm spelling once split them,
+    finalizing on one path and not the other."""
+
+    def _session_at_generation(self, gen, ui):
+        session = _make_session(ui=ui)
+        session._generation = gen
+        session.messages.append(Turn.user("hi"))
+        return session
+
+    def _drive(self, gen, kind):
+        ui = NullUI()
+        session = self._session_at_generation(gen, ui)
+
+        def stream():
+            yield StreamChunk(content_delta="partial answer")
+            if kind == "stop":
+                session.cancel()
+                yield StreamChunk(content_delta=" unreachable")
+            else:
+                raise KeyboardInterrupt
+
+        provider = arm_session(session, stream())
+        assert provider is session._provider
+        raised = None
+        try:
+            session._stream_response(0)
+        except BaseException as exc:  # noqa: BLE001 — the class IS the observation
+            raised = type(exc).__name__
+        return raised, ui.stream_ends, session._cancelled_partial_msg
+
+    def test_stop_and_ctrl_c_agree_on_an_unscoped_generation(self, tmp_db):
+        stop_raised, stop_ends, partial = self._drive(3, "stop")
+        kb_raised, kb_ends, _ = self._drive(3, "ctrl_c")
+
+        assert stop_raised == "GenerationCancelled"
+        assert kb_raised == "KeyboardInterrupt"
+        # The verdict is "live" on BOTH arms: each finalizes the display.
+        assert stop_ends == 1
+        assert kb_ends == 1
+        assert partial and partial["content"] == "partial answer"
+
+    def test_superseded_generation_finalizes_on_neither_arm(self, tmp_db):
+        # The scoped counterpart: a real orphan (its generation lost the
+        # claim) must touch the UI on no arm at all.  It never reaches
+        # one: the ref reads superseded, so ``model_turn`` refuses to
+        # dispatch and the ladder converts that to a cancel — an orphan
+        # issues no request and finalizes nothing.
+        ui = NullUI()
+        session = self._session_at_generation(5, ui)
+
+        def stream():
+            raise KeyboardInterrupt
+            yield  # unreachable; makes this a generator
+
+        provider = arm_session(session, stream())
+        with pytest.raises(GenerationCancelled):
+            session._stream_response(2)  # generation 2 lost the claim to 5
+        assert ui.stream_ends == 0
+        provider.create_streaming.assert_not_called()
+
+    def test_unscoped_generation_finalizes_on_the_ctrl_c_arm(self, tmp_db):
+        # Same arm, unscoped generation: the verdict flips to "live", so
+        # the display IS finalized — the agreement this class pins.
+        ui = NullUI()
+        session = self._session_at_generation(5, ui)
+
+        def stream():
+            raise KeyboardInterrupt
+            yield
+
+        arm_session(session, stream())
+        with pytest.raises(KeyboardInterrupt):
+            session._stream_response(0)
+        assert ui.stream_ends == 1
+
+
+class TestOrphanGuardsBelowTheLadder:
+    """The two supersession guards in ``_stream_response``'s own arms.
+
+    They fire only when a force-cancel lands in the window BELOW the
+    ladder's conversion: ``_model_turn_with_retry`` re-checks the
+    generation before it classifies a death, so on every deterministic
+    path an orphan's failure has already become ``GenerationCancelled``
+    by the time it leaves the ladder.  These arms cover the sub-statement
+    race where supersession arrives after that check — the same
+    accepted-width window ``_CancelRef`` documents.  Reaching them means
+    simulating the race at the seam directly; a scripted stream cannot,
+    which is why the suite left both branches unexercised.
+
+    What they protect: an orphaned thread must emit NOTHING, because the
+    successor generation is already streaming into the same UI.
+    """
+
+    def _armed_death(self, session, exc):
+        """A death observed as if supersession landed after the ladder's
+        own generation check: the attempt streamed, a newer generation
+        claimed the session, and only then does the failure surface."""
+
+        def _seam(consumer, prepare_wire, my_generation):
+            consumer.begin_attempt(_CancelRef(session, my_generation), None, MagicMock())
+            consumer._saw_chunk = True  # the attempt reached the display
+            session._generation = my_generation + 1  # force-cancel lands
+            raise exc
+
+        return _seam
+
+    def test_superseded_stream_death_emits_nothing(self, tmp_db):
+        from turnstone.core.providers import IncompleteStreamError
+
+        ui = NullUI()
+        session = _make_session(ui=ui)
+        session._generation = 1
+        with (
+            patch.object(
+                session,
+                "_model_turn_with_fallback",
+                side_effect=self._armed_death(session, IncompleteStreamError("wire died")),
+            ),
+            pytest.raises(IncompleteStreamError),
+        ):
+            session._stream_response(1)
+
+        # No retry theater, no finalize, no partial stashed: the live
+        # successor owns the UI now.
+        assert ui.stream_ends == 0
+        assert ui.infos == []
+        assert session._cancelled_partial_msg is None
+
+    def test_superseded_keyboard_interrupt_emits_nothing(self, tmp_db):
+        ui = NullUI()
+        session = _make_session(ui=ui)
+        session._generation = 1
+        with (
+            patch.object(
+                session,
+                "_model_turn_with_fallback",
+                side_effect=self._armed_death(session, KeyboardInterrupt()),
+            ),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            session._stream_response(1)
+
+        assert ui.stream_ends == 0
+
+    def test_live_generation_still_finalizes_on_ctrl_c(self, tmp_db):
+        # The other side of the same branch, without the supersession.
+        ui = NullUI()
+        session = _make_session(ui=ui)
+        session._generation = 1
+
+        def _seam(consumer, prepare_wire, my_generation):
+            consumer.begin_attempt(_CancelRef(session, my_generation), None, MagicMock())
+            consumer._saw_chunk = True
+            raise KeyboardInterrupt
+
+        with (
+            patch.object(session, "_model_turn_with_fallback", side_effect=_seam),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            session._stream_response(1)
+
+        assert ui.stream_ends == 1

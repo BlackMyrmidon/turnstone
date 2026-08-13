@@ -20,12 +20,14 @@ if TYPE_CHECKING:
 
 from turnstone.core.log import get_logger
 from turnstone.core.storage._protocol import (
+    USER_SCOPED_AUTH_TYPES,
     MCPOAuthPendingState,
     MCPPendingConsentRow,
     MCPUserToken,
     MCPUserTokenMetadataRow,
     OIDCIdentity,
     OIDCPendingState,
+    OIDCUserCredential,
 )
 from turnstone.core.storage._schema import (
     api_tokens,
@@ -43,6 +45,7 @@ from turnstone.core.storage._schema import (
     model_definitions,
     oidc_identities,
     oidc_pending_states,
+    oidc_user_credentials,
     orgs,
     output_assessments,
     output_guard_patterns,
@@ -74,6 +77,9 @@ from turnstone.core.storage._schema import (
 )
 from turnstone.core.storage._schema import (
     prompt_policies as prompt_policies_t,
+)
+from turnstone.core.storage._utils import (
+    CAPS_COMPARE_UNSET as _CAPS_COMPARE_UNSET,
 )
 from turnstone.core.storage._utils import (
     COMPACTION_SOURCE as _COMPACTION_SOURCE,
@@ -535,10 +541,17 @@ class SQLiteBackend:
         return msg_rows, (attachments or None)
 
     def load_messages(
-        self, ws_id: str, *, limit: int | None = None, repair: bool = True
+        self,
+        ws_id: str,
+        *,
+        limit: int | None = None,
+        repair: bool = True,
+        include_compaction: bool = False,
     ) -> list[dict[str, Any]]:
         msg_rows, attachments = self._conversation_rows(ws_id, limit)
-        return _reconstruct_messages(msg_rows, ws_id, attachments, repair=repair)
+        return _reconstruct_messages(
+            msg_rows, ws_id, attachments, repair=repair, include_compaction=include_compaction
+        )
 
     def load_message_turns(self, ws_id: str, *, checkpointed: bool = True) -> list[Turn]:
         """Load the conversation as canonical ``Turn``s (unresolved AttachmentRef).
@@ -1651,6 +1664,9 @@ class SQLiteBackend:
             conn.execute(sa.delete(channel_users).where(channel_users.c.user_id == user_id))
             conn.execute(sa.delete(api_tokens).where(api_tokens.c.user_id == user_id))
             conn.execute(sa.delete(oidc_identities).where(oidc_identities.c.user_id == user_id))
+            conn.execute(
+                sa.delete(oidc_user_credentials).where(oidc_user_credentials.c.user_id == user_id)
+            )
             conn.execute(sa.delete(mcp_user_tokens).where(mcp_user_tokens.c.user_id == user_id))
             conn.execute(sa.delete(mcp_oauth_pending).where(mcp_oauth_pending.c.user_id == user_id))
             result = conn.execute(sa.delete(users).where(users.c.user_id == user_id))
@@ -4963,8 +4979,9 @@ class SQLiteBackend:
         token row — the freshness sweep's drive set + keepalive-refresh signal.
 
         Unfiltered by expiry: an expired access token with a live refresh token
-        is still a consented grant the sweep must keep hot. Only ``oauth_user``
-        servers write these rows; no ciphertext is projected.
+        is still a consented grant the sweep must keep hot. Joined to
+        ``mcp_servers`` so only ``oauth_user`` grants drive the sweep; synthetic
+        model mint-cache rows are excluded. No ciphertext is projected.
         """
         with self._conn() as conn:
             rows = conn.execute(
@@ -4973,6 +4990,13 @@ class SQLiteBackend:
                     mcp_user_tokens.c.server_name,
                     sa.func.coalesce(mcp_user_tokens.c.last_refreshed, mcp_user_tokens.c.created),
                 )
+                .select_from(
+                    mcp_user_tokens.join(
+                        mcp_servers,
+                        mcp_servers.c.name == mcp_user_tokens.c.server_name,
+                    )
+                )
+                .where(mcp_servers.c.auth_type == "oauth_user")
             ).fetchall()
         return [(row[0], row[1], row[2]) for row in rows]
 
@@ -5183,12 +5207,12 @@ class SQLiteBackend:
             ).fetchall()
         return {row[0]: int(row[1] or 0) for row in rows}
 
-    def any_oauth_user_mcp_servers(self) -> bool:
+    def any_user_scoped_mcp_servers(self) -> bool:
         with self._conn() as conn:
             result = conn.execute(
                 sa.select(sa.literal(1))
                 .select_from(mcp_servers)
-                .where(mcp_servers.c.auth_type == "oauth_user")
+                .where(mcp_servers.c.auth_type.in_(sorted(USER_SCOPED_AUTH_TYPES)))
                 .limit(1)
             ).scalar()
         return result is not None
@@ -5212,6 +5236,9 @@ class SQLiteBackend:
         reasoning_effort: str | None = None,
         surface_persisted_reasoning: bool = True,
         replay_reasoning_to_model: bool = False,
+        auth_mode: str = "static",
+        obo_audience: str = "",
+        obo_scopes: str = "",
     ) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -5233,6 +5260,9 @@ class SQLiteBackend:
                     "reasoning_effort": reasoning_effort,
                     "surface_persisted_reasoning": 1 if surface_persisted_reasoning else 0,
                     "replay_reasoning_to_model": (1 if replay_reasoning_to_model else 0),
+                    "auth_mode": auth_mode,
+                    "obo_audience": obo_audience,
+                    "obo_scopes": obo_scopes,
                     "created_by": created_by,
                     "created": now,
                     "updated": now,
@@ -5280,7 +5310,13 @@ class SQLiteBackend:
                 for r in rows
             ]
 
-    def update_model_definition(self, definition_id: str, **fields: Any) -> bool:
+    def update_model_definition(
+        self,
+        definition_id: str,
+        *,
+        expected_capabilities: Any = _CAPS_COMPARE_UNSET,
+        **fields: Any,
+    ) -> bool:
 
         fields = {k: v for k, v in fields.items() if k in _MODEL_DEF_MUTABLE}
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -5293,11 +5329,18 @@ class SQLiteBackend:
         if "replay_reasoning_to_model" in fields:
             fields["replay_reasoning_to_model"] = 1 if fields["replay_reasoning_to_model"] else 0
         with self._conn() as conn:
-            result = conn.execute(
-                sa.update(model_definitions)
-                .where(model_definitions.c.definition_id == definition_id)
-                .values(**fields)
+            stmt = sa.update(model_definitions).where(
+                model_definitions.c.definition_id == definition_id
             )
+            if expected_capabilities is not _CAPS_COMPARE_UNSET:
+                # Conditional write: apply only while capabilities still
+                # equal the caller's re-read value, so a concurrent write is
+                # a rowcount-0 miss to re-merge onto, not a silent revert.
+                if expected_capabilities is None:
+                    stmt = stmt.where(model_definitions.c.capabilities.is_(None))
+                else:
+                    stmt = stmt.where(model_definitions.c.capabilities == expected_capabilities)
+            result = conn.execute(stmt.values(**fields))
             conn.commit()
             return result.rowcount > 0
 
@@ -5701,6 +5744,80 @@ class SQLiteBackend:
             result = conn.execute(
                 sa.delete(oidc_identities).where(
                     (oidc_identities.c.issuer == issuer) & (oidc_identities.c.subject == subject)
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    # -- OIDC user credential (single-credential MCP minting, #551) -------------
+
+    def upsert_oidc_user_credential(
+        self, user_id: str, issuer: str, *, refresh_token_ct: bytes
+    ) -> None:
+        """Create or replace the user's captured IdP refresh token."""
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            stmt = sqlite_insert(oidc_user_credentials).values(
+                user_id=user_id,
+                issuer=issuer,
+                refresh_token_ct=refresh_token_ct,
+                created=now,
+                last_refreshed=now,
+            )
+            conn.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=["user_id", "issuer"],
+                    set_={"refresh_token_ct": refresh_token_ct, "last_refreshed": now},
+                )
+            )
+            conn.commit()
+
+    def get_oidc_user_credential(self, user_id: str, issuer: str) -> OIDCUserCredential | None:
+        """Return the captured credential row or None."""
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(oidc_user_credentials).where(
+                    (oidc_user_credentials.c.user_id == user_id)
+                    & (oidc_user_credentials.c.issuer == issuer)
+                )
+            ).fetchone()
+            if row is None:
+                return None
+            m = row._mapping
+            return OIDCUserCredential(
+                user_id=m["user_id"],
+                issuer=m["issuer"],
+                refresh_token_ct=bytes(m["refresh_token_ct"]),
+                created=m["created"],
+                last_refreshed=m["last_refreshed"],
+            )
+
+    def update_oidc_user_credential_refresh(
+        self, user_id: str, issuer: str, *, refresh_token_ct: bytes
+    ) -> bool:
+        """Persist the newest refresh token after a rotating redemption."""
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.update(oidc_user_credentials)
+                .where(
+                    (oidc_user_credentials.c.user_id == user_id)
+                    & (oidc_user_credentials.c.issuer == issuer)
+                )
+                .values(refresh_token_ct=refresh_token_ct, last_refreshed=now)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_oidc_user_credential(self, user_id: str, issuer: str) -> bool:
+        """Remove the captured credential. Returns True if existed."""
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(oidc_user_credentials).where(
+                    (oidc_user_credentials.c.user_id == user_id)
+                    & (oidc_user_credentials.c.issuer == issuer)
                 )
             )
             conn.commit()

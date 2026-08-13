@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from turnstone.console.coordinator_alias import resolve_coordinator_alias
 from turnstone.core.log import get_logger
+from turnstone.core.model_turn import resolve_effort_setting, resolve_temperature_setting
 from turnstone.core.session import ChatSession
 from turnstone.core.workstream import WorkstreamKind
 from turnstone.prompts import ClientType
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
 
     from turnstone.console.coordinator_client import CoordinatorClient
     from turnstone.core.config_store import ConfigStore
+    from turnstone.core.mcp_client import MCPClientManager
     from turnstone.core.model_registry import ModelRegistry
     from turnstone.core.personas import PersonaSnapshot
     from turnstone.core.session import SessionUI
@@ -45,12 +47,18 @@ def build_console_session_factory(
     config_store: ConfigStore,
     node_id: str,
     coord_client_factory: Callable[[str, str], CoordinatorClient],
+    mcp_client_getter: Callable[[], MCPClientManager | None] | None = None,
 ) -> Callable[..., ChatSession]:
     """Return a session factory that builds coordinator-kind ChatSessions.
 
     The factory signature matches :class:`turnstone.core.workstream._SessionFactory`.
     ``coord_client_factory`` is called at session-create time with
     ``(ws_id, user_id)`` and returns a prepared :class:`CoordinatorClient`.
+    ``mcp_client_getter`` returns the console's CURRENT MCP client manager
+    (or ``None``) — a getter rather than an instance because the console's
+    ensure-helper can (re)construct the manager after this factory is
+    built; it is consulted per session construction (#725), the console
+    counterpart of the node factory's ``mcp_ref[0]`` read.
 
     Only ``kind="coordinator"`` is supported here — the console doesn't
     host interactive workstreams.  The factory rejects any other kind
@@ -119,7 +127,9 @@ def build_console_session_factory(
             registry=registry,
         )
 
-        r_client, r_model, r_cfg = registry.resolve(effective_alias)
+        # The generation comes back from resolve()'s own lock hold, exactly
+        # paired with the client it vouches for; hand it to the constructor.
+        r_client, r_model, r_cfg, registry_generation = registry.resolve(effective_alias)
 
         uid = getattr(ui, "_user_id", "") or ""
         _username = ""
@@ -137,6 +147,13 @@ def build_console_session_factory(
 
         live_memory_config = _build_memory_config()
         live_judge_config = _build_judge_config()
+        # Coordinator MCP surface (#725): resolved per construction so the
+        # session sees the CURRENT manager — the console ensure-helper can
+        # (re)construct it after this factory was built.  Passed
+        # unconditionally, exactly like the node session factory reads
+        # mcp_ref[0]: whether MCP tools actually surface is the persona's
+        # call, same as interactive (#725).
+        live_mcp_client = mcp_client_getter() if mcp_client_getter is not None else None
         # NOTE: do not pre-resolve ``live_judge_config.model`` against the
         # registry here.  ``IntentJudge.__init__`` does a richer resolution
         # that also picks up the alias's *provider + client*; rewriting
@@ -168,25 +185,17 @@ def build_console_session_factory(
                     e,
                 )
 
-        eff_temperature = (
-            r_cfg.temperature
-            if r_cfg.temperature is not None
-            else config_store.get("model.temperature")
-        )
+        # Sampling knobs ride the shared assignment scheme (alias >
+        # stored config > unset); the coordinator role setting slots in
+        # as a role rung.  Unset means the wire omits the field.
+        eff_temperature = resolve_temperature_setting(r_cfg, config_store)
         eff_max_tokens = (
             r_cfg.max_tokens
             if r_cfg.max_tokens is not None
             else config_store.get("model.max_tokens")
         )
-        # Coordinator has its own effort setting; fall back to model-level
-        # override, then global default.
-        eff_reasoning_effort = (
-            r_cfg.reasoning_effort
-            if r_cfg.reasoning_effort is not None
-            else (
-                config_store.get("coordinator.reasoning_effort")
-                or config_store.get("model.reasoning_effort")
-            )
+        eff_reasoning_effort = resolve_effort_setting(
+            r_cfg, config_store, role_key="coordinator.reasoning_effort"
         )
 
         coord_client = coord_client_factory(ws_id or "", uid)
@@ -205,9 +214,10 @@ def build_console_session_factory(
             auto_compact_pct=config_store.get("session.auto_compact_pct"),
             agent_max_turns=config_store.get("tools.agent_max_turns"),
             tool_truncation=config_store.get("tools.truncation"),
-            mcp_client=None,  # console doesn't host MCP today
+            mcp_client=live_mcp_client,
             registry=registry,
             model_alias=effective_alias,
+            registry_generation=registry_generation,
             health_registry=None,
             node_id=node_id,
             ws_id=ws_id,
