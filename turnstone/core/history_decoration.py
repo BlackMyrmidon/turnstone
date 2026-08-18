@@ -25,7 +25,9 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core import fence
 from turnstone.core.log import get_logger
+from turnstone.core.trajectory import sanitize_client_send_ids
 
 log = get_logger(__name__)
 
@@ -403,7 +405,17 @@ def attach_vllm_chat_reasoning_field(
         if not text:
             out.append(msg)
             continue
-        out.append({**msg, "reasoning": text})
+        # This plaintext projection is inserted into vLLM's assistant replay
+        # template after the ordinary history-fold fence pass.  Defang any
+        # trusted marker the model echoed into captured reasoning so it cannot
+        # re-enter the next request as an exact operator or participant fence.
+        # The persisted provider blocks remain byte-exact (including
+        # signed/encrypted native reasoning); only the derived, unsigned replay
+        # field is changed. ``tool_output`` is intentionally absent: that fence
+        # is declared untrusted rather than authoritative to the assistant.
+        safe_text = fence.neutralize(text, fence.SYSTEM_REMINDER_TAG, opening=True)
+        safe_text = fence.neutralize(safe_text, fence.SENDER_LABEL_TAG, opening=True)
+        out.append({**msg, "reasoning": safe_text})
     return out
 
 
@@ -526,6 +538,7 @@ def project_history_messages(
                     d = part.get("document", {})
                     attachments_meta.append(
                         {
+                            "attachment_id": str(part.get("attachment_id") or ""),
                             "kind": "text",
                             "filename": str(d.get("name", "")),
                             "mime_type": str(d.get("media_type", "")),
@@ -540,6 +553,7 @@ def project_history_messages(
         if isinstance(side_meta, list) and side_meta:
             attachments_meta = [
                 {
+                    "attachment_id": str(m.get("attachment_id") or ""),
                     "kind": str(m.get("kind") or ""),
                     "filename": str(m.get("filename") or ""),
                     "mime_type": str(m.get("mime_type") or ""),
@@ -572,6 +586,17 @@ def project_history_messages(
         #     user_interjection / tool_error / ...) for the operator bubble.
         if msg.get("_source"):
             entry["source"] = str(msg["_source"])
+
+        # Ordinary accepted user rows additionally carry participant
+        # attribution and one-shot optimistic-send correlation.  Both are
+        # role-local metadata and never enter the provider wire payload.
+        if role == "user":
+            sender = msg.get("_sender")
+            if isinstance(sender, str) and sender:
+                entry["sender"] = sender
+            stable_client_send_ids = sanitize_client_send_ids(msg.get("_client_send_ids"))
+            if stable_client_send_ids:
+                entry["client_send_ids"] = stable_client_send_ids
 
         # (3b) ``_source_meta`` side-channel → top-level ``meta``.  The
         #      operator turn's structured per-kind fields (``watch_triggered``'s

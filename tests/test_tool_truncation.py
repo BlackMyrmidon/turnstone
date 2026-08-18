@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -225,6 +226,11 @@ class TestContextOverflowRecovery:
             patch.object(session, "_stream_response", side_effect=mock_stream_response),
             patch.object(session, "_compact_messages", compact_mock),
             patch.object(session, "_full_messages", return_value=[]),
+            patch.object(
+                session,
+                "_compaction_policy",
+                return_value=_policy(over_soft=False),
+            ),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
@@ -333,6 +339,14 @@ def _tool_turn_texts(session):
     return [m.text for m in session.messages if m.role is Role.TOOL]
 
 
+def _policy(*, owed: bool = False, over_soft: bool = False, over_hard: bool = False):
+    return SimpleNamespace(
+        owed=lambda *_args, **_kwargs: owed,
+        over_soft=lambda *_args, **_kwargs: over_soft,
+        over_hard=lambda *_args, **_kwargs: over_hard,
+    )
+
+
 _SPAWN_CALL = [
     {
         "id": "tc_spawn",
@@ -404,13 +418,21 @@ class TestZeroBudgetDrain:
         """A bulky error output keeps its lead: a masked failure reads as
         success, which is the dishonesty #883 removes."""
         err = "Error: deploy failed: " + "trace line\n" * 500
-        session._tool_error_flags["tc_e"] = True
+
+        def execute_error_batch(*_args, **_kwargs):
+            # Side-map ownership begins inside the claimed generation.  A
+            # pre-send flag is predecessor state and is intentionally cleared
+            # by the claim before provider call ids may be reused.
+            session._tool_error_flags["tc_e"] = True
+            return ([("tc_e", err)], None)
+
         with _send_with_tool_batch(
             session,
             [{"id": "tc_e", "function": {"name": "bash", "arguments": "{}"}}],
             [("tc_e", err)],
             _remaining_token_budget=MagicMock(return_value=0),
             _compact_messages=MagicMock(return_value=False),
+            _execute_tools=MagicMock(side_effect=execute_error_batch),
         ):
             session.send("go")
 
@@ -452,7 +474,7 @@ class TestZeroBudgetDrain:
             [("tc_f", "page " * 2000)],
             _remaining_token_budget=budget,
             _compact_messages=compact,
-            _compaction_owed=MagicMock(return_value=False),
+            _compaction_policy=MagicMock(return_value=_policy(owed=False)),
         ):
             session.send("go")
 
@@ -480,7 +502,7 @@ class TestZeroBudgetDrain:
             [("tc_spawn", _SPAWN_RESULT)],
             _remaining_token_budget=MagicMock(return_value=0),
             _compact_messages=compact,
-            _compaction_owed=MagicMock(return_value=True),
+            _compaction_policy=MagicMock(return_value=_policy(owed=True)),
             _do_auto_compact=owed_compact,
         ):
             session.send("go")
@@ -505,7 +527,7 @@ class TestZeroBudgetDrain:
             [("tc_spawn", _SPAWN_RESULT), ("tc_f", "page " * 2000)],
             _remaining_token_budget=MagicMock(return_value=0),
             _compact_messages=compact,
-            _compaction_owed=MagicMock(return_value=False),
+            _compaction_policy=MagicMock(return_value=_policy(owed=False)),
         ):
             session.send("go")
 
@@ -536,7 +558,7 @@ class TestZeroBudgetDrain:
             batches,
             _remaining_token_budget=MagicMock(return_value=0),
             _compact_messages=compact,
-            _compaction_owed=MagicMock(return_value=False),
+            _compaction_policy=MagicMock(return_value=_policy(owed=False)),
         ):
             session.send("go")
 
@@ -569,7 +591,7 @@ class TestZeroBudgetDrain:
             batches,
             _remaining_token_budget=budget,
             _compact_messages=compact,
-            _compaction_owed=MagicMock(return_value=False),
+            _compaction_policy=MagicMock(return_value=_policy(owed=False)),
         ):
             session.send("go")
 
@@ -668,7 +690,7 @@ class TestZeroBudgetDrain:
             batches,
             _remaining_token_budget=budget,
             _compact_messages=compact,
-            _compaction_owed=MagicMock(return_value=False),
+            _compaction_policy=MagicMock(return_value=_policy(owed=False)),
         ):
             session.send("go")
 

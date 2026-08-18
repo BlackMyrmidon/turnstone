@@ -70,6 +70,36 @@ def _bootstrap_app(**overrides: Any) -> Any:
     return SimpleNamespace(state=SimpleNamespace(**state_kwargs))
 
 
+def test_partial_coord_teardown_shuts_registry_after_adapter() -> None:
+    from turnstone.console import server as server_module
+
+    calls: list[str] = []
+    adapter = MagicMock()
+    adapter.shutdown.side_effect = lambda: calls.append("adapter")
+    registry = MagicMock()
+    registry.shutdown.side_effect = lambda: calls.append("registry")
+    app = _bootstrap_app(coord_adapter=adapter, coord_registry=registry)
+
+    server_module._teardown_partial_coord_subsystem(app)
+
+    assert calls == ["adapter", "registry"]
+    assert app.state.coord_registry is None
+
+
+def test_console_lifespan_shuts_coord_registry_after_adapter() -> None:
+    """Pin the normal teardown ordering without booting the full console."""
+    import inspect
+
+    from turnstone.console import server as server_module
+
+    source = inspect.getsource(server_module._lifespan)
+    adapter = source.find('getattr(app.state, "coord_adapter", None)')
+    registry = source.find('getattr(app.state, "coord_registry", None)', adapter)
+    state_writer = source.find('getattr(app.state, "coord_state_writer", None)', registry)
+    assert adapter != -1 and registry != -1 and state_writer != -1
+    assert adapter < registry < state_writer
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -92,6 +122,7 @@ def _seed_model_def(
     obo_audience: str = "",
     obo_scopes: str = "",
     capabilities: str = "{}",
+    max_concurrency: int = 0,
 ) -> None:
     """Insert a model definition row directly via the storage API."""
     storage.create_model_definition(
@@ -108,6 +139,7 @@ def _seed_model_def(
         auth_mode=auth_mode,
         obo_audience=obo_audience,
         obo_scopes=obo_scopes,
+        max_concurrency=max_concurrency,
     )
 
 
@@ -174,6 +206,92 @@ def test_helper_preserves_object_identity(storage: SQLiteBackend) -> None:
     _refresh_coord_registry(state, storage)
 
     assert id(state.coord_registry) == before
+
+
+def test_concurrent_refresh_cannot_install_older_snapshot_last(
+    storage: SQLiteBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The strict load and in-place reload form one serialized operation.
+
+    The first caller captures an older snapshot and pauses inside the loader.
+    The second caller represents a later committed CRUD write.  It must block
+    before loading until the first install completes, then install the newer
+    snapshot last.  Without the outer refresh lock, the second reload wins
+    temporarily and the released first caller rolls the registry backward.
+    """
+    from turnstone.console import server as server_module
+
+    class _TrackingLock:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self._attempt_guard = threading.Lock()
+            self._attempts = 0
+            self.second_attempted = threading.Event()
+
+        def __enter__(self) -> _TrackingLock:
+            with self._attempt_guard:
+                self._attempts += 1
+                if self._attempts == 2:
+                    self.second_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            self._lock.release()
+
+    tracking_lock = _TrackingLock()
+    monkeypatch.setattr(server_module, "_COORD_REGISTRY_REFRESH_LOCK", tracking_lock)
+
+    first_load_entered = threading.Event()
+    release_first_load = threading.Event()
+    second_load_entered = threading.Event()
+    call_guard = threading.Lock()
+    call_count = 0
+
+    def _load_snapshot(**_kwargs: Any) -> ModelRegistry:
+        nonlocal call_count
+        with call_guard:
+            call_count += 1
+            call_number = call_count
+        if call_number == 1:
+            first_load_entered.set()
+            assert release_first_load.wait(timeout=5), "test did not release older snapshot"
+            return _make_registry(alias="local", model="older-snapshot")
+        second_load_entered.set()
+        return _make_registry(alias="local", model="newer-snapshot")
+
+    monkeypatch.setattr("turnstone.core.model_registry.load_model_registry", _load_snapshot)
+    state = SimpleNamespace(
+        coord_registry=_make_registry(alias="local", model="initial"),
+        coord_registry_error="",
+    )
+    errors: list[BaseException] = []
+
+    def _run_refresh() -> None:
+        try:
+            server_module._refresh_coord_registry(state, storage)
+        except BaseException as exc:  # pragma: no cover - diagnostic capture
+            errors.append(exc)
+
+    older = threading.Thread(target=_run_refresh, daemon=True)
+    newer = threading.Thread(target=_run_refresh, daemon=True)
+    older.start()
+    assert first_load_entered.wait(timeout=5), "older refresh never reached loader"
+    newer.start()
+    second_attempted = tracking_lock.second_attempted.wait(timeout=5)
+    loaded_while_older_blocked = second_load_entered.is_set()
+    release_first_load.set()
+    older.join(timeout=5)
+    newer.join(timeout=5)
+
+    assert second_attempted, "newer refresh never attempted the serialization lock"
+    assert not loaded_while_older_blocked
+    assert not older.is_alive()
+    assert not newer.is_alive()
+    assert errors == []
+    assert call_count == 2
+    assert state.coord_registry.get_config("local").model == "newer-snapshot"
 
 
 def test_helper_noop_when_coord_registry_none(storage: SQLiteBackend) -> None:
@@ -2345,6 +2463,91 @@ def test_update_endpoint_refreshes_registry(storage: SQLiteBackend) -> None:
     assert registry.get_config("local").model == "new-model"
 
 
+def test_create_and_update_max_concurrency_refresh_registry(storage: SQLiteBackend) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    registry = _make_registry(alias="local", model="m")
+    client = _make_client(storage, registry)
+
+    created = client.post(
+        "/v1/api/admin/model-definitions",
+        json={"alias": "limited", "model": "m2", "max_concurrency": 3},
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["max_concurrency"] == 3
+    assert registry.get_config("limited").max_concurrency == 3
+
+    definition_id = created.json()["definition_id"]
+    updated = client.put(
+        f"/v1/api/admin/model-definitions/{definition_id}",
+        json={"max_concurrency": 0},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["max_concurrency"] == 0
+    assert registry.get_config("limited").max_concurrency == 0
+
+
+def test_update_omission_preserves_max_concurrency(storage: SQLiteBackend) -> None:
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        max_concurrency=2,
+    )
+    registry = _make_registry(alias="local", model="m")
+    client = _make_client(storage, registry)
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"model": "m2"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["max_concurrency"] == 2
+    assert storage.get_model_definition("m1")["max_concurrency"] == 2
+
+
+@pytest.mark.parametrize("invalid", [None, True, "1", 1.0, -1, 2_147_483_648])
+def test_create_rejects_invalid_max_concurrency(
+    storage: SQLiteBackend,
+    invalid: Any,
+) -> None:
+    client = _make_client(storage, _make_registry())
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions",
+        json={"alias": "invalid", "model": "m", "max_concurrency": invalid},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "max_concurrency" in resp.json()["error"]
+    assert storage.get_model_definition_by_alias("invalid") is None
+
+
+@pytest.mark.parametrize("invalid", [None, True, "1", 1.0, -1, 2_147_483_648])
+def test_update_rejects_invalid_max_concurrency(
+    storage: SQLiteBackend,
+    invalid: Any,
+) -> None:
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="local",
+        model="m",
+        max_concurrency=2,
+    )
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"max_concurrency": invalid},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "max_concurrency" in resp.json()["error"]
+    assert storage.get_model_definition("m1")["max_concurrency"] == 2
+
+
 def test_update_endpoint_skips_refresh_on_empty_body(
     storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3723,6 +3926,7 @@ def test_every_mutable_column_probes_its_classification(
         "base_url": "https://other.example/v1",
         "api_key": "sk-new",
         "context_window": 4096,
+        "max_concurrency": 2,
         "capabilities": {"note": "probe"},
         # Arm direction: the loop seeds THIS row disabled, so the probe is the
         # gated false→true flip rather than the carved-out disarm.

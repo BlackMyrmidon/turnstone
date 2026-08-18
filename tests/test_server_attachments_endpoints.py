@@ -123,6 +123,7 @@ def _harden_ws_mock(ws) -> None:
     ws._closed = False
     ws._pending_sends = []
     ws._pending_drain = None
+    ws._worker_principal_id = ""
     ws.send_barrier_active = lambda: False
     ws._lock = threading.RLock()
 
@@ -506,10 +507,11 @@ class TestSendMessageAttachments:
         session._nudge_queue = None
         captured: dict = {}
 
-        def fake_send(message, attachments=None, send_id=None):
+        def fake_send(message, attachments=None, send_id=None, client_send_ids=()):
             captured["message"] = message
             captured["attachments"] = attachments
             captured["send_id"] = send_id
+            captured["client_send_ids"] = client_send_ids
 
         session.send = fake_send
 
@@ -528,6 +530,59 @@ class TestSendMessageAttachments:
         _harden_ws_mock(ws)
         mgr.get.return_value = ws
         return captured, session
+
+    def _wire_admission_ws(self, mgr, ws_id: str, user_id: str):
+        """Install a real session whose send stops after USER admission.
+
+        The HTTP resolver and ``ChatSession._append_user_turn`` then exercise
+        the production staged-buffer transfer without paying for a model call.
+        The real ``send`` derives the accepted turn's sender from the immutable
+        worker claim; mirror that boundary instead of reading the independently
+        owner-scoped attachment buffer identity.
+        """
+        from turnstone.core.session import ChatSession
+        from turnstone.core.session_worker import current_worker_claim
+        from turnstone.core.workstream import WorkstreamState
+
+        ui = MagicMock()
+        ui._ws_lock = threading.Lock()
+        ui._ws_messages = 0
+        ui._ws_turn_tool_calls = 0
+        session = ChatSession(
+            client=MagicMock(),
+            model="test-model",
+            ui=ui,
+            instructions=None,
+            temperature=0.3,
+            max_tokens=1024,
+            tool_timeout=10,
+            ws_id=ws_id,
+            user_id=user_id,
+        )
+
+        def admit_only(message, attachments=None, send_id=None):
+            claim = current_worker_claim(session)
+            if claim is None:
+                raise RuntimeError("admission test worker is missing its principal claim")
+            session._append_user_turn(
+                message,
+                attachments or (),
+                send_id=send_id,
+                sender_user_id=claim.principal_id,
+            )
+
+        session.send = admit_only  # type: ignore[assignment]
+
+        ws = MagicMock()
+        ws.id = ws_id
+        ws.state = WorkstreamState.IDLE
+        ws.ui = ui
+        ws.session = session
+        ws.worker_thread = None
+        ws._worker_running = False
+        _harden_ws_mock(ws)
+        mgr.get.return_value = ws
+        return ws, session
 
     def test_send_explicit_attachment_ids_resolves_and_passes(self, app_client):
         client, mgr = app_client
@@ -554,6 +609,32 @@ class TestSendMessageAttachments:
         assert atts[0].attachment_id == aid
         assert atts[0].kind == "text"
 
+    def test_send_validates_and_threads_client_send_id(self, app_client):
+        client, mgr = app_client
+        captured, _ = self._wire_ws(mgr, "ws-A", "userA")
+
+        invalid = client.post(
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "bad token", "client_send_id": "spaces are invalid"},
+            headers=_auth("userA"),
+        )
+        assert invalid.status_code == 400
+        assert invalid.json()["error"] == ("client_send_id must match [A-Za-z0-9_-]{1,128}")
+
+        accepted = client.post(
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "correlated", "client_send_id": "browser-send_1"},
+            headers=_auth("userA"),
+        )
+        assert accepted.status_code == 200
+        import time
+
+        for _ in range(50):
+            if captured.get("message"):
+                break
+            time.sleep(0.01)
+        assert captured["client_send_ids"] == ("browser-send_1",)
+
     def test_send_auto_consumes_pending_when_ids_omitted(self, app_client):
         client, mgr = app_client
         captured, _ = self._wire_ws(mgr, "ws-A", "userA")
@@ -575,6 +656,59 @@ class TestSendMessageAttachments:
             time.sleep(0.01)
         assert captured["attachments"] is not None
         assert len(captured["attachments"]) == 2
+
+    @pytest.mark.parametrize("acting_user", ["userA", "shared-userB"])
+    @pytest.mark.parametrize("explicit_ids", [True, False])
+    def test_owner_scoped_admission_consumes_once_for_shared_sender(
+        self,
+        app_client,
+        acting_user,
+        explicit_ids,
+    ):
+        """Actor identity and staged-byte ownership are separate scopes.
+
+        Trusted-team workstreams file pending uploads under the durable
+        workstream owner.  A different authenticated participant is still the
+        turn sender, but USER admission must transfer that owner-scoped upload
+        exactly once for both explicit-id and auto-consume requests.
+        """
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        ws, session = self._wire_admission_ws(mgr, "ws-A", "userA")
+        aid = _upload(client, "ws-A", acting_user, "shared.md", b"shared", "text/markdown")
+        buffer = get_attachment_buffer()
+        assert buffer.get(aid, ws_id="ws-A", user_id="userA") is not None
+        if acting_user != "userA":
+            assert buffer.get(aid, ws_id="ws-A", user_id=acting_user) is None
+
+        body: dict[str, object] = {"message": "review together"}
+        if explicit_ids:
+            body["attachment_ids"] = [aid]
+        response = client.post(
+            "/v1/api/workstreams/ws-A/send",
+            json=body,
+            headers=_auth(acting_user),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["attached_ids"] == [aid]
+        worker = ws.worker_thread
+        assert worker is not None
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert buffer.get(aid, ws_id="ws-A", user_id="userA") is None
+
+        storage = get_storage()
+        rows = storage.load_messages("ws-A", repair=False)
+        user_rows = [row for row in rows if row.get("role") == "user"]
+        assert len(user_rows) == 1
+        assert user_rows[0]["_sender"] == acting_user
+        stored_attachment = storage.get_attachment(aid)
+        assert stored_attachment is not None
+        assert stored_attachment["refcount"] == 1
+        assert session.has_unresolved_conversation_persistence() is False
 
     def test_send_empty_list_disables_autoconsume(self, app_client):
         client, mgr = app_client
@@ -936,10 +1070,21 @@ def voice_app_client(tmp_path):
         default="voice",
     )
     mock_client = MagicMock()
-    mock_client.audio.transcriptions.create.return_value = MagicMock(text="hello from speech")
-    speech = MagicMock()
-    speech.read.return_value = b"RIFF\x00\x00fakeaudio"
-    mock_client.audio.speech.create.return_value = speech
+    transcription_response = MagicMock()
+    transcription_response.parse.return_value = MagicMock(text="hello from speech")
+    transcription_manager = MagicMock()
+    transcription_manager.__enter__.return_value = transcription_response
+    transcription_manager.__exit__.return_value = False
+    mock_client.audio.transcriptions.with_streaming_response.create.return_value = (
+        transcription_manager
+    )
+    speech_response = MagicMock()
+    speech_response.read.return_value = b"RIFF\x00\x00fakeaudio"
+    speech_manager = MagicMock()
+    speech_manager.__enter__.return_value = speech_response
+    speech_manager.__exit__.return_value = False
+    mock_client.audio.speech.with_streaming_response.create.return_value = speech_manager
+    mock_client._voice_transcription_response = transcription_response
     registry._clients["voice"] = mock_client  # bypass real SDK client construction
 
     config_store = _VoiceConfigStore(
@@ -995,7 +1140,7 @@ class TestSpeechToText:
         body = resp.json()
         assert body["transcript"] == "hello from speech"
         assert body["model_alias"] == "voice"
-        assert mock_client.audio.transcriptions.create.called
+        assert mock_client.audio.transcriptions.with_streaming_response.create.called
 
     def test_empty_upload_returns_400(self, voice_app_client):
         client, _ = voice_app_client
@@ -1009,7 +1154,7 @@ class TestSpeechToText:
     def test_silence_returns_422(self, voice_app_client):
         # A successful transcription with no speech is not a backend failure.
         client, mock_client = voice_app_client
-        mock_client.audio.transcriptions.create.return_value = MagicMock(text="   ")
+        mock_client._voice_transcription_response.parse.return_value = MagicMock(text="   ")
         resp = client.post(
             "/v1/api/workstreams/ws-A/speech-to-text",
             files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
@@ -1021,9 +1166,8 @@ class TestSpeechToText:
     def test_backend_failure_returns_masked_502(self, voice_app_client):
         # Backend SDK error detail must not leak into the client-facing body.
         client, mock_client = voice_app_client
-        mock_client.audio.transcriptions.create.side_effect = RuntimeError(
-            "Error code: 401 - internal-host:9 invalid_api_key"
-        )
+        create = mock_client.audio.transcriptions.with_streaming_response.create
+        create.side_effect = RuntimeError("Error code: 401 - internal-host:9 invalid_api_key")
         resp = client.post(
             "/v1/api/workstreams/ws-A/speech-to-text",
             files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
@@ -1046,6 +1190,19 @@ class TestSpeechToText:
         assert resp.status_code == 404
 
 
+class TestSpeechToTextStream:
+    def test_dedicated_endpoint_streams_transcript(self, voice_app_client):
+        client, mock_client = voice_app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text/stream",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.text == "hello from speech"
+        assert mock_client.audio.transcriptions.with_streaming_response.create.called
+
+
 class TestTextToSpeech:
     def test_unconfigured_returns_503(self, app_client):
         client, _ = app_client
@@ -1060,7 +1217,8 @@ class TestTextToSpeech:
         assert resp.content == b"RIFF\x00\x00fakeaudio"
         assert resp.headers.get("x-model-alias") == "voice"
         # audio.tts_voice setting supplies the voice when the body omits one.
-        assert mock_client.audio.speech.create.call_args.kwargs["voice"] == "alloy"
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["voice"] == "alloy"
 
     def test_empty_text_returns_400(self, voice_app_client):
         client, _ = voice_app_client
@@ -1074,14 +1232,119 @@ class TestTextToSpeech:
 
     def test_backend_failure_returns_masked_502(self, voice_app_client):
         client, mock_client = voice_app_client
-        mock_client.audio.speech.create.side_effect = RuntimeError(
-            "Error code: 500 - internal-host:9 boom"
-        )
+        create = mock_client.audio.speech.with_streaming_response.create
+        create.side_effect = RuntimeError("Error code: 500 - internal-host:9 boom")
         resp = client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth("userA"))
         assert resp.status_code == 502
         body = resp.json()
         assert body["error"] == "Speech synthesis backend failed"
         assert "internal-host" not in body["error"]
+
+
+def _voice_request(client, route: str, *, user_id: str):
+    if route == "stt":
+        return client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth(user_id),
+        )
+    if route == "stt-stream":
+        return client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text/stream",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth(user_id),
+        )
+    return client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth(user_id))
+
+
+class TestVoiceBackendAuth:
+    @pytest.mark.parametrize("route", ["stt", "stt-stream", "tts"])
+    def test_request_principal_is_used_instead_of_workstream_owner(
+        self,
+        voice_app_client,
+        route,
+    ):
+        from dataclasses import replace
+
+        client, mock_client = voice_app_client
+        registry = client.app.state.registry
+        cfg = registry._models["voice"]
+        registry._models["voice"] = replace(
+            cfg,
+            api_key="",
+            auth_mode="entra_obo",
+            obo_audience="api://voice",
+        )
+        mint_client = MagicMock()
+        mint_client.mint_model_obo_token_sync.return_value = "minted-token"
+        client.app.state.mcp_client = mint_client
+        mock_client.with_options.return_value = mock_client
+
+        response = _voice_request(client, route, user_id="userB")
+
+        assert response.status_code == 200, response.text
+        mint_client.mint_model_obo_token_sync.assert_called_once_with(
+            user_id="userB",
+            alias="voice",
+            audience="api://voice",
+            scopes="",
+            grant_leg="entra",
+        )
+        mock_client.with_options.assert_called_once_with(api_key="minted-token")
+
+    @pytest.mark.parametrize("route", ["stt", "stt-stream", "tts"])
+    def test_auth_failure_is_masked_and_never_dispatches(
+        self,
+        voice_app_client,
+        route,
+    ):
+        from dataclasses import replace
+
+        client, mock_client = voice_app_client
+        registry = client.app.state.registry
+        cfg = registry._models["voice"]
+        registry._models["voice"] = replace(
+            cfg,
+            api_key="",
+            auth_mode="entra_obo",
+            obo_audience="api://voice",
+        )
+        mint_client = MagicMock()
+        mint_client.mint_model_obo_token_sync.return_value = None
+        client.app.state.mcp_client = mint_client
+
+        response = _voice_request(client, route, user_id="userB")
+
+        assert response.status_code == 503
+        assert response.json() == {"error": "Model backend authentication unavailable"}
+        mock_client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+        mock_client.audio.speech.with_streaming_response.create.assert_not_called()
+
+
+class TestVoiceStreamLifecycle:
+    def test_response_call_cancellation_aborts_opened_handle(self, monkeypatch):
+        import asyncio
+
+        from starlette.responses import StreamingResponse
+
+        from turnstone.core.deadline import StreamAbortRef
+        from turnstone.server import _AbortOnExitStreamingResponse
+
+        handle = MagicMock()
+        abort_ref = StreamAbortRef()
+        abort_ref.append(handle)
+
+        async def cancel_before_body(self, scope, receive, send):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(StreamingResponse, "__call__", cancel_before_body)
+        response = _AbortOnExitStreamingResponse([], abort_ref=abort_ref)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(response({}, MagicMock(), MagicMock()))
+
+        assert abort_ref.aborted
+        handle.close.assert_called()
 
 
 # ---------------------------------------------------------------------------

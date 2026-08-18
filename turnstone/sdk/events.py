@@ -9,6 +9,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from typing import Any
 
+# Runtime import keeps the public SDK alias and dataclass annotations resolvable.
+from turnstone.core.workstream import (  # noqa: TC001
+    ConversationPersistenceState as ConversationPersistenceState,
+)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -81,6 +86,37 @@ class HistoryEvent(ServerEvent):
 
 
 @dataclass
+class HistoryResyncEvent(ServerEvent):
+    """The rendered REST history no longer matches the live row prefix.
+
+    This is stronger than an event-ring gap.  Callers must stop using the
+    current stream, fetch ``/history`` again, render that response, and open a
+    new stream with its one-shot handoff token.  The SDK intentionally does
+    not perform that policy automatically.
+    """
+
+    type: str = "history_resync"
+    reason: str = ""
+
+
+@dataclass
+class UserTurnEvent(ServerEvent):
+    """Canonical accepted user row projected to every stream consumer.
+
+    ``client_send_ids`` correlate browser optimistic bubbles only; they are
+    not idempotency keys. ``_event_id`` is the monotonic row/event identity.
+    """
+
+    type: str = "user_turn"
+    content: str = ""
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    sender: str = ""
+    source: str = ""
+    client_send_ids: list[str] = field(default_factory=list)
+    _event_id: int | None = None
+
+
+@dataclass
 class ThinkingStartEvent(ServerEvent):
     type: str = "thinking_start"
 
@@ -116,6 +152,22 @@ class InProgressSnapshotEvent(ServerEvent):
     type: str = "in_progress_snapshot"
     content: str = ""
     reasoning: str = ""
+
+
+@dataclass
+class AgentContextEvent(ServerEvent):
+    """Latest prompt usage for one running task agent.
+
+    Live updates follow each task-agent model turn. Fresh or truncated SSE
+    connections also receive one synthetic reading per active parent call. A
+    ``ToolResultEvent`` whose ``call_id`` matches ``parent_call_id`` is the
+    terminal signal; completed readings are not retained in history.
+    """
+
+    type: str = "agent_context"
+    parent_call_id: str = ""
+    prompt_tokens: int = 0
+    context_window: int = 0
 
 
 @dataclass
@@ -195,6 +247,10 @@ class ToolResultEvent(ServerEvent):
     name: str = ""
     output: str = ""
     is_error: bool = False
+    preview: dict[str, Any] | None = None
+    accepted: bool = False
+    effect_status: str = ""
+    _event_id: int | None = None
 
 
 @dataclass
@@ -307,21 +363,29 @@ class CompactionEvent(ServerEvent):
     wait); ``end`` carries ``ok`` plus either the result
     (``before_tokens``/``after_tokens``/``summary``) or the failure
     ``reason``/``message`` — failure ends carry ``trigger`` too.  The
-    successful end's summary is also persisted as a compaction marker
-    row and replays from ``/history`` as a ``role="system"``,
-    ``source="compaction"`` entry.  ``compaction_id`` correlates every
-    event of one compaction run (0 from internal/legacy emitters).  End
+    ``target`` is ``"workstream"`` when the lifecycle owns the transcript
+    and durable marker. ``"task_agent"`` events instead carry
+    ``parent_call_id`` and are transient progress for that nested task; their
+    successful end omits ``summary``. Events without a target are workstream
+    events because that was the only compaction scope before targeted events
+    existed. The workstream successful end's summary is also
+    persisted as a compaction marker row and replays from ``/history`` as a
+    ``role="system"``, ``source="compaction"`` entry. ``compaction_id``
+    correlates every event of one attempt (0 from internal emitters). End
     events additionally carry ``superseded``: True marks a force-abandoned
     compaction retiring after a successor generation took over — clients
     should skip failure notices for those (an OK end's result still
-    stands; the history swap happened).  Failed ends carry ``notice``:
-    the emitter-computed display verdict — show ``message`` only when it
-    is True, instead of re-deriving suppression from
-    reason/trigger/superseded client-side.
+    stands; the history swap happened). Failed ends carry ``notice``: the
+    emitter-computed display verdict. Workstream errors use their paired typed
+    error and set it false; task-agent errors have no unscoped error twin and
+    set it true for the nested card. Clients show ``message`` only when notice
+    is true instead of re-deriving policy from reason/trigger/superseded.
     """
 
     type: str = "compaction"
     phase: str = ""
+    target: str = "workstream"
+    parent_call_id: str = ""
     compaction_id: int = 0
     superseded: bool = False
     notice: bool = False
@@ -355,6 +419,7 @@ class WsStateEvent(ServerEvent):
     context_ratio: float = 0.0
     activity: str = ""
     activity_state: str = ""
+    persistence_state: ConversationPersistenceState = "healthy"
     content: str = ""  # populated on idle transitions only
 
 
@@ -418,6 +483,7 @@ class ClusterStateEvent(ClusterEvent):
     context_ratio: float = 0.0
     activity: str = ""
     activity_state: str = ""
+    persistence_state: ConversationPersistenceState = "healthy"
 
 
 @dataclass
@@ -426,6 +492,7 @@ class ClusterWsCreatedEvent(ClusterEvent):
     ws_id: str = ""
     node_id: str = ""
     name: str = ""
+    persistence_state: ConversationPersistenceState = "healthy"
 
 
 @dataclass
@@ -497,11 +564,14 @@ _SERVER_REGISTRY: dict[str, type[ServerEvent]] = {
     for cls in [
         ConnectedEvent,
         HistoryEvent,
+        HistoryResyncEvent,
+        UserTurnEvent,
         ThinkingStartEvent,
         ThinkingStopEvent,
         ReasoningEvent,
         ContentEvent,
         InProgressSnapshotEvent,
+        AgentContextEvent,
         StateChangeEvent,
         StreamEndEvent,
         ToolPendingEvent,

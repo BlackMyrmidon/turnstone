@@ -20,15 +20,19 @@ from turnstone.core.providers._openai_common import (
     apply_tool_search,
     extract_usage,
     format_citations,
+    reject_non_stream_response,
     sanitize_messages,
 )
 from turnstone.core.providers._protocol import (
     ModelCapabilities,
+    ProviderRequestMetrics,
     StreamChunk,
     ToolCallDelta,
     _join_reasoning_with_cap,
     finish_shim_due,
     merge_reasoning_template_kwargs,
+    refuse_aborted_request,
+    serialized_tool_chars,
 )
 from turnstone.core.trajectory import materialize_attachments
 
@@ -303,6 +307,7 @@ class OpenAIChatCompletionsProvider:
         replay_reasoning_to_model: bool = True,
         extra_headers: dict[str, str] | None = None,
         resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
+        request_metrics_ref: list[ProviderRequestMetrics] | None = None,
     ) -> Iterator[StreamChunk]:
         messages = materialize_attachments(messages, resolve_attachments)
         caps = capabilities or self.get_capabilities(model)
@@ -325,6 +330,14 @@ class OpenAIChatCompletionsProvider:
         if extra_headers:
             kwargs["extra_headers"] = extra_headers
 
+        refuse_aborted_request(cancel_ref)
+        if request_metrics_ref is not None:
+            request_metrics_ref.append(
+                ProviderRequestMetrics(
+                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools"))
+                )
+            )
+
         log.debug(
             "openai.chat.request",
             model=model,
@@ -333,7 +346,9 @@ class OpenAIChatCompletionsProvider:
             message_count=len(messages),
             tool_count=len(tools) if tools else 0,
         )
+        refuse_aborted_request(cancel_ref)
         stream = client.chat.completions.create(**kwargs)
+        reject_non_stream_response(stream, cancel_ref=cancel_ref)
         if cancel_ref is not None:
             cancel_ref.append(stream)
         return self._iter_stream(stream, finish_reason_optional=caps.finish_reason_optional)
@@ -439,11 +454,11 @@ class OpenAIChatCompletionsProvider:
         # operator-declared ``finish_reason_optional`` capability: on a
         # server that never sends finish reasons, a stream that ended
         # CLEANLY — the SDK ends iteration on [DONE]; an abrupt connection
-        # death raises httpx.TransportError out of this generator — after
-        # delivering output is a completed generation.  Everywhere else a
-        # clean finish-less end is indistinguishable from a generation
-        # that died behind a clean-closing proxy/ASGI layer, so the shim
-        # stays DISARMED and the drain's complete-or-error gate raises
+        # death raises the active HTTP client's TransportError out of this
+        # generator — after delivering output is a completed generation.
+        # Everywhere else a clean finish-less end is indistinguishable
+        # from a generation that died behind a clean-closing proxy/ASGI layer,
+        # so the shim stays DISARMED and the drain's complete-or-error gate raises
         # (retryable) instead of blessing possibly-truncated text.
         # Reasoning counts as delivered output — a thinking model that
         # spent its budget before emitting content is still a completed

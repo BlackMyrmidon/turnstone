@@ -42,7 +42,6 @@ from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
-from starlette.staticfiles import StaticFiles
 
 from turnstone import __version__
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
@@ -65,13 +64,26 @@ from turnstone.core.mcp_utils import (
     strip_server_status_for_read as _strip_server_status_for_read,
 )
 from turnstone.core.metrics import metrics as _metrics
-from turnstone.core.model_turn import resolve_effort_setting, resolve_temperature_setting
+from turnstone.core.model_turn import (
+    resolve_effort_setting,
+    resolve_model_binding,
+    resolve_temperature_setting,
+)
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
-from turnstone.core.session_manager import SessionManager
-from turnstone.core.session_replay import session_replay_preamble
+from turnstone.core.session_manager import (
+    PERSISTENCE_RECONCILE_INTERVAL_SECONDS,
+    STALE_CREATE_GRACE_SECONDS,
+    STALE_CREATE_SWEEP_INTERVAL_SECONDS,
+    SessionManager,
+)
+from turnstone.core.session_replay import (
+    request_replay_project_name,
+    session_replay_preamble,
+)
 from turnstone.core.session_routes import (
     AttachmentUploadHelpers,
+    CreatePreCommitError,
     SessionEndpointConfig,
     SharedSessionVerbHandlers,
     make_approve_handler,
@@ -101,11 +113,14 @@ from turnstone.core.session_ui_base import (
 )
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.trajectory import final_assistant_text
+from turnstone.core.web_helpers import RevalidatingStaticFiles
 from turnstone.core.web_helpers import version_html as _version_html
 from turnstone.core.workstream import (
     Workstream,
     WorkstreamKind,
     WorkstreamState,
+    concrete_method,
+    workstream_persistence_state,
 )
 from turnstone.prompts import ClientType
 
@@ -180,6 +195,41 @@ class WebUI(SessionUIBase):
         """
         return self._kind, self._parent_ws_id
 
+    # ``_current_persistence_state`` inherited from :class:`SessionUIBase`:
+    # derives through the session bound at construction, never a registry
+    # lookup by id (which fails open to "healthy" exactly while tombstone
+    # retention or retirement has the row out of the map).
+
+    def _publish_global_state_snapshot(
+        self,
+        state: str,
+        payload: dict[str, Any],
+        *,
+        include_content: bool,
+    ) -> None:
+        """Fan out one rich state snapshot without mutating session state."""
+        if WebUI._global_queue is None:
+            return
+        kind, parent_ws_id = self._ws_kind_and_parent()
+        event: dict[str, Any] = {
+            "type": "ws_state",
+            "ws_id": self.ws_id,
+            "state": state,
+            "tokens": payload["tokens"],
+            "context_ratio": payload["context_ratio"],
+            "activity": payload["activity"],
+            "activity_state": payload["activity_state"],
+            "kind": kind,
+            "parent_ws_id": parent_ws_id,
+            "persistence_state": self._current_persistence_state(),
+        }
+        if include_content and state == "idle":
+            event["content"] = payload["content"]
+        try:
+            WebUI._global_queue.put_nowait(event)
+        except queue.Full:
+            log.debug("Global SSE queue full, dropping %s event", event.get("type"))
+
     def _broadcast_state(self, state: str) -> None:
         """Send a state-change event to the global SSE channel.
 
@@ -191,20 +241,6 @@ class WebUI(SessionUIBase):
         """
         if WebUI._global_queue is not None:
             payload = self.snapshot_and_consume_state_payload(state)
-            kind, parent_ws_id = self._ws_kind_and_parent()
-            event: dict[str, Any] = {
-                "type": "ws_state",
-                "ws_id": self.ws_id,
-                "state": state,
-                "tokens": payload["tokens"],
-                "context_ratio": payload["context_ratio"],
-                "activity": payload["activity"],
-                "activity_state": payload["activity_state"],
-                "kind": kind,
-                "parent_ws_id": parent_ws_id,
-            }
-            if state == "idle":
-                event["content"] = payload["content"]
             # ``pending_approval_detail`` is NO LONGER piggybacked on
             # state-change events (Stage 3 cleanup). Symmetric event
             # flow now: initial approval items arrive via bulk fetch
@@ -213,10 +249,31 @@ class WebUI(SessionUIBase):
             # ``intent_verdict`` event class, and resolution via
             # ``approval_resolved``. Reducer no longer has to dedupe
             # the piggyback path against the explicit one.
-            try:
-                WebUI._global_queue.put_nowait(event)
-            except queue.Full:
-                log.debug("Global SSE queue full, dropping %s event", event.get("type"))
+            self._publish_global_state_snapshot(state, payload, include_content=True)
+
+    def on_persistence_state_changed(self) -> None:
+        """Refresh the operator row after journal failure or recovery.
+
+        This intentionally uses the global node stream only. Conversation-pane
+        SSE is a transcript/control channel and must not receive operator-only
+        storage diagnostics. Unlike a real state transition, this snapshot does
+        not consume the terminal turn-content accumulator.
+        """
+        # The registry read serves ONLY the row-state field (``ws.state``
+        # lives on the manager's row); the persistence field itself derives
+        # through the bound session inside the snapshot publish.  A miss
+        # here means the row left the roster — there is no operator row to
+        # refresh, so dropping is correct, and it can no longer launder a
+        # blocked journal into "healthy" (the pre-fix hazard).
+        mgr = WebUI._workstream_mgr
+        if mgr is None:
+            return
+        ws = mgr.get(self.ws_id)
+        if ws is None:
+            return
+        payload = self.snapshot_state_payload_non_consuming()
+        payload["content"] = ""
+        self._publish_global_state_snapshot(ws.state.value, payload, include_content=False)
 
     def _broadcast_activity(self) -> None:
         """Send an activity-change event to the global SSE channel."""
@@ -359,6 +416,17 @@ class WebUI(SessionUIBase):
         from :meth:`SessionUIBase.on_status`. ``usage`` field access
         is defensive for parity with the lifted body.
         """
+        super().on_status(usage, context_window, effort)
+
+    def on_status_deferred(
+        self,
+        usage: dict[str, Any],
+        context_window: int,
+        effort: str,
+        *,
+        deferred_persistence: list[Callable[[], None]],
+    ) -> None:
+        """Record live node metrics while deferring the usage-row write."""
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
         total_tok = prompt_tokens + completion_tokens
@@ -367,7 +435,12 @@ class WebUI(SessionUIBase):
         _metrics.record_tokens(prompt_tokens, completion_tokens)
         _metrics.record_cache_tokens(cache_creation, cache_read)
         _metrics.record_context_ratio(total_tok / context_window if context_window > 0 else 0.0)
-        super().on_status(usage, context_window, effort)
+        super().on_status_deferred(
+            usage,
+            context_window,
+            effort,
+            deferred_persistence=deferred_persistence,
+        )
 
     def on_aux_usage(self, usage: dict[str, Any]) -> None:
         """Feed node Prometheus token counters for auxiliary LLM calls.
@@ -410,6 +483,46 @@ class WebUI(SessionUIBase):
             evt["acting_user_id"] = self._acting_user_id
         self._enqueue(evt)
 
+    def on_state_change_deferred(
+        self,
+        state: str,
+        *,
+        deferred_persistence: list[Callable[[], None]],
+        owner_valid: Callable[[], bool],
+    ) -> None:
+        """Defer durable state and every observer publication as one unit."""
+        evt: dict[str, Any] = {"type": "state_change", "state": state}
+        if self._acting_user_id:
+            evt["acting_user_id"] = self._acting_user_id
+
+        def _publish_local() -> None:
+            self._broadcast_state(state)
+            self._enqueue(evt)
+
+        if WebUI._workstream_mgr is not None:
+            try:
+                ws_state = WorkstreamState(state)
+            except ValueError:
+                log.debug("Ignoring unknown state %r for ws %s", state, self.ws_id)
+            else:
+                admitted = WebUI._workstream_mgr.set_state_deferred(
+                    self.ws_id,
+                    ws_state,
+                    deferred_persistence=deferred_persistence,
+                    after_persist=_publish_local,
+                    owner_valid=owner_valid,
+                )
+                if admitted:
+                    return
+
+        # Standalone/test UIs have no manager tombstone to consult, but still
+        # keep callbacks off ChatSession's generation lock.
+        def _publish_local_if_owned() -> None:
+            if owner_valid():
+                _publish_local()
+
+        deferred_persistence.append(_publish_local_if_owned)
+
     def on_rename(self, name: str) -> None:
         """Update the workstream's display name and broadcast to all clients."""
         if WebUI._global_queue is not None:
@@ -418,15 +531,8 @@ class WebUI(SessionUIBase):
                     {"type": "ws_rename", "ws_id": self.ws_id, "name": name}
                 )
 
-    def on_intent_verdict(
-        self,
-        verdict: dict[str, Any],
-        judge_event: object | None = None,
-    ) -> None:
-        """Extend :meth:`SessionUIBase.on_intent_verdict` with a
-        node-level prometheus metric update.
-        """
-        super().on_intent_verdict(verdict, judge_event)
+    def _record_llm_judge_metric(self, verdict: dict[str, Any]) -> None:
+        """Record the node-level metric for one LLM-tier verdict."""
         fire_judge_verdict_metric(_metrics, verdict, "llm")
 
     # ``on_output_warning`` inherited from :class:`SessionUIBase`.
@@ -693,79 +799,14 @@ def _audit_retry_workstream(
     )
 
 
-def _interactive_dispatch_retry(ws: Workstream, user_msg: str) -> None:
-    """Re-send ``user_msg`` on an interactive workstream after ``/retry``.
-
-    Passed to :func:`make_retry_handler` as ``dispatch_retry``; called
-    once :meth:`ChatSession.retry` has truncated the last turn. Drives
-    the shared :func:`turnstone.core.session_worker.send` dispatcher with
-    an interactive ``run`` closure (surfaces ``GenerationCancelled`` /
-    errors through the WebUI hooks) and a hard-reject ``enqueue`` closure
-    (a retry must not silently queue behind an in-flight turn — preserves
-    the pre-lift inline behaviour). The shared dispatcher owns the
-    ``_worker_running`` lifecycle, so the ``run`` closure needs no
-    ``finally`` flag-clear of its own.
-
-    Deliberately NOT gated on the /send order barrier
-    (``ws._pending_sends``): a retry is an explicit user action that
-    rewinds a COMPLETED turn — dispatching it ahead of deferred sends is
-    an accepted overtake (the user just asked for exactly that turn to
-    run again), not the silent send-vs-send inversion the barrier exists
-    to prevent.  Deferred entries dispatch after it, order among
-    themselves preserved.
-    """
-    from turnstone.core import session_worker
-
-    session = ws.session
-    ui = ws.ui
-    if session is None or ui is None:
-        return
-
-    def _run() -> None:
-        me = threading.current_thread()
-        try:
-            session.send(user_msg)
-        except GenerationCancelled:
-            if ws.worker_thread is me:
-                ui.on_stream_end()
-                ui.on_state_change("idle")
-        except Exception as exc:
-            # Deliberately NOT routed through session.ensure_error_recorded: on a
-            # REUSED session a pre-try raise after a prior errored turn finds
-            # _has_persisted_error stale-True (it is session-lifetime — cleared
-            # only by _emit_state idle/running, not per-turn), so the recorder
-            # would no-op and swallow the fresh error.  The DISPLAY string is
-            # sanitized inline (a credential-bearing base-URL in the exception
-            # text must not cross into the dashboard SSE, the confidentiality
-            # floor _record_fatal_error also enforces); the double state emit and
-            # the pre-try no-persist (a reused-session retry can then have the
-            # coordinator read a STALE last_error) still need the per-turn
-            # error-signal redesign and are tracked in #865, matching the /send
-            # and coord-send sibling closures.
-            if ws.worker_thread is me:
-                from turnstone.core.memory import sanitize_error_text
-
-                ui.on_error(f"Error: {sanitize_error_text(str(exc))}")
-                ui.on_stream_end()
-                ui.on_state_change("error")
-
-    def _enqueue() -> None:
-        ui.on_error("Cannot retry: workstream is busy")
-
-    session_worker.send(ws, enqueue=_enqueue, run=_run, thread_name=f"retry-{ws.id[:8]}")
-
-
 def _interactive_events_replay(
     ws: Workstream, ui: Any, request: Request
 ) -> Iterable[dict[str, Any]]:
     """Initial SSE replay payload for interactive ``events`` connections.
 
-    Yields a ``connected`` event (model + skip_permissions), a
-    ``status`` event with the workstream's last token usage + context %
-    (when a turn has completed), and the pending approval prompt + cached
-    intent verdicts (if a prompt is pending). The lifted
-    ``make_events_handler`` body delegates that yield sequence to this
-    callback so the kind-specific shape stays in this module.
+    Yields the shared ``connected`` / ``status`` preamble, followed by pending
+    approval prompts and cached intent verdicts. The lifted handler resolves
+    viewer-specific project metadata off-loop before invoking this callback.
 
     Conversation history is NOT replayed over SSE: the frontend fetches
     it via ``GET /history`` on page load and re-fetches on the
@@ -774,17 +815,17 @@ def _interactive_events_replay(
 
     Pure read — never mutates ``ws`` / ``ui`` / ``session``.
     """
-    session = ws.session
-    if session is None:
+    if ws.session is None:
         # Defensive — the lifted body's UI presence check guarantees
         # the workstream made it past placeholder state, but the
         # session can still be detached on the close-then-reopen path.
         return
 
-    # Connected + status preamble — same shape coord replays use; the
-    # shared helper keeps the two surfaces from drifting on a future
-    # field add.
-    yield from session_replay_preamble(session, ui)
+    yield from session_replay_preamble(
+        ws.session,
+        ui,
+        project_name=request_replay_project_name(request),
+    )
 
     # Pending approval re-injection (so a reconnecting tab sees the
     # prompt) + cached LLM verdicts received since the prompt fired.
@@ -1004,6 +1045,7 @@ def _build_node_snapshot(app_state: Any) -> dict[str, Any]:
                 "model_alias": ws.session.model_alias if ws.session else "",
                 "kind": ws.kind,
                 "parent_ws_id": ws.parent_ws_id,
+                "persistence_state": workstream_persistence_state(ws),
                 "user_id": ws.user_id,
                 "project_id": ws.project_id,
                 "persona": ws.persona,
@@ -1383,6 +1425,7 @@ async def dashboard(request: Request) -> JSONResponse:
                 "model_alias": ws.session.model_alias if ws.session else "",
                 "kind": ws.kind,
                 "parent_ws_id": ws.parent_ws_id,
+                "persistence_state": workstream_persistence_state(ws),
                 "user_id": ws.user_id,
                 "project_id": ws.project_id,
                 "persona": ws.persona,
@@ -1494,6 +1537,40 @@ _STT_UPLOAD_CAP = 25 * 1024 * 1024  # 25 MiB — generous for short dictation cl
 _TTS_TEXT_CAP = 8000  # characters per synthesis request
 
 
+def _audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | None]:
+    """Bind one audio HTTP request to its authenticated model principal."""
+    from turnstone.core.model_backend_auth import resolve_model_backend_auth_token
+
+    principal_id = _auth_user_id(request).strip()
+    config_store = getattr(request.app.state, "config_store", None)
+    mint_client = getattr(request.app.state, "mcp_client", None)
+
+    def _resolve(alias: str, config: Any) -> str | None:
+        return resolve_model_backend_auth_token(
+            alias,
+            config,
+            principal_id=principal_id,
+            config_store=config_store,
+            mint_client=mint_client,
+        )
+
+    return _resolve
+
+
+class _AbortOnExitStreamingResponse(StreamingResponse):
+    """Abort an upstream audio stream even before body iteration begins."""
+
+    def __init__(self, *args: Any, abort_ref: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._abort_ref = abort_ref
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._abort_ref.abort()
+
+
 async def speech_to_text(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/{ws_id}/speech-to-text — transcribe one audio clip.
 
@@ -1507,6 +1584,8 @@ async def speech_to_text(request: Request) -> JSONResponse:
         resolve_role_alias,
         transcribe,
     )
+    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.model_backend_auth import BackendAuthUnavailableError
     from turnstone.core.web_helpers import read_multipart_file_or_400
 
     ws_id = request.path_params.get("ws_id", "")
@@ -1539,6 +1618,8 @@ async def speech_to_text(request: Request) -> JSONResponse:
     stt_prompt = ""
     if config_store is not None:
         stt_prompt = (config_store.get("audio.stt_prompt") or "").strip()
+    abort_ref = StreamAbortRef()
+    backend_auth_resolver = _audio_backend_auth_resolver(request)
     try:
         # Blocking SDK round-trip — offload so the shared event loop (and SSE
         # streaming) stays responsive.
@@ -1549,7 +1630,13 @@ async def speech_to_text(request: Request) -> JSONResponse:
             data=data,
             filename=filename or "speech.webm",
             prompt=stt_prompt,
+            config_store=config_store,
+            backend_auth_resolver=backend_auth_resolver,
+            cancel_ref=abort_ref,
         )
+    except BackendAuthUnavailableError:
+        log.warning("speech_to_text.backend_auth_unavailable", exc_info=True)
+        return JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
     except AudioUnavailableError as exc:
         return JSONResponse({"error": str(exc)}, status_code=503)
     except AudioBackendError as exc:
@@ -1557,6 +1644,8 @@ async def speech_to_text(request: Request) -> JSONResponse:
         # response detail — log it, but return a static body to the caller.
         log.warning("speech_to_text.backend_failed", error=str(exc), exc_info=True)
         return JSONResponse({"error": "Speech transcription backend failed"}, status_code=502)
+    finally:
+        abort_ref.abort()
 
     if not result.transcript:
         # Successful call that detected no speech (silence / non-speech audio)
@@ -1585,6 +1674,8 @@ async def speech_to_text_stream(request: Request) -> Response:
         resolve_role_alias,
         transcribe_stream,
     )
+    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.model_backend_auth import BackendAuthUnavailableError
     from turnstone.core.web_helpers import read_multipart_file_or_400
 
     ws_id = request.path_params.get("ws_id", "")
@@ -1617,18 +1708,36 @@ async def speech_to_text_stream(request: Request) -> Response:
     stt_prompt = ""
     if config_store is not None:
         stt_prompt = (config_store.get("audio.stt_prompt") or "").strip()
+    abort_ref = StreamAbortRef()
+    backend_auth_resolver = _audio_backend_auth_resolver(request)
 
     # Resolve + transcode + open the stream eagerly (off the event loop) so the
     # common failures map to a clean status before any bytes are sent.
     try:
         deltas = await asyncio.to_thread(
-            transcribe_stream, registry=registry, alias=alias, data=data, prompt=stt_prompt
+            transcribe_stream,
+            registry=registry,
+            alias=alias,
+            data=data,
+            prompt=stt_prompt,
+            config_store=config_store,
+            backend_auth_resolver=backend_auth_resolver,
+            cancel_ref=abort_ref,
         )
+    except BackendAuthUnavailableError:
+        abort_ref.abort()
+        log.warning("speech_to_text_stream.backend_auth_unavailable", exc_info=True)
+        return JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
     except AudioUnavailableError as exc:
+        abort_ref.abort()
         return JSONResponse({"error": str(exc)}, status_code=503)
     except AudioBackendError:
+        abort_ref.abort()
         log.warning("speech_to_text_stream.backend_failed", exc_info=True)
         return JSONResponse({"error": "Speech transcription backend failed"}, status_code=502)
+    except BaseException:
+        abort_ref.abort()
+        raise
 
     # Drive the blocking stream from one worker thread that owns (and closes)
     # the upstream connection, handing deltas to the loop via a queue.  A client
@@ -1647,7 +1756,8 @@ async def speech_to_text_stream(request: Request) -> Response:
                     loop.call_soon_threadsafe(queue.put_nowait, delta.encode("utf-8"))
             except Exception:
                 # Mid-stream backend failure: end the partial stream (logged).
-                log.warning("speech_to_text_stream.mid_stream_failed", exc_info=True)
+                if not abort_ref.aborted:
+                    log.warning("speech_to_text_stream.mid_stream_failed", exc_info=True)
             finally:
                 close = getattr(deltas, "close", None)
                 if callable(close):
@@ -1663,8 +1773,13 @@ async def speech_to_text_stream(request: Request) -> Response:
                 yield chunk
         finally:
             stop.set()
+            abort_ref.abort()
 
-    return StreamingResponse(_body(), media_type="text/plain; charset=utf-8")
+    return _AbortOnExitStreamingResponse(
+        _body(),
+        media_type="text/plain; charset=utf-8",
+        abort_ref=abort_ref,
+    )
 
 
 async def text_to_speech(request: Request) -> Response:
@@ -1675,6 +1790,8 @@ async def text_to_speech(request: Request) -> Response:
         resolve_role_alias,
         synthesize,
     )
+    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.model_backend_auth import BackendAuthUnavailableError
     from turnstone.core.web_helpers import read_json_or_400
 
     body = await read_json_or_400(request)
@@ -1705,17 +1822,31 @@ async def text_to_speech(request: Request) -> Response:
     if not voice and config_store is not None:
         voice = (config_store.get("audio.tts_voice") or "").strip()
 
+    abort_ref = StreamAbortRef()
+    backend_auth_resolver = _audio_backend_auth_resolver(request)
     try:
         # Blocking SDK round-trip — offload off the event loop.
         speech = await asyncio.to_thread(
-            synthesize, registry=registry, alias=alias, text=text, voice=voice
+            synthesize,
+            registry=registry,
+            alias=alias,
+            text=text,
+            voice=voice,
+            config_store=config_store,
+            backend_auth_resolver=backend_auth_resolver,
+            cancel_ref=abort_ref,
         )
+    except BackendAuthUnavailableError:
+        log.warning("text_to_speech.backend_auth_unavailable", exc_info=True)
+        return JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
     except AudioUnavailableError as exc:
         return JSONResponse({"error": str(exc)}, status_code=503)
     except AudioBackendError as exc:
         # Static body to the caller; backend SDK detail stays in the log.
         log.warning("text_to_speech.backend_failed", error=str(exc), exc_info=True)
         return JSONResponse({"error": "Speech synthesis backend failed"}, status_code=502)
+    finally:
+        abort_ref.abort()
 
     return Response(
         speech.audio_bytes,
@@ -1933,10 +2064,23 @@ async def command(request: Request) -> JSONResponse:
                 status_code=400,
             )
 
+        if cmd_word in {"/new", "/workstreams", "/resume", "/delete"}:
+            # These are local-CLI lifecycle helpers, not remote conversation
+            # commands.  Their implementations enumerate or mutate storage
+            # globally and predate the HTTP surface's tenant/project gates.
+            # Reject here before dispatching a worker so alternate/test
+            # Session implementations cannot bypass ChatSession's matching
+            # defence-in-depth guard.
+            return JSONResponse(
+                {"error": "This workstream command is only available in the local CLI."},
+                status_code=400,
+            )
+
         from turnstone.core import session_worker
 
         session = ws.session
         cmd_ui = ui
+        command_principal = _auth_user_id(request).strip()
         busy_hit = False
 
         def _reject_busy() -> None:
@@ -1969,6 +2113,7 @@ async def command(request: Request) -> JSONResponse:
                     ws,
                     enqueue=_reject_busy,
                     run=run,
+                    expected_session=session,
                     thread_name=thread_name,
                     worker_kind="command",
                 )
@@ -2039,7 +2184,7 @@ async def command(request: Request) -> JSONResponse:
                 prev_state = ws.state
                 try:
                     cmd_ui.on_state_change("thinking")
-                    session.compact_now()
+                    session.compact_now(principal_id=command_principal)
                 except GenerationCancelled:
                     # User stopped it — including a Stop that landed in the
                     # completion tail, which compact_now re-raises after
@@ -2086,7 +2231,10 @@ async def command(request: Request) -> JSONResponse:
         def _run_cmd() -> None:
             me = threading.current_thread()
             try:
-                should_exit = session.handle_command(cmd)
+                should_exit = session.handle_command(
+                    cmd,
+                    principal_id=command_principal,
+                )
                 # Post-command follow-ups run HERE, on the worker, not
                 # after the endpoint's done-wait: past the 25s backstop the
                 # endpoint has already answered {"status": "running"}, and
@@ -2115,6 +2263,16 @@ async def command(request: Request) -> JSONResponse:
                         updated_name = get_workstream_display_name(session.ws_id)
                         if updated_name:
                             ws.name = updated_name
+            except GenerationCancelled:
+                # Defense-in-depth, the sibling of _run_initial's arm (no
+                # generic command claims a generation today, so this is
+                # effectively unreachable).  ``session_worker._runner``
+                # catches only ``Exception`` — without this arm a stray
+                # cancel would kill the worker thread via
+                # ``threading.excepthook``; the finally below still
+                # unblocks the endpoint either way.
+                if ws.worker_thread is me:
+                    cmd_ui.on_info("Command cancelled.")
             except Exception as e:
                 # Same guard: a late "Command error:" from an abandoned
                 # worker would land mid-successor-turn.
@@ -2222,6 +2380,37 @@ def _validate_notify_targets(raw: Any) -> tuple[str, str]:
         normalized.append(normalized_target)
 
     return json.dumps(normalized), ""
+
+
+def _normalize_auto_approve_tools(raw: Any) -> tuple[list[str], str]:
+    """Validate and canonicalize create-time per-tool approval input.
+
+    The Python SDK historically emits a comma-separated string while direct
+    HTTP callers naturally use an array.  Preserve first-seen order for a
+    stable canonical body, strip surrounding whitespace, drop empty entries,
+    and deduplicate exact names.  A malformed array is rejected before the
+    deferred workstream reservation is created.
+    """
+    if raw is None or raw == "":
+        return [], ""
+    if isinstance(raw, str):
+        candidates: list[Any] = raw.split(",")
+    elif isinstance(raw, list):
+        candidates = raw
+    else:
+        return [], "auto_approve_tools must be a comma-separated string or array of strings"
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for index, candidate in enumerate(candidates):
+        if not isinstance(candidate, str):
+            return [], f"auto_approve_tools[{index}] must be a string"
+        tool_name = candidate.strip()
+        if not tool_name or tool_name in seen:
+            continue
+        seen.add(tool_name)
+        normalized.append(tool_name)
+    return normalized, ""
 
 
 def _fire_notify_targets(ws: Any, content: str) -> None:
@@ -2354,6 +2543,8 @@ async def _interactive_create_validate_request(
       ``ws_created`` broadcast) and the only available signal is to
       raise — which the factory turns into 500. 400 at the gate is
       correct shape for client-input validation.
+    - auto_approve_tools accepts CSV or a list of strings and is
+      canonicalized before the workstream reservation is created.
     """
     requested_ws_id = body.get("ws_id", "") or ""
     if not isinstance(requested_ws_id, str):
@@ -2391,7 +2582,7 @@ async def _interactive_create_validate_request(
 
         _pstorage = _get_storage_for_parent()
         parent_row = _pstorage.get_workstream(body_parent) if _pstorage else None
-        if parent_row is None:
+        if parent_row is None or parent_row.get("state") == "creating":
             return JSONResponse(
                 {"error": "parent_ws_id does not reference a known workstream"},
                 status_code=400,
@@ -2412,85 +2603,95 @@ async def _interactive_create_validate_request(
         if not (body.get("project_id") or "") and parent_row.get("project_id"):
             body["project_id"] = parent_row.get("project_id")
             inherited_pid = True
-    # Fork/resume: a fork's project is STRUCTURALLY its source's, and only when
-    # the require_project gate is on (off is byte-identical — no resolve, no
-    # inherit, explicit project_id untouched). This DELIBERATELY DIVERGES from the
-    # sibling parent-coordinator block at :2244: that block DEFERS to an explicit
-    # body project_id (a coordinator spawn carries no history, so the
-    # spawn_workstream(project=…) escape hatch is legitimate), whereas a fork
-    # copies the SOURCE's conversation — which must never be re-filed under an
-    # unrelated project the caller merely owns — so here we DISCARD any explicit
-    # project_id up front and then inherit only the source's own project. An
-    # explicit body project_id can never influence a fork.
+    # Fork/resume is a source READ, regardless of whether this deployment
+    # requires every new chat to have a project.  Project-less/public rows keep
+    # Turnstone's trusted-team visibility, but a private-project source must pass
+    # the same owner/member predicate as history and attachment reads.  This is
+    # especially load-bearing now that a fork atomically retains the source's
+    # attachment refs: without the gate, a caller who guessed a private ws id
+    # could mint a caller-owned fork and download its raw blobs.
     #
-    # No cross-tenant oracle, by construction: for a source that is inaccessible-
-    # private (attach 403 → resume_inherited_pid drop below), projectless, or
-    # nonexistent/unresolvable, body["project_id"] stays "" and the gate emits ONE
-    # uniform 400 — identical BODY *and* STATUS (the discard, not body-equalising,
-    # is what makes them indistinguishable). The residual side-channel is DB-query
-    # LATENCY only (an inaccessible-private source runs extra get_project/
-    # is_project_member); constant-time storage is out of scope.
-    #
-    # RAW/raising storage is deliberate — the swallowing memory.resolve_workstream
-    # would turn a transient DB error into None → a misleading "requires a project"
-    # 400, whereas a raise here surfaces an honest 500 (consistent with the parent
-    # block's sync get_workstream). resume_ws is only read, never mutated:
-    # post_install still performs the real fork (one extra indexed lookup on the
-    # rare fork path). Caveat (pre-existing to the resume mechanic): post_install
-    # re-resolves via the swallowing resolver, so a delete/blip between here and
-    # there degrades the fork to a fresh chat in the inherited project.
-    from turnstone.core.auth import require_project_enabled
-
-    if (
-        isinstance(resume_ws_id, str)
-        and resume_ws_id
-        and require_project_enabled(getattr(request.app.state, "config_store", None))
-    ):
-        # Discard any caller-supplied project_id FIRST: a fork is filed under its
-        # SOURCE's project, or (no accessible source project) refused — never a
-        # caller pick. This structural discard is what blocks the re-file and makes
-        # the {inaccessible/projectless/nonexistent}-source outcomes uniform. It
-        # gates on require_project_enabled (the flag) and NOT require_project_denies_
-        # create (flag + service/coordinator exemptions), DELIBERATELY: the
-        # exemptions waive the "must have a project" MANDATE, but fork-integrity — a
-        # fork's copied history must never be re-filed under an unrelated project —
-        # is a security invariant that binds every forker while the feature is on.
-        # The two require_project predicates differ here on purpose.
-        body["project_id"] = ""
+    # Resolve once, before generic create loads the source persona/config, and
+    # replace the body value with that canonical id.  Post-install therefore
+    # cannot rebind through an alias change between authorization and copy.
+    # A fork is structurally filed under its source project (when one exists),
+    # even when ``server.require_project`` is off; caller-supplied re-filing
+    # would otherwise declassify a private conversation through a public or
+    # project-less destination.
+    if isinstance(resume_ws_id, str) and resume_ws_id:
+        from turnstone.core.auth import WorkstreamProjectVisibility
         from turnstone.core.storage._registry import get_storage as _get_storage_for_resume
 
         _rstorage = _get_storage_for_resume()
-        if _rstorage is not None:
-            _canonical = _rstorage.resolve_workstream(resume_ws_id)
-            _src_row = _rstorage.get_workstream(_canonical) if _canonical else None
-            if _src_row and _src_row.get("project_id"):
-                body["project_id"] = _src_row["project_id"]
-                resume_inherited_pid = True
-    # Project attach gate (explicit or parent-inherited): a private
-    # project accepts new workstreams only from its owner/members, and a
-    # nonexistent EXPLICIT project_id is a caller error rather than a
-    # silent dangling link. Re-checking the inherited value is deliberate
+        if _rstorage is None:
+            return JSONResponse({"error": "Storage unavailable"}, status_code=503)
+        # A full workstream id is already canonical.  Do not feed it back
+        # through alias-first resolution: an unrelated row may legally carry
+        # that 32-hex string as its alias, and a routing proxy has already
+        # canonicalized saved aliases before forwarding the request.  Retain
+        # support for 32-hex aliases only when no exact row exists.
+        _exact_source = (
+            _rstorage.get_workstream(resume_ws_id) if _VALID_WS_ID.fullmatch(resume_ws_id) else None
+        )
+        _canonical = (
+            resume_ws_id
+            if _exact_source is not None
+            else _rstorage.resolve_workstream(resume_ws_id)
+        )
+        _src_row = (
+            _rstorage.ensure_workstream_incarnation_snapshot(_canonical) if _canonical else None
+        )
+        if _src_row is None or _src_row.get("state") in {"creating", "deleted"}:
+            return JSONResponse({"error": "Workstream not found"}, status_code=404)
+
+        auth = getattr(getattr(request, "state", None), "auth_result", None)
+        actor_uid = str(getattr(auth, "user_id", "") or "")
+        service_for_self = bool(
+            auth is not None and auth.has_scope("service") and actor_uid and actor_uid == uid
+        )
+        visibility = WorkstreamProjectVisibility(
+            uid,
+            bypass=service_for_self,
+            storage=_rstorage,
+        )
+        source_project = str(_src_row.get("project_id") or "")
+        source_owner = str(_src_row.get("user_id") or "")
+        if not visibility.ws_visible(source_project, ws_owner=source_owner):
+            # Match the ordinary missing-row shape so a guessed id is not a
+            # private-project existence oracle.
+            return JSONResponse({"error": "Workstream not found"}, status_code=404)
+
+        body["resume_ws"] = _canonical
+        # Private request-local witness: clone compares this preflight
+        # incarnation inside its transaction, so delete/recreate under the same
+        # canonical id cannot inherit the earlier authorization decision.
+        body["_resume_incarnation_token"] = str(_src_row.get("fork_reservation_token") or "")
+        body["project_id"] = source_project
+        resume_inherited_pid = bool(source_project)
+    # Project attach gate (explicit or parent-inherited): a project requires
+    # canonical active-runtime read access, and a nonexistent EXPLICIT
+    # project_id is a caller error rather than a silent dangling link.
+    # Re-checking the inherited value is deliberate
     # — a coordinator owner whose membership was revoked fails the child
     # spawn loudly here instead of minting rows they can no longer see.
     # The one asymmetry: an INHERITED project that no longer exists is
     # not the spawner's error — project deletion leaves the parent's
     # link dangling by design and must not disable spawn_workstream, so
     # the child simply isn't attached.
-    attach_pid = str(body.get("project_id") or "")
+    project_raw = body.get("project_id")
+    attach_pid = project_raw.strip() if isinstance(project_raw, str) else ""
+    body["project_id"] = attach_pid
     if attach_pid:
         from turnstone.core.auth import ensure_project_attachable
 
         denied = ensure_project_attachable(uid, attach_pid)
         if denied is not None:
             status, message = denied
-            if resume_inherited_pid:
-                # Resume-inherited project: ANY denial (unknown 400, private
-                # 403, storage-blip/None 403) drops to a projectless create, so
-                # a private/inaccessible/dangling SOURCE is indistinguishable
-                # from a projectless or nonexistent one. Surfacing the 403 would
-                # leak that the resume_ws id sits under a private project the
-                # caller can't see (a cross-tenant oracle). The require_project
-                # gate then emits ONE uniform 400 downstream.
+            if resume_inherited_pid and status == 400:
+                # The source points at a project row that no longer exists.
+                # Project deletion deliberately leaves workstream links
+                # dangling, so the fork becomes project-less; the private
+                # visibility check above already handled real/uncertain rows.
                 body["project_id"] = ""
             elif inherited_pid and status == 400:
                 # Parent-inherited dangling project (deleted): the child simply
@@ -2505,6 +2706,12 @@ async def _interactive_create_validate_request(
     _, nt_err = _validate_notify_targets(notify_targets_raw)
     if nt_err:
         return JSONResponse({"error": nt_err}, status_code=400)
+    auto_approve_tools, tools_err = _normalize_auto_approve_tools(
+        body.get("auto_approve_tools", "")
+    )
+    if tools_err:
+        return JSONResponse({"error": tools_err}, status_code=400)
+    body["auto_approve_tools"] = auto_approve_tools
     return None
 
 
@@ -2552,7 +2759,74 @@ def _interactive_create_build_kwargs(
     }
 
 
-async def _interactive_create_post_install(
+async def _interactive_create_pre_commit(
+    request: Request,
+    ws: Workstream,
+    body: dict[str, Any],
+    uid: str,
+) -> dict[str, Any]:
+    """Atomically fork a requested source before the create is advertised."""
+    del request
+    resume_ws_id = body.get("resume_ws", "") or ""
+    if not resume_ws_id:
+        return {}
+    if ws.session is None:
+        raise CreatePreCommitError("Fork could not be completed", status_code=503)
+
+    from turnstone.core.storage import (
+        ForkDestinationConflictError,
+        ForkSourceUnavailableError,
+    )
+
+    source_ws_id = str(resume_ws_id)
+    source_reservation_token = str(body.get("_resume_incarnation_token") or "")
+    if not source_reservation_token:
+        raise CreatePreCommitError(
+            "Fork source is no longer available",
+            status_code=409,
+        )
+    try:
+        snapshot = await asyncio.to_thread(
+            ws.session.fork_from_storage,
+            source_ws_id,
+            principal_id=uid,
+            source_reservation_token=source_reservation_token,
+            trusted_internal=False,
+        )
+        message_count = len(snapshot.turns)
+        ws.project_id = snapshot.project_id
+    except ForkSourceUnavailableError as exc:
+        # Missing and newly-inaccessible sources deliberately collapse to one
+        # conflict response: no private-workstream existence oracle.
+        raise CreatePreCommitError(
+            "Fork source is no longer available",
+            status_code=409,
+        ) from exc
+    except ForkDestinationConflictError as exc:
+        log.warning(
+            "ws.fork.destination_conflict source=%s destination=%s",
+            source_ws_id[:8],
+            ws.id[:8],
+        )
+        raise CreatePreCommitError(
+            "Workstream creation was superseded",
+            status_code=409,
+        ) from exc
+    except Exception as exc:
+        log.warning(
+            "ws.fork.storage_failed source=%s destination=%s",
+            source_ws_id[:8],
+            ws.id[:8],
+            exc_info=True,
+        )
+        raise CreatePreCommitError("Fork could not be completed", status_code=503) from exc
+
+    # A committed empty snapshot is still a successful fork. The boolean is
+    # about fulfilling the requested operation, not whether history was nonempty.
+    return {"resumed": True, "message_count": message_count}
+
+
+async def _interactive_create_prepare_install(
     request: Request,
     ws: Workstream,
     body: dict[str, Any],
@@ -2561,103 +2835,50 @@ async def _interactive_create_post_install(
     applied_skill_version: int,
     attachment_ids: list[str],
 ) -> dict[str, Any]:
-    """Tail end of interactive create: per-WebUI bookkeeping + dispatch.
+    """Prepare fallible interactive setup before lifecycle publication.
 
-    Wired onto :attr:`SessionEndpointConfig.create_post_install`.
-    Runs after the workstream is fully built, attachments saved,
-    and audit emitted. Sequence:
+    Wired onto :attr:`SessionEndpointConfig.create_prepare_install`.
+    Runs after the workstream is fully built, attachments and any requested
+    atomic fork are committed, but before ``commit_create``. Sequence:
 
     1. Cast ``ws.ui`` to :class:`WebUI` (defence in depth — the
        interactive adapter's session factory is the only path that
        reaches this handler).
     2. Apply ``auto_approve`` from server-wide ``skip_permissions``
        or per-request body.
-    3. Register the watch runner for the workstream's session.
-    4. Broadcast ``ws_created`` on the global SSE queue. Held until
-       this point so a rejected attachment validation produces no
-       phantom create→close pair on the SSE stream.
-    5. Atomic resume: if ``body["resume_ws"]`` is set, fork the
-       referenced session into the new ws_id, push history into the
-       UI listener queue, and rebroadcast ``ws_rename`` so the tab
-       picks up the fork's display name.
-    6. Apply the skill's session config (temperature / reasoning /
+    3. For a pre-committed fork, persist its requested alias.
+    4. Prepare bounded clear/create/rename/watch publication data for the
+       interactive adapter; nothing is emitted from this phase.
+    5. Apply the skill's session config (temperature / reasoning /
        max_tokens / approval policy / metadata).
-    7. Resolve notify_targets (schedule targets win over skill
+    6. Resolve notify_targets (schedule targets win over skill
        fallback).
-    8. Pin the workstream's routing to this node when no caller-
+    7. Pin the workstream's routing to this node when no caller-
        supplied ``ws_id`` was provided (direct creates).
-    9. Spawn the initial-message worker thread when ``initial_message``
-       is set, resolving any staged uploads from the buffer onto that
-       first turn (then draining them so a freshly-opened pane's
-       rehydrate can't observe them as still-pending).
 
-    Returns ``{resumed, message_count}`` for the response. On the
-    no-resume path both default to ``False`` / ``0``.
+    Initial-message dispatch remains in ``_interactive_create_post_install``
+    so no state event can precede the atomic created publication.
     """
-    from turnstone.core.memory import get_workstream_display_name
+    from turnstone.core.memory import (
+        finalize_deferred_create,
+        get_workstream_display_name,
+    )
 
     if not isinstance(ws.ui, WebUI):
         raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
     skip: bool = request.app.state.skip_permissions
     if skip or body.get("auto_approve", False):
         ws.ui.auto_approve = True
-    runner = getattr(request.app.state, "watch_runner", None)
-    if runner and ws.session:
-        ws.session.set_watch_runner(runner, wake_fn=_watch_fire_wake_fn(ws))
-    gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
-    # Emit ``ws_created`` on the global queue for SSE consumers
-    # (console). Held until past attachment validation in the
-    # factory so a rejected upload doesn't flash a workstream that
-    # never really existed.
-    display_name = get_workstream_display_name(ws.id) or ws.name
-    with contextlib.suppress(queue.Full):
-        gq.put_nowait(
-            {
-                "type": "ws_created",
-                "ws_id": ws.id,
-                "name": display_name,
-                "model": ws.session.model if ws.session else "",
-                "model_alias": ws.session.model_alias if ws.session else "",
-                "kind": ws.kind,
-                "parent_ws_id": ws.parent_ws_id,
-                # Owner id propagates through the cluster event
-                # stream so console-side fan-out can enforce tenant
-                # isolation — a coordinator must never receive
-                # child_ws_* events for workstreams it doesn't own.
-                "user_id": ws.user_id,
-                # Project id likewise: the console's per-connection SSE
-                # tenancy filter gates ws_created on it — omitting it
-                # here made freshly-created private-project workstreams
-                # fail open on live cluster views (its open/resume and
-                # node-snapshot siblings already carry it).
-                "project_id": ws.project_id,
-                "persona": ws.persona,
-            }
-        )
-
-    # Atomic workstream resume during creation.
-    resumed = False
-    message_count = 0
+    # The storage fork already committed in ``create_pre_commit``. Keep the
+    # existing post-success alias and clear-ui behavior without re-reading or
+    # copying the source here.
     resume_ws_id = body.get("resume_ws", "") or ""
+    resumed = bool(resume_ws_id)
+    alias_to_apply: str | None = None
     if resume_ws_id and ws.session is not None:
-        from turnstone.core.memory import resolve_workstream
-
-        target_id = resolve_workstream(resume_ws_id)
-        if target_id and ws.session.resume(target_id, fork=True):
-            resumed = True
-            message_count = len(ws.session.messages)
-            user_name = body.get("name", "").strip()
-            if user_name:
-                from turnstone.core.memory import set_workstream_alias
-
-                set_workstream_alias(ws.id, user_name)
-                ws.name = user_name
-            ui = ws.ui
-            if isinstance(ui, WebUI):
-                # clear_ui signals the frontend to re-fetch history via REST.
-                ui._enqueue({"type": "clear_ui"})
-            with contextlib.suppress(queue.Full):
-                gq.put_nowait({"type": "ws_rename", "ws_id": ws.id, "name": ws.name})
+        user_name = body.get("name", "").strip()
+        if user_name:
+            alias_to_apply = user_name
 
     # Apply skill session config (only for new workstreams with a skill).
     if skill_data and not resumed and ws.session:
@@ -2695,7 +2916,23 @@ async def _interactive_create_post_install(
         sess._applied_skill_version = applied_skill_version
         if skill_data.get("content"):
             sess._applied_skill_content = skill_data["content"]
-        sess._save_config()
+        # The config snapshot is persisted below in the same reservation-
+        # checked transaction as alias and routing. A by-id save here could
+        # otherwise land in a replacement incarnation after delete/recreate.
+
+    # Explicit create-time per-tool approvals are independent of blanket
+    # ``auto_approve`` and union with a skill's allow-list. Apply them after
+    # the skill block so an explicitly named overlap carries the request's
+    # provenance instead of being misreported as an implicit skill approval.
+    requested_auto_approve_tools = body.get("auto_approve_tools", [])
+    if requested_auto_approve_tools:
+        ws.ui.auto_approve_tools.update(requested_auto_approve_tools)
+        ws.ui._auto_approve_tools_source.update(
+            {
+                tool_name: AutoApproveReason.AUTO_APPROVE_TOOLS
+                for tool_name in requested_auto_approve_tools
+            }
+        )
 
     # notify_targets: schedule targets override skill targets. The
     # validator already gated malformed input as 400; here we just
@@ -2715,15 +2952,79 @@ async def _interactive_create_post_install(
 
     # Pin locally-created workstreams so the console routes to this node.
     requested_ws_id = body.get("ws_id", "") or ""
+    node_id_to_apply: str | None = None
     if not requested_ws_id:
         node_id = getattr(request.app.state, "node_id", "")
         if node_id:
-            try:
-                from turnstone.core.storage import get_storage as _gs
+            node_id_to_apply = node_id
 
-                _gs().set_workstream_override(ws.id, node_id, reason="local")
-            except Exception:
-                log.debug("Failed to set routing override for %s", ws.id, exc_info=True)
+    reservation_token = ws._fork_reservation_token
+    if not reservation_token:
+        raise CreatePreCommitError(
+            "Workstream creation was superseded",
+            status_code=409,
+        )
+    config_to_apply = (
+        ws.session._config_for_save()
+        if skill_data and not resumed and ws.session is not None
+        else None
+    )
+    try:
+        finalized = await asyncio.to_thread(
+            finalize_deferred_create,
+            ws.id,
+            reservation_token,
+            alias=alias_to_apply,
+            config=config_to_apply,
+            node_id=node_id_to_apply,
+            override_reason="local",
+        )
+    except Exception as exc:
+        log.warning(
+            "ws.create.prepare_finalize_failed ws=%s",
+            ws.id[:8],
+            exc_info=True,
+        )
+        raise CreatePreCommitError(
+            "Workstream creation could not be finalized",
+            status_code=503,
+        ) from exc
+    if not finalized:
+        raise CreatePreCommitError(
+            "Workstream creation was superseded",
+            status_code=409,
+        )
+    if alias_to_apply is not None:
+        ws.name = alias_to_apply
+
+    # ``InteractiveAdapter.emit_created`` consumes only these bounded values
+    # while SessionManager still owns the exact deferred-create reservation.
+    ws._create_event_name = get_workstream_display_name(ws.id) or ws.name
+    ws._create_clear_ui = resumed
+    ws._create_emit_rename = resumed
+    ws._create_watch_runner = getattr(request.app.state, "watch_runner", None)
+    ws._create_watch_wake_fn = _watch_fire_wake_fn(ws)
+
+    return {}
+
+
+async def _interactive_create_post_install(
+    request: Request,
+    ws: Workstream,
+    body: dict[str, Any],
+    uid: str,
+    skill_data: dict[str, Any] | None,
+    applied_skill_version: int,
+    attachment_ids: list[str],
+) -> dict[str, Any]:
+    """Dispatch the optional first turn after lifecycle publication.
+
+    All alias/config/watch/UI setup is complete before ``commit_create`` and
+    the adapter has already emitted ``ws_created`` (plus a fork rename) before
+    this hook runs. Consequently a concurrent close can only make the dispatch
+    refuse; it cannot be followed by stale create/watch publication.
+    """
+    del skill_data, applied_skill_version
 
     # Initial-message worker thread.
     initial_message = body.get("initial_message", "").strip()
@@ -2737,13 +3038,11 @@ async def _interactive_create_post_install(
         session = ws.session
         send_id = uuid.uuid4().hex
         resolved_atts: list[Any] = []
-        staged_ord: list[str] = []
         if attachment_ids:
-            # Resolve (peek) the staged uploads.  The buffer DRAIN happens
-            # after the dispatch below, and only on the spawn path — the
-            # enqueue path can't deliver attachments, so there they must
-            # stay staged (see ``_enqueue_init``).
-            resolved_atts, staged_ord, _drop = _resolve_staged(attachment_ids, ws.id, uid)
+            # Resolve without draining. Accepted USER journal admission owns
+            # the atomic transfer; every pre-admission refusal keeps staging
+            # intact for a retry (including the enqueue path below).
+            resolved_atts, _staged_ord, _drop = _resolve_staged(attachment_ids, ws.id, uid)
 
         def _run_initial() -> None:
             me = threading.current_thread()
@@ -2868,6 +3167,7 @@ async def _interactive_create_post_install(
             ws,
             enqueue=_enqueue_init,
             run=_run_initial,
+            expected_session=session,
             thread_name=f"ws-init-{ws.id[:8]}",
         )
         if not init_ok:
@@ -2887,21 +3187,7 @@ async def _interactive_create_post_install(
                 ws.id[:8],
                 initial_message_status,
             )
-        if staged_ord and not init_enqueued and init_ok:
-            # Spawn path took the message: drain the staged copies NOW,
-            # before this handler returns — the pane's rehydrate can only
-            # start after it receives this response, so it can never
-            # observe the consumed uploads as still-pending composer
-            # chips.  (``enqueue`` runs synchronously inside ``send``, so
-            # ``init_enqueued`` is settled here.)  ``_append_user_turn``'s
-            # own per-id discard then no-ops.
-            from turnstone.core.attachment_buffer import get_attachment_buffer
-
-            _buf = get_attachment_buffer()
-            for _aid in staged_ord:
-                _buf.discard(_aid, ws_id=ws.id, user_id=uid)
-
-    out: dict[str, Any] = {"resumed": resumed, "message_count": message_count}
+    out: dict[str, Any] = {}
     if initial_message_status:
         # Only present when the initial message was NOT delivered — the
         # factory passes it through to the response so API clients don't
@@ -2944,20 +3230,30 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/{ws_id}/delete — permanently delete a saved workstream."""
     from turnstone.core.audit import record_audit
     from turnstone.core.log import get_logger
-    from turnstone.core.memory import delete_workstream
+    from turnstone.core.storage._registry import get_storage
 
     log = get_logger(__name__)
     ws_id = request.path_params.get("ws_id", "")
     if not ws_id:
         log.warning("ws.delete.failed", reason="empty_ws_id")
         return JSONResponse({"error": "ws_id is required"}, status_code=400)
-    # Cross-tenant delete would destroy another tenant's workstream,
-    # conversations, and attachments in one call.  _require_ws_access
-    # returns 404 on mismatch so existence isn't enumerable.
-    owner_uid, err = _require_ws_access(request, ws_id)
+    storage = getattr(request.app.state, "auth_storage", None) or get_storage()
+    if storage is None:
+        return JSONResponse({"error": "Storage unavailable"}, status_code=503)
+    try:
+        row = storage.ensure_workstream_incarnation_snapshot(ws_id)
+    except Exception:
+        log.warning("ws.delete.snapshot_failed", ws_id=ws_id[:8], exc_info=True)
+        return JSONResponse({"error": "Delete failed"}, status_code=500)
+    if row is None:
+        return JSONResponse({"error": "Workstream not found"}, status_code=404)
+    # Authorize the same immutable row snapshot whose private incarnation
+    # token fences deletion. A cross-node delete/re-register between an ACL
+    # read and the delete can therefore only make the conditional delete fail;
+    # it can never substitute a replacement row with different project ACLs.
+    owner_uid, err = _require_ws_access(request, ws_id, resolved_row=row)
     if err:
         return err
-    storage = getattr(request.app.state, "auth_storage", None)
     kind: str = ""
     parent_ws_id: str | None = None
     name: str = ""
@@ -2975,12 +3271,30 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
         # deliberately NOT in the audit detail — display names can be
         # long / operator-noisy and aren't needed for forensic recall
         # (ws_id + kind + parent are enough).
-        if storage is not None:
-            row = storage.get_workstream(ws_id) or {}
-            kind = row.get("kind", "")
-            parent_ws_id = row.get("parent_ws_id")
-            name = row.get("name", "") or ""
-        if delete_workstream(ws_id):
+        kind = row.get("kind", "")
+        parent_ws_id = row.get("parent_ws_id")
+        name = row.get("name", "") or ""
+        reservation_token = str(row.get("fork_reservation_token") or "")
+        if not reservation_token:
+            raise RuntimeError("workstream incarnation snapshot has no token")
+        delete_exact = functools.partial(
+            storage.delete_workstream_if_fork_reserved,
+            ws_id,
+            reservation_token,
+        )
+        mgr = getattr(request.app.state, "workstreams", None)
+        delete_persisted = concrete_method(mgr, "delete_persisted")
+        if delete_persisted is not None:
+            deleted = await asyncio.to_thread(
+                delete_persisted,
+                ws_id,
+                delete_fn=delete_exact,
+                name=name,
+                expected_reservation_token=reservation_token,
+            )
+        else:
+            deleted = await asyncio.to_thread(delete_exact)
+        if deleted:
             log.info("ws.deleted", ws_id=ws_id[:8])
             # Fire ``ws_closed`` with ``reason='deleted'`` so the
             # cluster collector → coord adapter chain re-emits as
@@ -2991,8 +3305,7 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
             # ever-growing tree on the dashboard.  Best-effort: an
             # emit failure must not roll back the storage delete or
             # 500 the response.
-            mgr = getattr(request.app.state, "workstreams", None)
-            if mgr is not None:
+            if mgr is not None and delete_persisted is None:
                 try:
                     mgr.delete(ws_id, name=name)
                 except Exception:
@@ -3067,6 +3380,7 @@ def _require_ws_access(
     ws_id: str,
     *,
     mgr: SessionManager | None = None,
+    resolved_row: dict[str, Any] | None = None,
 ) -> tuple[str, JSONResponse | None]:
     """Resolve ``ws_id`` to its owner, 404-ing when the row doesn't exist.
 
@@ -3079,7 +3393,13 @@ def _require_ws_access(
     """
     from turnstone.core.web_helpers import resolve_workstream_owner
 
-    return resolve_workstream_owner(request, ws_id, mgr=mgr, not_found_label="Workstream not found")
+    return resolve_workstream_owner(
+        request,
+        ws_id,
+        mgr=mgr,
+        not_found_label="Workstream not found",
+        resolved_row=resolved_row,
+    )
 
 
 async def list_watches(request: Request) -> JSONResponse:
@@ -3181,40 +3501,167 @@ def _resolve_user_scope_id(
     return uid, None
 
 
+def _resolve_workstream_memory_scope_id(
+    request: Request,
+    scope_id: str,
+) -> tuple[str, JSONResponse | None]:
+    """Bind REST workstream-memory access to the authenticated owner."""
+    from turnstone.core.storage._registry import get_storage
+
+    resolved = scope_id.strip()
+    if not resolved:
+        return "", JSONResponse(
+            {"error": "scope_id is required for workstream scope"},
+            status_code=400,
+        )
+    owner = get_storage().get_workstream_owner(resolved)
+    if owner is None:
+        return "", JSONResponse({"error": "Workstream not found"}, status_code=404)
+    caller = _auth_user_id(request)
+    if "service" not in _auth_scopes(request) and (not caller or owner != caller):
+        return "", JSONResponse(
+            {"error": "Cannot access another user's workstream memories"},
+            status_code=403,
+        )
+    return resolved, None
+
+
+def _resolve_rest_memory_scope(
+    request: Request,
+    scope: str,
+    scope_id: str,
+    *,
+    allow_empty: bool,
+) -> tuple[str, str, JSONResponse | None]:
+    """Validate a public memory scope and bind its caller-controlled id."""
+    normalized_scope = scope.strip().lower()
+    normalized_id = scope_id.strip()
+    if not normalized_scope and allow_empty:
+        err = _validate_scope_scope_id(normalized_scope, normalized_id)
+        return normalized_scope, normalized_id, err
+    if normalized_scope not in _VALID_MEMORY_SCOPES:
+        return (
+            "",
+            "",
+            JSONResponse(
+                {
+                    "error": (
+                        f"invalid scope: {normalized_scope}; "
+                        f"must be one of {sorted(_VALID_MEMORY_SCOPES)}"
+                    )
+                },
+                status_code=400,
+            ),
+        )
+    if normalized_scope == "user":
+        normalized_id, err = _resolve_user_scope_id(request, normalized_id)
+        if err:
+            return "", "", err
+    elif normalized_scope == "workstream":
+        normalized_id, err = _resolve_workstream_memory_scope_id(request, normalized_id)
+        if err:
+            return "", "", err
+    err = _validate_scope_scope_id(
+        normalized_scope,
+        normalized_id,
+        require_scope_id=True,
+    )
+    return normalized_scope, normalized_id, err
+
+
+def _rest_visible_memory_scopes(request: Request) -> list[tuple[str, str]]:
+    """Default public read envelope: global plus the caller's user scope."""
+    scopes = [("global", "")]
+    uid = _auth_user_id(request)
+    if uid:
+        scopes.append(("user", uid))
+    return scopes
+
+
+def _audit_rest_memory_mutation(
+    request: Request,
+    action: str,
+    row: dict[str, str],
+) -> None:
+    """Record one authenticated REST/SDK memory mutation."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.storage._registry import get_storage
+
+    uid, ip = _audit_context(request)
+    record_audit(
+        get_storage(),
+        uid,
+        action,
+        "memory",
+        row["memory_id"],
+        {
+            "name": row["name"],
+            "scope": row["scope"],
+            "scope_id": row["scope_id"],
+            "type": row["type"],
+            "surface": "rest",
+        },
+        ip,
+    )
+
+
 async def list_memories(request: Request) -> JSONResponse:
     """GET /v1/api/memories — list memories with optional filters."""
-    from turnstone.core.memory import list_structured_memories
+    from turnstone.core.storage._registry import get_storage
 
-    mem_type = request.query_params.get("type", "")
+    mem_type = request.query_params.get("type", "").strip().lower()
     scope = request.query_params.get("scope", "")
     scope_id = request.query_params.get("scope_id", "")
+    if mem_type and mem_type not in _VALID_MEMORY_TYPES:
+        return JSONResponse({"error": f"invalid type: {mem_type}"}, status_code=400)
     try:
-        limit = min(int(request.query_params.get("limit", "100")), 200)
+        limit = int(request.query_params.get("limit", "100"))
     except (ValueError, TypeError):
         return JSONResponse({"error": "limit must be an integer"}, status_code=400)
-    err = _validate_scope_scope_id(scope, scope_id)
+    if not 1 <= limit <= 200:
+        return JSONResponse({"error": "limit must be between 1 and 200"}, status_code=400)
+    scope, scope_id, err = _resolve_rest_memory_scope(
+        request,
+        scope,
+        scope_id,
+        allow_empty=True,
+    )
     if err:
         return err
-    if scope == "user":
-        scope_id, err = _resolve_user_scope_id(request, scope_id)
-        if err:
-            return err
-    rows = list_structured_memories(mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit)
+    try:
+        storage = get_storage()
+        if scope:
+            rows = storage.list_structured_memories(
+                mem_type=mem_type,
+                scope=scope,
+                scope_id=scope_id,
+                limit=limit,
+            )
+        else:
+            rows = storage.list_visible_structured_memories(
+                _rest_visible_memory_scopes(request),
+                mem_type=mem_type,
+                limit=limit,
+            )
+    except Exception:
+        log.warning("memory.rest_list_failed", exc_info=True)
+        return JSONResponse({"error": "Memory storage unavailable"}, status_code=500)
     return JSONResponse({"memories": rows, "total": len(rows)})
 
 
 async def save_memory(request: Request) -> JSONResponse:
     """POST /v1/api/memories — save (upsert) a structured memory."""
-    from turnstone.core.memory import save_structured_memory
+    from turnstone.core.memory import normalize_memory_name, save_structured_memory_strict
     from turnstone.core.web_helpers import read_json_or_400
 
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
-    name = str(body.get("name", "")).strip()
+    try:
+        name = normalize_memory_name(body.get("name"))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     content = str(body.get("content", "")).strip()
-    if not name or len(name) > 256:
-        return JSONResponse({"error": "name is required (max 256 characters)"}, status_code=400)
     if not content:
         return JSONResponse({"error": "content is required"}, status_code=400)
     if len(content) > _MAX_MEMORY_CONTENT:
@@ -3222,12 +3669,17 @@ async def save_memory(request: Request) -> JSONResponse:
             {"error": f"content exceeds {_MAX_MEMORY_CONTENT} character limit"},
             status_code=400,
         )
-    # None (field omitted) means "leave unset": the upsert keeps the stored
-    # value on update and defaults on insert; an explicit value overwrites.
-    raw_desc = body.get("description")
-    description = None if raw_desc is None else str(raw_desc)
+    from turnstone.core.memory_index import normalize_memory_description
+
+    try:
+        description = normalize_memory_description(body.get("description"))
+    except ValueError as exc:
+        return JSONResponse(
+            {"error": str(exc)},
+            status_code=400,
+        )
     raw_type = body.get("type")
-    mem_type = None if raw_type is None else str(raw_type)
+    mem_type = None if raw_type is None else str(raw_type).strip().lower()
     scope = str(body.get("scope", "global"))
     scope_id = str(body.get("scope_id", ""))
     if mem_type is not None and mem_type not in _VALID_MEMORY_TYPES:
@@ -3235,24 +3687,31 @@ async def save_memory(request: Request) -> JSONResponse:
             {"error": f"invalid type: {mem_type}; must be one of {sorted(_VALID_MEMORY_TYPES)}"},
             status_code=400,
         )
-    if scope not in _VALID_MEMORY_SCOPES:
-        return JSONResponse(
-            {"error": f"invalid scope: {scope}; must be one of {sorted(_VALID_MEMORY_SCOPES)}"},
-            status_code=400,
-        )
-    if scope == "user":
-        scope_id, err = _resolve_user_scope_id(request, scope_id)
-        if err:
-            return err
-    err = _validate_scope_scope_id(scope, scope_id, require_scope_id=True)
+    scope, scope_id, err = _resolve_rest_memory_scope(
+        request,
+        scope,
+        scope_id,
+        allow_empty=False,
+    )
     if err:
         return err
-    # The upsert RETURNINGs the full saved row, so no follow-up read is needed.
-    row, was_update = save_structured_memory(
-        name, content, description=description, mem_type=mem_type, scope=scope, scope_id=scope_id
-    )
-    if not row:
+    try:
+        row, was_update = save_structured_memory_strict(
+            name,
+            content,
+            description=description,
+            mem_type=mem_type,
+            scope=scope,
+            scope_id=scope_id,
+        )
+    except Exception:
+        log.warning("memory.rest_save_failed", name=name, exc_info=True)
         return JSONResponse({"error": "Failed to save memory"}, status_code=500)
+    _audit_rest_memory_mutation(
+        request,
+        "memory.update" if was_update else "memory.save",
+        row,
+    )
     return JSONResponse(row, status_code=200 if was_update else 201)
 
 
@@ -3261,7 +3720,7 @@ async def search_memories(request: Request) -> JSONResponse:
 
     Uses POST for the request body but requires only read scope (non-mutating).
     """
-    from turnstone.core.memory import search_structured_memories as search_fn
+    from turnstone.core.storage._registry import get_storage
     from turnstone.core.web_helpers import read_json_or_400
 
     body = await read_json_or_400(request)
@@ -3270,46 +3729,109 @@ async def search_memories(request: Request) -> JSONResponse:
     query = str(body.get("query", "")).strip()
     if not query:
         return JSONResponse({"error": "query is required"}, status_code=400)
-    mem_type = str(body.get("type", ""))
+    mem_type = str(body.get("type", "")).strip().lower()
     scope = str(body.get("scope", ""))
     scope_id = str(body.get("scope_id", ""))
     try:
-        limit = min(int(body.get("limit", 20)), 50)
+        limit = int(body.get("limit", 20))
     except (ValueError, TypeError):
         return JSONResponse({"error": "limit must be an integer"}, status_code=400)
-    err = _validate_scope_scope_id(scope, scope_id)
+    if mem_type and mem_type not in _VALID_MEMORY_TYPES:
+        return JSONResponse({"error": f"invalid type: {mem_type}"}, status_code=400)
+    if not 1 <= limit <= 50:
+        return JSONResponse({"error": "limit must be between 1 and 50"}, status_code=400)
+    scope, scope_id, err = _resolve_rest_memory_scope(
+        request,
+        scope,
+        scope_id,
+        allow_empty=True,
+    )
     if err:
         return err
-    if scope == "user":
-        scope_id, err = _resolve_user_scope_id(request, scope_id)
-        if err:
-            return err
-    rows = search_fn(query, mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit)
+    try:
+        storage = get_storage()
+        if scope:
+            rows = storage.search_structured_memories(
+                query,
+                mem_type=mem_type,
+                scope=scope,
+                scope_id=scope_id,
+                limit=limit,
+            )
+        else:
+            rows = storage.search_visible_structured_memories(
+                query,
+                _rest_visible_memory_scopes(request),
+                mem_type=mem_type,
+                limit=limit,
+            )
+    except Exception:
+        log.warning("memory.rest_search_failed", exc_info=True)
+        return JSONResponse({"error": "Memory storage unavailable"}, status_code=500)
     return JSONResponse({"memories": rows, "total": len(rows)})
+
+
+async def get_memory_endpoint(request: Request) -> JSONResponse:
+    """GET /v1/api/memories/{name} — fetch one full body and record access."""
+    from turnstone.core.memory import (
+        get_and_touch_structured_memory_by_name_strict,
+        normalize_memory_name,
+    )
+
+    try:
+        name = normalize_memory_name(request.path_params["name"])
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    scope = request.query_params.get("scope", "global")
+    scope_id = request.query_params.get("scope_id", "")
+    scope, scope_id, err = _resolve_rest_memory_scope(
+        request,
+        scope,
+        scope_id,
+        allow_empty=False,
+    )
+    if err:
+        return err
+    try:
+        memory = get_and_touch_structured_memory_by_name_strict(name, scope, scope_id)
+    except Exception:
+        log.warning("memory.rest_get_failed", name=name, exc_info=True)
+        return JSONResponse({"error": "Memory storage unavailable"}, status_code=500)
+    if memory is None:
+        return JSONResponse({"error": f"Memory '{name}' not found"}, status_code=404)
+    return JSONResponse(memory)
 
 
 async def delete_memory_endpoint(request: Request) -> JSONResponse:
     """DELETE /v1/api/memories/{name} — delete a memory by name and scope."""
-    from turnstone.core.memory import delete_structured_memory, normalize_key
+    from turnstone.core.memory import (
+        delete_structured_memory_returning_strict,
+        normalize_memory_name,
+    )
 
-    name = normalize_key(request.path_params["name"])
+    try:
+        name = normalize_memory_name(request.path_params["name"])
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     scope = request.query_params.get("scope", "global")
-    if scope not in _VALID_MEMORY_SCOPES:
-        return JSONResponse(
-            {"error": f"invalid scope: {scope}; must be one of {sorted(_VALID_MEMORY_SCOPES)}"},
-            status_code=400,
-        )
     scope_id = request.query_params.get("scope_id", "")
-    if scope == "user":
-        scope_id, err = _resolve_user_scope_id(request, scope_id)
-        if err:
-            return err
-    err = _validate_scope_scope_id(scope, scope_id, require_scope_id=True)
+    scope, scope_id, err = _resolve_rest_memory_scope(
+        request,
+        scope,
+        scope_id,
+        allow_empty=False,
+    )
     if err:
         return err
-    if delete_structured_memory(name, scope, scope_id):
-        return JSONResponse({"status": "ok", "name": name})
-    return JSONResponse({"error": f"Memory '{name}' not found"}, status_code=404)
+    try:
+        deleted = delete_structured_memory_returning_strict(name, scope, scope_id)
+    except Exception:
+        log.warning("memory.rest_delete_failed", name=name, exc_info=True)
+        return JSONResponse({"error": "Failed to delete memory"}, status_code=500)
+    if deleted is None:
+        return JSONResponse({"error": f"Memory '{name}' not found"}, status_code=404)
+    _audit_rest_memory_mutation(request, "memory.delete", deleted)
+    return JSONResponse({"status": "ok", "name": name})
 
 
 # ---------------------------------------------------------------------------
@@ -3318,8 +3840,8 @@ async def delete_memory_endpoint(request: Request) -> JSONResponse:
 #
 # User-facing CRUD over projects.  Every handler gates first on the RBAC
 # capability (``project.{create,read,write,delete}`` — admin-default) and then,
-# for a specific project, on the per-project ACL via
-# ``auth.user_can_access_project`` (or ownership for destructive / membership
+# for a specific project, on the lifecycle-independent per-project ACL via
+# ``auth.user_can_manage_project`` (or ownership for destructive / membership
 # ops).  Registered by both the standalone server and the console — projects
 # are global / shared-DB, so the handlers are node-agnostic.
 
@@ -3410,7 +3932,7 @@ async def create_project(request: Request) -> JSONResponse:
 
 async def get_project_endpoint(request: Request) -> JSONResponse:
     """GET /v1/api/projects/{project_id} — one project the caller can read."""
-    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.auth import require_permission, user_can_manage_project
     from turnstone.core.storage import get_storage
 
     err = require_permission(request, "project.read")
@@ -3424,7 +3946,7 @@ async def get_project_endpoint(request: Request) -> JSONResponse:
     row = storage.get_project(project_id) if storage else None
     if row is None:
         return JSONResponse({"error": "project not found"}, status_code=404)
-    if not user_can_access_project(uid, project_id, write=False, storage=storage):
+    if not user_can_manage_project(uid, project_id, write=False, storage=storage):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     return JSONResponse(_project_view(row))
 
@@ -3438,7 +3960,7 @@ async def project_resources_endpoint(request: Request) -> JSONResponse:
     Same access gate as ``get_project_endpoint``: ``project.read`` plus the
     per-project ACL.
     """
-    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.auth import require_permission, user_can_manage_project
     from turnstone.core.storage import get_storage
 
     err = require_permission(request, "project.read")
@@ -3452,7 +3974,7 @@ async def project_resources_endpoint(request: Request) -> JSONResponse:
     row = storage.get_project(project_id) if storage else None
     if row is None:
         return JSONResponse({"error": "project not found"}, status_code=404)
-    if not user_can_access_project(uid, project_id, write=False, storage=storage):
+    if not user_can_manage_project(uid, project_id, write=False, storage=storage):
         return JSONResponse({"error": "forbidden"}, status_code=403)
 
     def _collect() -> dict[str, Any]:
@@ -3472,7 +3994,7 @@ async def project_resources_endpoint(request: Request) -> JSONResponse:
 
 async def update_project_endpoint(request: Request) -> JSONResponse:
     """PATCH /v1/api/projects/{project_id} — rename / re-visibility / archive."""
-    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.auth import require_permission, user_can_manage_project
     from turnstone.core.storage import get_storage
     from turnstone.core.web_helpers import read_json_or_400
 
@@ -3487,7 +4009,7 @@ async def update_project_endpoint(request: Request) -> JSONResponse:
     row = storage.get_project(project_id) if storage else None
     if storage is None or row is None:
         return JSONResponse({"error": "project not found"}, status_code=404)
-    if not user_can_access_project(uid, project_id, write=True, storage=storage):
+    if not user_can_manage_project(uid, project_id, write=True, storage=storage):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
@@ -3547,7 +4069,7 @@ async def delete_project_endpoint(request: Request) -> JSONResponse:
 
 async def list_project_members_endpoint(request: Request) -> JSONResponse:
     """GET /v1/api/projects/{project_id}/members — member user_ids."""
-    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.auth import require_permission, user_can_manage_project
     from turnstone.core.storage import get_storage
 
     err = require_permission(request, "project.read")
@@ -3560,7 +4082,7 @@ async def list_project_members_endpoint(request: Request) -> JSONResponse:
     storage = get_storage()
     if storage is None or storage.get_project(project_id) is None:
         return JSONResponse({"error": "project not found"}, status_code=404)
-    if not user_can_access_project(uid, project_id, write=False, storage=storage):
+    if not user_can_manage_project(uid, project_id, write=False, storage=storage):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     return JSONResponse({"members": storage.list_project_members(project_id)})
 
@@ -4147,6 +4669,7 @@ def internal_model_reload(request: Request) -> JSONResponse:
     from turnstone.core.model_registry import (
         DynamicAuthKeyError,
         ModelAuthConfigError,
+        ModelConcurrencyConfigError,
         load_model_registry,
     )
     from turnstone.core.storage._registry import get_storage
@@ -4166,10 +4689,10 @@ def internal_model_reload(request: Request) -> JSONResponse:
             provider=cli_args["provider"],
             storage=storage,
         )
-    except ModelAuthConfigError as exc:
-        # A row whose auth fields violate _normalize_auth_mode, reachable via
-        # direct SQL, a migration mishap, or console version skew (console
-        # writes are validated). The loader deliberately propagates it; this
+    except (ModelAuthConfigError, ModelConcurrencyConfigError) as exc:
+        # A row whose auth or concurrency fields violate registry validation,
+        # reachable via direct SQL, a migration mishap, or console version skew
+        # (console writes are validated). The loader deliberately propagates it; this
         # arm keeps the node from answering a bare 500 where the console's
         # refresh path catches the same row. Same structured 422 contract as
         # the bad-arguments arm below: the reason names the row and field.
@@ -4193,8 +4716,12 @@ def internal_model_reload(request: Request) -> JSONResponse:
 
     # No-op fast path: skip reload when nothing changed (avoids client churn
     # on broadcast model-reloads where this node has no pending changes).
+    admission_unchanged = {
+        alias: cfg.max_concurrency for alias, cfg in new_registry.models.items()
+    } == {alias: cfg.max_concurrency for alias, cfg in registry.models.items()}
     unchanged = (
         new_registry.models == registry.models
+        and admission_unchanged
         and new_registry.fallback == registry.fallback
         and new_registry.agent_model == registry.agent_model
         and eff_default == registry.default
@@ -4287,6 +4814,7 @@ def internal_model_status(request: Request) -> JSONResponse:
             "provider": cfg.provider,
             "source": cfg.source,
             "context_window": cfg.context_window,
+            "max_concurrency": cfg.max_concurrency,
             "enabled": True,
             "temperature": cfg.temperature,
             "max_tokens": cfg.max_tokens,
@@ -4546,7 +5074,7 @@ def _idle_cleanup_thread(
     rate_limiter: Any = None,
     stop: threading.Event | None = None,
 ) -> None:
-    """Periodically close IDLE workstreams and clean up rate limiter buckets.
+    """Run persistence repair plus lifecycle and rate-limit maintenance.
 
     ``mgr.close_idle`` fires the adapter's ``emit_closed`` for each
     victim, which pushes ``ws_closed`` onto ``global_queue`` with
@@ -4554,17 +5082,58 @@ def _idle_cleanup_thread(
     is gone — the frontend didn't differentiate "idle" from "closed"
     anyway and the duplicate event caused spurious UI flicker.
 
-    ``stop`` (#885): lifespan shutdown signal, same ``wait``-as-sleep
-    pattern as :func:`_aggregate_emitter_thread`.
+    Transient accepted-row persistence retries use a short one-second tick.
+    Ordinary idle eviction retains its timeout/4 cadence, and hidden
+    ``state='creating'`` rows retain their independent five-minute sweep and
+    conservative two-hour grace. Thus ``timeout_sec == 0`` disables only idle
+    eviction, not either recovery path. ``stop`` (#885) is the lifespan
+    shutdown signal, using the same ``wait``-as-sleep pattern as
+    :func:`_aggregate_emitter_thread`.
     """
     del global_queue  # adapter handles the emission
     if stop is None:
         stop = threading.Event()
-    check_every = min(300.0, timeout_sec / 4)  # check at 1/4 of timeout, max 5 min
+    idle_enabled = timeout_sec > 0
+    lifecycle_check_every = (
+        min(STALE_CREATE_SWEEP_INTERVAL_SECONDS, timeout_sec / 4)
+        if idle_enabled
+        else float(STALE_CREATE_SWEEP_INTERVAL_SECONDS)
+    )
+    check_every = min(PERSISTENCE_RECONCILE_INTERVAL_SECONDS, lifecycle_check_every)
+    try:
+        mgr.reconcile_unresolved_persistence()
+    except Exception:
+        log.debug("server.persistence_reconcile_initial_failed", exc_info=True)
+    try:
+        mgr.reap_stale_creating_reservations(STALE_CREATE_GRACE_SECONDS)
+    except Exception:
+        log.debug("server.stale_create_cleanup_initial_failed", exc_info=True)
+    last_create_sweep_at = time.monotonic()
+    last_lifecycle_sweep_at = last_create_sweep_at
     while not stop.wait(check_every):
-        mgr.close_idle(timeout_sec)
-        if rate_limiter is not None:
-            rate_limiter.cleanup()
+        try:
+            mgr.reconcile_unresolved_persistence()
+        except Exception:
+            log.debug("server.persistence_reconcile_failed", exc_info=True)
+        now = time.monotonic()
+        if now - last_lifecycle_sweep_at >= lifecycle_check_every:
+            last_lifecycle_sweep_at = now
+            if idle_enabled:
+                try:
+                    mgr.close_idle(timeout_sec)
+                except Exception:
+                    log.debug("server.idle_cleanup_failed", exc_info=True)
+            if now - last_create_sweep_at >= STALE_CREATE_SWEEP_INTERVAL_SECONDS:
+                # Keep rare hidden-create GC on its own fixed cadence. A short
+                # idle timeout must not turn the cluster-liveness scan into part
+                # of the ordinary high-frequency persistence sweep.
+                last_create_sweep_at = now
+                try:
+                    mgr.reap_stale_creating_reservations(STALE_CREATE_GRACE_SECONDS)
+                except Exception:
+                    log.debug("server.stale_create_cleanup_failed", exc_info=True)
+            if rate_limiter is not None:
+                rate_limiter.cleanup()
 
 
 # Shutdown sentinel for ``_global_fanout_thread`` (#885): the lifespan
@@ -4653,21 +5222,20 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         daemon=True,
     )
     agg_emitter.start()
-    # Start idle cleanup thread if configured
-    cleanup: threading.Thread | None = None
-    if app.state.idle_timeout > 0:
-        cleanup = threading.Thread(
-            target=_idle_cleanup_thread,
-            args=(
-                app.state.workstreams,
-                app.state.idle_timeout * 60,
-                app.state.global_queue,
-                app.state.rate_limiter,
-            ),
-            kwargs={"stop": daemon_stop},
-            daemon=True,
-        )
-        cleanup.start()
+    # Always run lifecycle maintenance: timeout=0 disables idle eviction but
+    # must not disable recovery of crash-abandoned hidden create reservations.
+    cleanup = threading.Thread(
+        target=_idle_cleanup_thread,
+        args=(
+            app.state.workstreams,
+            app.state.idle_timeout * 60,
+            app.state.global_queue,
+            app.state.rate_limiter,
+        ),
+        kwargs={"stop": daemon_stop},
+        daemon=True,
+    )
+    cleanup.start()
     # Start watch runner (periodic command polling)
     if app.state.watch_runner:
         app.state.watch_runner.start()
@@ -5049,6 +5617,8 @@ def create_app(
         create_gate_require_project=True,
         create_validate_request=_interactive_create_validate_request,
         create_build_kwargs=_interactive_create_build_kwargs,
+        create_pre_commit=_interactive_create_pre_commit,
+        create_prepare_install=_interactive_create_prepare_install,
         create_post_install=_interactive_create_post_install,
         # Bulk display-name resolution for the active list — one
         # ``SELECT ... WHERE ws_id IN (...)`` for the whole snapshot
@@ -5098,7 +5668,6 @@ def create_app(
     )
     retry_handler = make_retry_handler(
         interactive_endpoint_config,
-        dispatch_retry=_interactive_dispatch_retry,
         audit_emit=_audit_retry_workstream,
         accepted_permissions=("conversation.modify",),
     )
@@ -5182,6 +5751,7 @@ def create_app(
                     Route("/api/memories", list_memories),
                     Route("/api/memories", save_memory, methods=["POST"]),
                     Route("/api/memories/search", search_memories, methods=["POST"]),
+                    Route("/api/memories/{name}", get_memory_endpoint, methods=["GET"]),
                     Route("/api/memories/{name}", delete_memory_endpoint, methods=["DELETE"]),
                     Route("/api/projects", list_projects),
                     Route("/api/projects", create_project, methods=["POST"]),
@@ -5278,8 +5848,16 @@ def create_app(
             Route("/metrics", metrics_endpoint),
             Route("/openapi.json", _openapi_handler),
             Route("/docs", _docs_handler),
-            Mount("/static", app=StaticFiles(directory=str(_STATIC_DIR)), name="static"),
-            Mount("/shared", app=StaticFiles(directory=str(_SHARED_DIR)), name="shared"),
+            Mount(
+                "/static",
+                app=RevalidatingStaticFiles(directory=str(_STATIC_DIR)),
+                name="static",
+            ),
+            Mount(
+                "/shared",
+                app=RevalidatingStaticFiles(directory=str(_SHARED_DIR)),
+                name="shared",
+            ),
         ],
         middleware=_build_middleware(cors_origins),
         lifespan=_lifespan,
@@ -5621,10 +6199,9 @@ def main() -> None:
         trusted_proxies=config_store.get("ratelimit.trusted_proxies"),
     )
 
-    # Config builders — shared between startup logging and session factory.
-    # Re-read from ConfigStore each call so hot-reload works.
+    # Judge config is shared between startup logging and session construction.
+    # Re-read from ConfigStore for each new session so hot-reload works.
     from turnstone.core.judge import JudgeConfig
-    from turnstone.core.memory_relevance import MemoryConfig
 
     def _build_judge_config() -> JudgeConfig:
         return JudgeConfig(
@@ -5634,6 +6211,7 @@ def main() -> None:
             confidence_threshold=config_store.get("judge.confidence_threshold"),
             max_context_ratio=config_store.get("judge.max_context_ratio"),
             timeout=config_store.get("judge.timeout"),
+            parallel_evaluations=config_store.get("judge.parallel_evaluations", 1),
             read_only_tools=config_store.get("judge.read_only_tools"),
             output_guard=config_store.get("judge.output_guard"),
             output_guard_budget_seconds=config_store.get("judge.output_guard_budget_seconds"),
@@ -5641,15 +6219,6 @@ def main() -> None:
             output_guard_model=config_store.get("judge.output_guard_model"),
             output_guard_llm_timeout=config_store.get("judge.output_guard_llm_timeout"),
             redact_secrets=config_store.get("judge.redact_secrets"),
-        )
-
-    def _build_memory_config() -> MemoryConfig:
-        return MemoryConfig(
-            relevance_k=config_store.get("memory.relevance_k"),
-            fetch_limit=config_store.get("memory.fetch_limit"),
-            max_content=config_store.get("memory.max_content"),
-            nudge_cooldown=config_store.get("memory.nudge_cooldown"),
-            nudges=config_store.get("memory.nudges"),
         )
 
     judge_config = _build_judge_config()
@@ -5684,6 +6253,7 @@ def main() -> None:
         parent_ws_id: str | None = None,
         project_id: str = "",
         persona_snapshot: PersonaSnapshot | None = None,
+        fork_reservation_token: str = "",
     ) -> ChatSession:
         assert ui is not None
         # Resolve the effective alias once and use it consistently
@@ -5696,9 +6266,21 @@ def main() -> None:
         # loud; the manager filters those out via its model_validator
         # before the alias reaches this factory.
         model_alias = model_alias or _effective_default_alias()
-        # The generation comes back from resolve()'s own lock hold, exactly
-        # paired with the client it vouches for; hand it to the constructor.
-        r_client, r_model, r_cfg, registry_generation = registry.resolve(model_alias)
+        # Resolve every stable model facet under one registry lock hold.  Passing
+        # the same immutable binding through to ChatSession prevents a reload in
+        # the construction window from pairing an old client/config with a new
+        # provider.
+        model_binding = resolve_model_binding(
+            registry,
+            model_alias,
+            config_store=config_store,
+        )
+        r_client = model_binding.lane.client
+        r_model = model_binding.lane.model
+        r_cfg = model_binding.config
+        if r_cfg is None:
+            raise RuntimeError(f"model binding for alias {model_alias!r} has no config")
+        registry_generation = model_binding.registry_generation
         # Read MCP client from shared ref — may have been replaced after startup
         # by internal_mcp_reload (Sync to Nodes) when no --mcp-config was passed.
         live_mcp_client = _mcp_ref[0]
@@ -5719,7 +6301,6 @@ def main() -> None:
                 log.debug("Failed to resolve username for uid %s", uid, exc_info=True)
 
         # Re-resolve from ConfigStore so new workstreams pick up hot-reloaded settings.
-        live_memory_config = _build_memory_config()
         live_judge_config = _build_judge_config()
         if live_judge_config and judge_model:
             import dataclasses
@@ -5772,6 +6353,7 @@ def main() -> None:
             registry=registry,
             model_alias=model_alias,
             registry_generation=registry_generation,
+            model_binding=model_binding,
             health_registry=health_registry,
             node_id=_node_id,
             ws_id=ws_id,
@@ -5782,7 +6364,6 @@ def main() -> None:
             skill=skill or args.skill or None,
             judge_config=live_judge_config,
             user_id=uid,
-            memory_config=live_memory_config,
             config_store=config_store,
             client_type=ClientType(client_type)
             if client_type in {ct.value for ct in ClientType}
@@ -5792,6 +6373,7 @@ def main() -> None:
             parent_ws_id=parent_ws_id,
             project_id=project_id,
             persona_snapshot=persona_snapshot,
+            fork_reservation_token=fork_reservation_token,
         )
 
     # Create WatchRunner (periodic command polling, server-level)
@@ -6133,6 +6715,19 @@ def main() -> None:
                 bind_host=args.host,
                 extra_sans=os.environ.get("TURNSTONE_TLS_SANS", ""),
             )
+            from turnstone.core.auth import (
+                JWT_AUD_CONSOLE,
+                TLS_ACME_TOKEN_SOURCE,
+                ServiceTokenManager,
+            )
+
+            enrollment_tokens = ServiceTokenManager(
+                user_id=_node_id,
+                scopes=frozenset({"service"}),
+                source=TLS_ACME_TOKEN_SOURCE,
+                secret=jwt_secret,
+                audience=JWT_AUD_CONSOLE,
+            )
             tls_client = TLSClient(
                 storage=get_storage(),
                 hostnames=hostnames,
@@ -6141,6 +6736,11 @@ def main() -> None:
                 # explicit override pointing at the published ACME endpoint.
                 # Empty (the in-cluster default) falls back to service discovery.
                 console_url=os.environ.get("TURNSTONE_CONSOLE_URL", ""),
+                # In-cluster clients fetch the directory from ``console`` but a
+                # cross-host responder advertises its LAN/proxy URL. Trust that
+                # second credential destination only when operators configured it.
+                acme_external_url=os.environ.get("TURNSTONE_ACME_EXTERNAL_URL", ""),
+                enrollment_token_provider=lambda: enrollment_tokens.token,
             )
             asyncio.run(tls_client.init(attempts=TLS_INIT_RETRY_ATTEMPTS))
             bundle = tls_client.bundle
@@ -6175,21 +6775,16 @@ def main() -> None:
                     """
                     from turnstone.core.tls import refresh_runtime_pems, swap_context_cert
 
-                    try:
-                        new_paths = refresh_runtime_pems(
-                            new_bundle,
-                            ca_pem=tls_client.ca_pem,
-                            previous=pem_dir_state["dir"],
-                        )
-                        pem_dir_state["dir"] = new_paths.cert.parent
-                    except Exception:
-                        log.warning("TLS runtime PEM refresh failed", exc_info=True)
-
                     cfg = getattr(app.state, "uvicorn_config", None)
                     live_ctx = getattr(cfg, "ssl", None) if cfg is not None else None
-                    if live_ctx is None:
-                        return  # listener not started yet — boot cert still valid
-                    swap_context_cert(live_ctx, new_bundle, ca_pem=tls_client.ca_pem)
+                    if live_ctx is not None:
+                        swap_context_cert(live_ctx, new_bundle, ca_pem=tls_client.ca_pem)
+                    new_paths = refresh_runtime_pems(
+                        new_bundle,
+                        ca_pem=tls_client.ca_pem,
+                        previous=pem_dir_state["dir"],
+                    )
+                    pem_dir_state["dir"] = new_paths.cert.parent
                     log.info("TLS cert reloaded into listener: %s", new_bundle.domain)
 
                 tls_client.set_cert_reload_hook(_reload_server_cert)

@@ -12,7 +12,7 @@ Field set and rationale: ``docs/design/canonical-trajectory-ideal-target.md`` §
 NOTE: non-text content rides as ``AttachmentRef`` — a reference to a content-addressed
 blob in ``workstream_attachments``.  ``Turn``s never carry bytes, and the dict bridge
 carries only the ``{type: kind, attachment_id}`` placeholder.  Each output boundary (the
-provider translator, the ``/history`` display, export) materializes the placeholder to an
+model-dispatch path, the ``/history`` display, export) materializes the placeholder to an
 inline part by point-lookup against the blob store, via :func:`resolve_attachment_parts`.
 """
 
@@ -68,9 +68,9 @@ class TextBlock:
 class AttachmentRef:
     """A reference to attachment bytes held in the content-addressed blob store.
 
-    Non-text content is carried *by reference* (never inline bytes): the translator
-    resolves ``attachment_id`` to bytes and expands it to the provider's native
-    format at wire time.  ``kind`` is the by-reference placeholder type —
+    Non-text content is carried *by reference* (never inline bytes): the model-dispatch
+    path resolves ``attachment_id`` to bytes and expands it to the provider-neutral
+    inline wire part before provider admission.  ``kind`` is the placeholder type —
     ``"image"``, ``"document"`` (text docs), ``"pdf"``, or ``"audio"``.  The
     dict-bridge keys off ``attachment_id`` and is kind-agnostic, so new kinds
     need no change here.
@@ -81,6 +81,70 @@ class AttachmentRef:
 
 
 ContentBlock = TextBlock | AttachmentRef
+
+
+PROVENANCE_META_KEY = "provenance"
+
+
+@dataclass(frozen=True, slots=True)
+class TurnProvenance:
+    """Immutable identity of the model attempt that produced a turn.
+
+    The four fields are request facts, captured from one resolved serving lane
+    and the caller's already-pinned principal.  They deliberately exclude the
+    endpoint URL and credential: both can contain secrets, while neither is
+    needed to distinguish a registry binding for audit or accounting.
+
+    The serialized form rides ``TurnMeta.extra[PROVENANCE_META_KEY]``.  Empty
+    strings and generation zero are explicit "not registry/auth scoped"
+    values for direct CLI, eval, and test lanes; they are not omitted so every
+    accepted model turn has one stable four-axis shape.
+    """
+
+    model_alias: str = ""
+    backend_model_id: str = ""
+    registry_generation: int = 0
+    acting_principal_id: str = ""
+
+    def to_meta(self) -> dict[str, str | int]:
+        """Return the JSON-safe well-known metadata object."""
+        return {
+            "model_alias": self.model_alias,
+            "backend_model_id": self.backend_model_id,
+            "registry_generation": self.registry_generation,
+            "acting_principal_id": self.acting_principal_id,
+        }
+
+    @classmethod
+    def from_meta(cls, raw: Any) -> TurnProvenance | None:
+        """Decode a stored provenance object, rejecting torn/corrupt shapes.
+
+        A partially trustworthy identity is worse than no identity: consumers
+        could join it to the wrong registry generation or principal.  Require
+        every axis with its exact scalar type and tolerate future sibling keys
+        by projecting only the four fields owned here.
+        """
+        if not isinstance(raw, dict):
+            return None
+        model_alias = raw.get("model_alias")
+        backend_model_id = raw.get("backend_model_id")
+        registry_generation = raw.get("registry_generation")
+        acting_principal_id = raw.get("acting_principal_id")
+        if (
+            not isinstance(model_alias, str)
+            or not isinstance(backend_model_id, str)
+            or not isinstance(registry_generation, int)
+            or isinstance(registry_generation, bool)
+            or registry_generation < 0
+            or not isinstance(acting_principal_id, str)
+        ):
+            return None
+        return cls(
+            model_alias=model_alias,
+            backend_model_id=backend_model_id,
+            registry_generation=registry_generation,
+            acting_principal_id=acting_principal_id,
+        )
 
 
 @dataclass(slots=True)
@@ -99,8 +163,10 @@ class ProviderNative:
     """The one opaque provider-native lane (reasoning, server-tool results, …).
 
     Replayed verbatim to the producing provider and dropped (rebuilt from the neutral
-    fields) for any other.  ``blocks`` are opaque on the wire path and never inspected
-    there; the UI display projection is the only reader that looks inside.
+    fields) for any other.  Signed, encrypted, and structured blocks are opaque on the
+    wire path.  Trust-boundary lowering may copy and defang editable top-level
+    ``type=text`` blocks so a native replay cannot resurrect forged session markers;
+    the UI display projection also reads selected blocks.
     """
 
     producer: str
@@ -111,14 +177,25 @@ class ProviderNative:
 class TurnMeta:
     """Sidecar metadata: never reaches the wire, never read by the lowering layer.
 
-    ``event_id`` is the per-ws SSE ``Last-Event-ID`` resume cursor; ``extra`` holds
-    open metadata under well-known keys — ``"source_meta"`` (an operator-context
+    ``event_id`` is the per-ws SSE ``Last-Event-ID`` resume cursor;
+    ``commit_key`` is the storage idempotency identity used only to reconcile a
+    live-to-durable history handoff. ``extra`` holds open metadata under
+    well-known keys — ``"source_meta"`` (an operator-context
     ``system`` turn's structured per-kind fields, e.g. ``watch_triggered``'s
     ``watch_name`` / ``command`` / poll counters; persisted in the
     ``conversations.meta`` column, surfaced to the FE for per-kind rendering) and
-    ``"attachments_meta"`` (display metadata for by-reference attachments)."""
+    ``"attachments_meta"`` (display metadata for by-reference attachments) and
+    ``"provenance"`` (the immutable model alias / backend id / registry
+    generation / acting-principal tuple captured by the successful attempt).
+    Storage-backed canonical loads also carry ``"storage_attachment_ids"`` (the
+    raw ordered row ref-list used only to make fork retention fail-closed) and,
+    on TOOL turns, ``"acting_principal"`` (the principal whose turn executed
+    the effect, for revocation and audit).  Both are persistence-only side
+    channels: dict/wire projection deliberately ignores them, so no public
+    payload can carry the audit identity."""
 
     event_id: int | None = None
+    commit_key: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -275,6 +352,19 @@ def _content_to_raw(content: tuple[ContentBlock, ...]) -> str | list[dict[str, A
     return parts
 
 
+def sanitize_client_send_ids(value: object) -> list[str]:
+    """Normalize an untrusted ``client_send_ids`` payload to its stable form.
+
+    The single filter for the correlation-id list every boundary reads
+    (turn reconstruction, /history projection, canonical storage reload) —
+    a hardening change lands here once, so the same stored row can never
+    project different correlation sets per path.
+    """
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item]
+
+
 def turn_from_dict(msg: dict[str, Any]) -> Turn:
     """Read an OpenAI-like message dict (with ``_``-side channels) as a ``Turn``."""
     role_str = msg.get("role", "")
@@ -296,7 +386,11 @@ def turn_from_dict(msg: dict[str, Any]) -> Turn:
     if pc is not None:
         native = ProviderNative(producer=msg.get("_producer", ""), blocks=tuple(pc))
 
-    meta = TurnMeta(event_id=msg.get("_event_id"))
+    raw_commit_key = msg.get("_commit_key")
+    meta = TurnMeta(
+        event_id=msg.get("_event_id"),
+        commit_key=raw_commit_key if isinstance(raw_commit_key, str) and raw_commit_key else None,
+    )
     am = msg.get("_attachments_meta")
     if am is not None:
         meta.extra["attachments_meta"] = am
@@ -323,6 +417,12 @@ def turn_from_dict(msg: dict[str, Any]) -> Turn:
     sndr = msg.get("_sender")
     if sndr:
         meta.extra["sender"] = sndr
+    stable_client_send_ids = sanitize_client_send_ids(msg.get("_client_send_ids"))
+    if stable_client_send_ids:
+        meta.extra["client_send_ids"] = stable_client_send_ids
+    provenance = TurnProvenance.from_meta(msg.get("_provenance"))
+    if provenance is not None:
+        meta.extra[PROVENANCE_META_KEY] = provenance.to_meta()
 
     return Turn(
         role=role,
@@ -360,6 +460,8 @@ def turn_to_dict(turn: Turn) -> dict[str, Any]:
             msg["_producer"] = turn.native.producer
     if turn.meta.event_id is not None:
         msg["_event_id"] = turn.meta.event_id
+    if turn.meta.commit_key is not None:
+        msg["_commit_key"] = turn.meta.commit_key
     am = turn.meta.extra.get("attachments_meta")
     if am is not None:
         msg["_attachments_meta"] = am
@@ -375,6 +477,12 @@ def turn_to_dict(turn: Turn) -> dict[str, Any]:
     sndr = turn.meta.extra.get("sender")
     if sndr:
         msg["_sender"] = sndr
+    client_send_ids = turn.meta.extra.get("client_send_ids")
+    if isinstance(client_send_ids, list) and client_send_ids:
+        msg["_client_send_ids"] = list(client_send_ids)
+    provenance = TurnProvenance.from_meta(turn.meta.extra.get(PROVENANCE_META_KEY))
+    if provenance is not None:
+        msg["_provenance"] = provenance.to_meta()
     return msg
 
 
@@ -432,10 +540,10 @@ def resolve_attachment_parts(
     ``{type: kind, attachment_id}`` placeholders in a message's list content;
     *parts_by_id* maps an id to its inline content part — or a *list* of parts
     (one placeholder may expand to several, e.g. a PDF rasterized to one image
-    per page for a vision model) — built from the content-addressed blob.  This is the materialization the
-    translator — and reconstruct, for display — runs at its output boundary: a
-    placeholder whose blob is missing (pruned) is dropped, so a consumer never
-    sees an unresolved reference.  Identity-preserving when no message carries a
+    per page for a vision model) — built from the content-addressed blob. This
+    shared substitution runs at each output boundary (model dispatch or display):
+    a placeholder whose blob is missing (pruned) is dropped, so a consumer never
+    sees an unresolved reference. Identity-preserving when no message carries a
     placeholder; never mutates the input.
     """
 
@@ -475,9 +583,9 @@ def materialize_attachments(
 ) -> list[dict[str, Any]]:
     """Expand by-reference attachment placeholders to inline parts at the wire.
 
-    The translator's entry point for the by-reference content lane: collect the
-    placeholder ids across *messages*, ask *resolve* (a storage point-lookup the
-    session hands down) for their inline content parts, and substitute via
+    The shared wire-boundary entry point for the by-reference content lane:
+    collect the placeholder ids across *messages*, ask *resolve* (a storage
+    point-lookup the session hands down) for their inline content parts, and substitute via
     :func:`resolve_attachment_parts`.  A ``None`` resolver (no storage — e.g. a
     unit test or an in-memory sub-agent whose media is already inline) or a
     placeholder-free trajectory is a no-op, so the common path is allocation-free.

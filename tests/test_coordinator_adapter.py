@@ -8,12 +8,17 @@ tests in test_session_manager.py cover the lifecycle path.
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from turnstone.console.coordinator_adapter import CoordinatorAdapter
+from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+from turnstone.core.session_manager import SessionManager
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
 
 
@@ -158,7 +163,112 @@ def test_emit_state_calls_collector_state() -> None:
         activity="",
         activity_state="",
         content="",
+        persistence_state="healthy",
     )
+
+
+@pytest.mark.parametrize("takeover", ["successor", "close"])
+def test_deferred_stale_state_does_not_consume_coordinator_content(
+    takeover: str,
+) -> None:
+    """Only a still-current state tail may drain the rich content payload."""
+    write_started = threading.Event()
+    release_write = threading.Event()
+    first_idle = True
+    write_lock = threading.Lock()
+    storage = MagicMock()
+    storage.get_workstream.return_value = None
+
+    def update_state(_ws_id: str, state: str) -> None:
+        nonlocal first_idle
+        should_block = False
+        with write_lock:
+            if state == WorkstreamState.IDLE.value and first_idle:
+                first_idle = False
+                should_block = True
+        if should_block:
+            write_started.set()
+            if not release_write.wait(2):
+                raise RuntimeError("test predecessor state write was not released")
+
+    storage.update_workstream_state.side_effect = update_state
+    ui = ConsoleCoordinatorUI(ws_id="coord-content")
+    adapter, collector = _make_adapter(ui_factory=lambda _ws: ui)
+    manager = SessionManager(
+        adapter,
+        storage=storage,
+        max_active=1,
+        event_emitter=adapter,
+    )
+    adapter.attach(manager)
+    ws = manager.create(user_id="u1", ws_id="coord-content")
+    collector.emit_console_ws_state.reset_mock()
+
+    content = "payload belongs to the current state transition"
+    with ui._ws_lock:
+        ui._ws_turn_content = [content]
+        ui._ws_turn_content_size = len(content)
+
+    predecessor_tail: list[Any] = []
+    assert manager.set_state_deferred(
+        ws.id,
+        WorkstreamState.IDLE,
+        deferred_persistence=predecessor_tail,
+    )
+    assert len(predecessor_tail) == 1
+    errors: list[BaseException] = []
+
+    def run_predecessor_tail() -> None:
+        try:
+            predecessor_tail[0]()
+        except BaseException as exc:
+            errors.append(exc)
+
+    predecessor = threading.Thread(target=run_predecessor_tail)
+    predecessor.start()
+    successor_tail: list[Any] = []
+    try:
+        assert write_started.wait(2)
+        if takeover == "successor":
+            assert manager.set_state_deferred(
+                ws.id,
+                WorkstreamState.IDLE,
+                deferred_persistence=successor_tail,
+            )
+            assert len(successor_tail) == 1
+        else:
+            assert manager.close(ws.id) is True
+
+        # Admission/close invalidated the predecessor, but neither path has
+        # consumed the terminal-state payload while its DB write is blocked.
+        with ui._ws_lock:
+            assert ui._ws_turn_content == [content]
+        collector.emit_console_ws_state.assert_not_called()
+        release_write.set()
+    finally:
+        release_write.set()
+        predecessor.join(2)
+
+    assert not predecessor.is_alive()
+    assert errors == []
+    collector.emit_console_ws_state.assert_not_called()
+    with ui._ws_lock:
+        assert ui._ws_turn_content == [content]
+
+    if takeover == "successor":
+        successor_tail[0]()
+        collector.emit_console_ws_state.assert_called_once_with(
+            ws.id,
+            WorkstreamState.IDLE.value,
+            tokens=0,
+            context_ratio=0.0,
+            activity="",
+            activity_state="",
+            content=content,
+            persistence_state="healthy",
+        )
+        with ui._ws_lock:
+            assert ui._ws_turn_content == []
 
 
 def test_emit_closed_calls_collector_closed() -> None:
@@ -365,6 +475,22 @@ class _SendSession:
         self.closed = True
 
 
+class _ForeignQueueSession(_SendSession):
+    """Session whose queue already holds another participant's input.
+
+    Concrete method, not a mock attribute: the adapter's spawn gate only
+    honours a real hook (see ``concrete_method``).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.probed_principals: list[str] = []
+
+    def has_foreign_queued_messages(self, principal_id: str) -> bool:
+        self.probed_principals.append(principal_id)
+        return True
+
+
 class _StubManager:
     """Minimal SessionManager stub exposing ``get`` for adapter.send."""
 
@@ -457,6 +583,49 @@ class TestCoordinatorAdapterWorkerDispatch:
         assert ws.worker_thread is not None
         ws.worker_thread.join(timeout=2.0)
         assert ws._worker_running is False
+        assert session.send_calls == ["hello"]
+
+    def test_cross_user_queued_input_refusal_names_its_reason(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The refusal reaches the caller as a bare ``False``.
+
+        ``send`` has no per-refusal return channel (the interactive route's
+        409 ``cross_user_interjection`` has one), so the log is the ONLY place
+        this refusal is distinguishable from a full queue or an unloaded
+        workstream.  Pin the reason token, not just the return value.
+        """
+        adapter, _ = _make_adapter()
+        ws = _make_ws()
+        session = _ForeignQueueSession()
+        ws.session = session  # type: ignore[assignment]
+        adapter.attach(_StubManager(ws))  # type: ignore[arg-type]
+
+        with caplog.at_level(logging.WARNING, logger="turnstone.console.coordinator_adapter"):
+            assert adapter.send(ws.id, "hello", acting_user_id="user-b") is False
+        assert session.probed_principals == ["user-b"]
+        assert session.send_calls == []
+        assert session.queue_calls == []
+        assert ws.worker_thread is None
+        assert any(
+            "coord_adapter.send_refused_cross_user_queued_input" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_unauthenticated_dispatch_skips_the_cross_user_probe(self) -> None:
+        """Internal dispatch carries no principal, so there is nobody to
+        classify against — the probe must not run at all (a blanket refusal
+        would strand the create-time initial message)."""
+        adapter, _ = _make_adapter()
+        ws = _make_ws()
+        session = _ForeignQueueSession()
+        ws.session = session  # type: ignore[assignment]
+        adapter.attach(_StubManager(ws))  # type: ignore[arg-type]
+
+        assert adapter.send(ws.id, "hello") is True
+        assert session.probed_principals == []
+        if ws.worker_thread is not None:
+            ws.worker_thread.join(timeout=2.0)
         assert session.send_calls == ["hello"]
 
 

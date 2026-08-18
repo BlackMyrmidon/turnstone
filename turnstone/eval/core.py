@@ -32,7 +32,7 @@ from typing import Any
 
 from openai import OpenAI
 
-from turnstone.core.model_turn import cap_tool_calls, model_turn, resolve_lane
+from turnstone.core.model_turn import cap_tool_calls, model_turn, require_lane_capabilities
 from turnstone.core.providers import LLMProvider, create_client, create_provider
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage, init_storage, reset_storage
@@ -232,7 +232,7 @@ class HeadlessSession(ChatSession):
     - auto_approve is always True
     - Tool calls are recorded into a structured log
     - All stdout output is suppressed
-    - send_headless() uses non-streaming API
+    - send_headless() drains the production streaming provider path
     """
 
     def __init__(
@@ -307,8 +307,8 @@ class HeadlessSession(ChatSession):
     ) -> list[dict[str, Any]]:
         """Run a complete conversation turn headlessly.
 
-        Uses non-streaming API calls. Captures all tool calls into
-        self.tool_call_log.
+        Drains production streaming provider calls into single-shot results.
+        Captures all tool calls into ``self.tool_call_log``.
 
         Returns the tool call log: list of dicts with keys:
             tool: str, args: dict, result: str (truncated), ok: bool,
@@ -334,17 +334,15 @@ class HeadlessSession(ChatSession):
         """
         self.tool_call_log = []
 
-        # The eval lane — resolved once per run, like the sub-agent seam.
-        # ``temperature`` relays the harness's operator-resolved knob per
-        # call below (house rule: relay, never pin).
-        lane = resolve_lane(
-            self._provider,
-            self.client,
-            self.model,
-            alias=self._model_alias or "",
-            registry=self._registry,
-            capabilities=self._get_capabilities(),
-        )
+        # Pin one immutable semantic primary-lane snapshot for the whole eval
+        # run, like the sub-agent seam.  A concurrent session rebind must not
+        # splice a different provider/model/config into one measured tool loop;
+        # retirement of the old registry client may abort the run instead.  The
+        # same lane's capabilities drive every full-history wire fold below.
+        # ``temperature`` relays the harness's operator-resolved knob per call
+        # (house rule: relay, never pin).
+        lane = self._primary_lane()
+        lane_caps = require_lane_capabilities(lane)
 
         for turn in range(max_turns):
             if self._cancelled.is_set():
@@ -367,7 +365,9 @@ class HeadlessSession(ChatSession):
             # ("System message must be at the beginning") by another,
             # and either way the nudge eval was measuring the wrong
             # stimulus.
-            turns = turns_from_dicts(self._prepare_wire_messages(self._full_messages()))
+            turns = turns_from_dicts(
+                self._prepare_wire_messages(self._full_messages(), caps=lane_caps)
+            )
 
             if self._cancelled.is_set():
                 break
@@ -533,9 +533,9 @@ def run_with_lifecycle(
       past the teardown (which closes only the last one built).
     * *drive* (returned by ``build_session``) — submitted to a
       one-worker executor and bounded by ``future.result(test_timeout)``.
-      The per-request httpx timeout cannot bound a STREAM: a trickling
-      response resets the read timeout indefinitely, so without the
-      wall clock a hung generation occupies a run slot forever.  On
+      The per-request HTTP transport timeout cannot bound a STREAM: a
+      trickling response resets the read timeout indefinitely, so without
+      the wall clock a hung generation occupies a run slot forever.  On
       timeout the session is DROPPED, not closed: the shutdown did not
       wait, so the worker is still inside the drive, and ``close()``'s
       bounded shell-join would trade a bounded leak for a blocked
@@ -736,8 +736,8 @@ def _run_single_test(
             )
 
     def _build_client() -> Any:
-        # Per-attempt client with request-level timeout so httpx aborts
-        # the HTTP request itself — no zombie connections on the server.
+        # Per-attempt client with a per-read timeout. The executor wall clock
+        # above separately bounds a trickling stream that keeps resetting it.
         return OpenAI(
             base_url=client.base_url,
             api_key=client.api_key,

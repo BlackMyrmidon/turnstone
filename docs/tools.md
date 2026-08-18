@@ -1,9 +1,10 @@
 # Tools Reference
 
-turnstone exposes 17 built-in tools plus any number of external MCP tools to the
-LLM via the OpenAI function-calling interface. Built-in tools are defined as JSON
-files under `turnstone/tools/` and loaded at startup by `turnstone/core/tools.py`.
-MCP tools are discovered from configured MCP servers at startup by
+Turnstone exposes a role-specific built-in tool surface plus any configured MCP
+tools through provider-native or OpenAI-compatible function calling. Built-in
+schemas live under `turnstone/tools/` and are loaded by
+`turnstone/core/tools.py`; metadata selects the interactive, coordinator, and
+task-agent subsets. MCP tools are discovered from configured servers by
 `turnstone/core/mcp_client.py`.
 
 ---
@@ -50,10 +51,10 @@ set lives in `_META_KEYS` in `turnstone/core/tools.py`):
 
 | Name                | Description |
 |---------------------|-------------|
-| `TOOLS`             | All 29 loaded built-in tool definitions (interactive + coordinator union). Sessions send a kind-specific subset (`INTERACTIVE_TOOLS` or `COORDINATOR_TOOLS`). |
+| `TOOLS`             | The complete loaded built-in union. Sessions send a kind-specific subset (`INTERACTIVE_TOOLS` or `COORDINATOR_TOOLS`). |
 | `TASK_AGENT_TOOLS`  | Tools with `task_agent: true` -- available to task sub-agents. Includes write operations. |
 | `TASK_AUTO_TOOLS`   | Set of all tool names with `auto_approve: true` -- used by task-agent sub-sessions to skip confirmation for matching available tools. |
-| `BUILTIN_TOOL_NAMES`| Frozenset of all 29 built-in tool names (interactive + coordinator union). Used by tool search to distinguish always-on tools from deferrable MCP tools. |
+| `BUILTIN_TOOL_NAMES`| Frozenset of the built-in union. Used by tool search to distinguish built-ins from deferrable MCP tools. |
 | `PRIMARY_KEY_MAP`   | Dict mapping tool name to its `primary_key` parameter name. |
 
 ---
@@ -62,7 +63,10 @@ set lives in `_META_KEYS` in `turnstone/core/tools.py`):
 
 > See also: [Tool Pipeline diagram](diagrams/png/05-tool-pipeline.png)
 
-Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools()`:
+Tool handling spans a four-phase pipeline. `ChatSession._execute_tools()` owns
+prepare, approval, and execution (phases 1–3); after it returns, the owning
+conversation loop guards the observed results and folds them into the
+trajectory (phase 4).
 
 ### Phase 1: Prepare
 
@@ -71,9 +75,8 @@ Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools
 - Parses the JSON arguments (with fallback for malformed JSON).
 - If JSON parsing fails entirely, uses `PRIMARY_KEY_MAP` to map a bare string
   to the correct parameter.
-- Dispatches to the matching `_prepare_{func_name}()` handler. There are 17
-  built-in tools plus `tool_search` (synthetic, client-side BM25 fallback) and
-  the generic `_prepare_mcp_tool()` handler for MCP tools.
+- Dispatches to the matching `_prepare_{func_name}()` handler, the synthetic
+  `tool_search` fallback, or the generic `_prepare_mcp_tool()` handler.
 - Validates arguments and builds a preview dict containing:
   - `call_id`, `func_name`, `header`, `preview` (for display)
   - `needs_approval` (bool)
@@ -82,7 +85,10 @@ Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools
 
 ### Phase 2: Approve
 
-All prepared items are sent to the UI via `ui.approve_tools(items)`.
+Prepared items are sent to the UI via `ui.approve_tools(items)`. Several
+parallel task agents may leave independent `ApprovalCycle` objects pending on
+one workstream; each round owns a `cycle_id`, event, result, and verdict set.
+Remote clients resolve the exact round by `cycle_id` (or a member `call_id`).
 
 - The UI displays each tool's header and preview to the user.
 - Items where `needs_approval` is `False` (auto-approved tools) are shown
@@ -94,6 +100,10 @@ All prepared items are sent to the UI via `ui.approve_tools(items)`.
   prompt). This is per-tool, not blanket.
 - If `auto_approve` is `True` on the session (via `--skip-permissions` or workstream
   template), all tools are approved automatically.
+- When Smart Approvals are enabled, one immutable judge/settings snapshot is
+  stamped onto the whole batch. The batch auto-approves only when every gated
+  item has a qualifying verdict; partial or mixed qualification fails closed to
+  the human prompt. Stop is linearized against that terminal decision.
 
 ### Phase 3: Execute
 
@@ -113,6 +123,28 @@ Each item's `execute` callable is invoked:
   denials are tracked separately. This removes the need for text-prefix heuristics.
   Other tools deliver results atomically via
   `ui.on_tool_result(call_id, name, output, is_error=...)` only.
+
+Stop propagates to child model scopes, judges, tracked subprocess groups, and
+the approval cycles owned by the cancelled operation. Calls that definitely
+never started receive `EffectStatus.none`; an interrupted call whose external
+outcome was not observed receives `unknown`, `partial`, or `rolled_back` as
+appropriate. These typed receipts preserve effect truth across storage/replay
+without exposing unreviewed model output as a tool result.
+
+### Phase 4: Guard and atomic fold
+
+After `_execute_tools()` returns, the main `send()` loop compacts/truncates
+completed results to the remaining shared budget and then runs the heuristic
+and optional LLM output guard. The task-agent loop deliberately guards the
+observed raw output before applying its size cap, so truncation cannot hide a
+sensitive result from that check.
+
+After guard work, the owning loop rechecks generation ownership. On the main
+conversation path, one generation-fenced commit appends the complete
+tool-result block, advisories, feedback, and queued user turns; its durable
+records run in FIFO order outside the lifecycle lock. A force-cancelled
+predecessor can therefore finish external cleanup, but cannot fold late results
+into its successor's trajectory.
 ---
 
 ## Tool Approval Flow
@@ -120,7 +152,7 @@ Each item's `execute` callable is invoked:
 **Auto-approved** (no user confirmation needed at runtime):
 - `read_file` -- reads files, no side effects
 - `search` -- grep-style search, no side effects
-- `memory` -- structured persistent memory (save/search/delete/list)
+- `memory` -- structured persistent memory (save/get/search/delete/list)
 - `recall` -- searches conversation history
 - `notify` -- sends notifications to linked channels (time-sensitive, auto-approved for urgency)
 
@@ -295,7 +327,7 @@ Fetch a URL and extract specific information from it.
 | `url`      | string | yes      | The URL to fetch (must start with `http://` or `https://`). |
 | `question` | string | yes      | What to extract or answer from the page content. |
 
-- **What it does**: Fetches the URL, strips HTML to plain text, and uses the LLM to extract the answer to the question from the page content. Every redirect hop is SSRF-screened before it is requested. Private/internal addresses are refused by default; enable `tools.allow_private_network` (console Settings → Tools) to make them approvable for self-hosted setups whose services live on the local network — the approval prompt marks such requests, and a public site redirecting into private space is refused regardless.
+- **What it does**: Fetches the URL, strips HTML to plain text, and uses the LLM to extract the answer to the question from the page content. Every redirect hop is SSRF-screened before it is requested. Private/internal addresses are refused by default; enable `tools.allow_private_network` (console Settings → Tools) to make them approvable for self-hosted setups whose services live on the local network — the approval prompt marks such requests, and a public site redirecting into private space is refused regardless. Cloud metadata endpoints and link-local, multicast and reserved addresses are refused even with the opt-in enabled, including as a redirect target from a private address you approved. An address is judged by what it actually reaches, so an IPv6 transition address (NAT64, 6to4, Teredo) wrapping an internal IPv4 is treated exactly as that IPv4 would be.
 - **Auto-approve**: No -- requires user confirmation (makes network requests).
 - **Agent availability**: `task_agent`.
 
@@ -328,7 +360,17 @@ Search the web using a text query.
 
 The `rerank_web_search` toggle defaults on once a reranker is selected. If the endpoint is unreachable or errors, web_search falls back silently to the backend's native result order — reranking never makes a search fail.
 
-When `rerank_bm25` is enabled, the candidate text for memory, tool, and skill retrieval (memory name/description/content and tool/skill names + descriptions) is also sent to the rerank endpoint — a self-hosted endpoint (vLLM/TEI/llama.cpp) keeps it on your infrastructure, a hosted provider (Cohere/Jina/Voyage) sends it off-box.
+The selected alias's `max_concurrency` limit applies to reranking. Turnstone
+keeps one process-owned HTTP connection pool for the active endpoint, shares it
+across sessions, and rotates it when relevant model or Reranker-role settings
+change. Three consecutive endpoint failures open a 30-second circuit so later
+retrievals preserve native order immediately instead of repeatedly waiting for
+the network timeout; one probe is allowed after cooldown. Queued work observes
+generation cancellation. A synchronous HTTP request already dispatched cannot
+be interrupted safely, but its per-call timeout still bounds eventual drain
+and fallback latency.
+
+When `rerank_bm25` is enabled, Turnstone also sends the current query and BM25 candidate metadata to the rerank endpoint. Live memory-pointer candidates contain only the memory name and authored description—never the body. Tool and skill candidates contain their names and descriptive metadata. A self-hosted endpoint (vLLM/TEI/llama.cpp) keeps this on your infrastructure; a hosted provider (Cohere/Jina/Voyage) sends it off-box.
 
 **Serving a Qwen3-Reranker with vLLM.** The model is instruction-aware, so vLLM **must** apply its chat template — pass `--chat-template` explicitly. Without it the bare query produces near-random scores and reranking actively *hurts* retrieval (verified: an irrelevant passage outscored the correct one):
 
@@ -344,7 +386,7 @@ Then add a reranker model in the **Models** tab with `base_url` `http://vllm:800
 
 For an endpoint that does *not* apply the model's template, set `rerank_instruction` instead — Turnstone then wraps each query as `<Instruct>: {instruction}` / `<Query>: {query}` (Qwen3's own default is `Given a web search query, retrieve relevant passages that answer the query`). Use the chat template **or** the instruction, not both (they double-wrap).
 
-**Picking `rerank_bm25_threshold`.** The relevance floor that gates proactive memory injection is a probability in `[0, 1]`, but the right value differs per model (a sharp 0.6B reranker may want ~0.95; a broader 4B ~0.33). Calibrate it against your endpoint:
+**Picking `rerank_bm25_threshold`.** The relevance floor that filters live memory pointers is a probability in `[0, 1]`, but the right value differs per model (a sharp 0.6B reranker may want ~0.95; a broader 4B ~0.33). Calibrate it against your endpoint:
 
 ```bash
 turnstone-admin rerank-calibrate           # probe the endpoint, recommend a floor
@@ -401,7 +443,12 @@ Delegate a general-purpose task to an autonomous sub-agent.
 |-----------|--------|----------|-------------|
 | `prompt`  | string | yes      | Complete task description for the sub-agent. |
 
-- **What it does**: Spawns a sub-agent that inherits the `TASK_AGENT_TOOLS` set (read, write, edit, search, bash, web tools, memory tools). The sub-agent runs autonomously to completion. Use for work that requires file modifications or command execution.
+- **What it does**: Spawns a sub-agent that inherits the production
+  `TASK_AGENT_TOOLS` set (read, write, edit, search, bash, and web tools). The
+  sub-agent runs autonomously to completion. A selected persona can narrow
+  that final lane but cannot add memory: task agents are memory-disabled in
+  1.8 regardless of the child persona's memory flag. Use for work that requires
+  file modifications or command execution.
 - **Auto-approve**: No -- requires user confirmation.
 - **Agent availability**: Top-level only.
 
@@ -415,18 +462,38 @@ Structured persistent memory across sessions with typed, scoped entries.
 
 | Parameter     | Type    | Required | Description |
 |---------------|---------|----------|-------------|
-| `action`      | string  | yes      | `save`, `search`, `delete`, or `list`. |
-| `name`        | string  | save/delete | Short snake_case identifier for the memory. |
+| `action`      | string  | yes      | `save`, `get`, `search`, `delete`, or `list`. |
+| `name`        | string  | save/get/delete | Short snake_case identifier for the memory. |
 | `content`     | string  | save     | Memory content to store. |
-| `description` | string  | no       | Short description for relevance matching (recommended for `save`). |
-| `type`        | string  | no       | Memory type: `user`, `project`, `feedback`, or `reference`. Default: `project`. |
-| `scope`       | string  | no       | Memory scope: `global`, `workstream`, or `user`. Default: `global`. |
+| `description` | string  | save     | Authored one-line index hook (1-512 characters); required on every create or update. |
+| `type`        | string  | no       | Memory type: `user`, `general`, `feedback`, or `reference`. Default: `general`. |
+| `scope`       | string  | no       | Memory scope: `global`, `workstream`, `user`, `coordinator`, or `project`. See defaults below. |
 | `query`       | string  | search   | Search query for finding memories. |
 | `limit`       | integer | no       | Max results for `search` or `list`. Default: 20. |
 
-- **What it does**: Manages structured persistent memories in the database. Memories persist across sessions, have a type classification (user preferences, project knowledge, feedback, reference material) and a scope (global across all workstreams, private to a workstream, or following a user). Relevant memories are included in the system prompt on startup.
+- **What it does**: Manages structured persistent memories in the database.
+  Memories persist across sessions, have a type classification, and live in a
+  role-specific visible scope. Unscoped `save`/`get`/`delete` resolve to one
+  target. Any stored project attachment pins that target to `project`; a
+  missing or archived project, or revoked access, fails closed without falling
+  back. Authorized read-only access permits `get` but makes `save`/`delete`
+  fail. Authorized reactivation restores eligibility. Only a workstream with
+  no stored project attachment defaults to `global` (interactive) or
+  `coordinator`. A valid explicit scope selects exactly that scope. Unscoped
+  `search`/`list` cover all visible scopes; use the displayed scope when
+  following a result with `get` or `delete`. The initial system prefix contains
+  an immutable, complete, body-free metadata index for the acting principal.
+  It records an explicit project ID only when the attached project is active
+  and readable at first admission. Later user turns may add live body-free
+  `(scope, name)` pointers. Setting `memory.nudges=false` suppresses those live
+  pointers and memory-directed nudges, but not the immutable index or the
+  memory tool. `get` is the sole full-body read and the sole action that updates
+  access counters.
+  The model-facing over-budget notice is opt-in, defaults off, and can appear
+  only on a successful memory-tool save; REST/SDK saves are unchanged and
+  console health remains unconditional.
 - **Auto-approve**: Yes.
-- **Agent availability**: Not available to sub-agents (top-level only).
+- **Agent availability**: Not available to task agents.
 
 ---
 
@@ -441,7 +508,7 @@ Search conversation history for past messages and tool results.
 
 - **What it does**: Searches conversation history across sessions using FTS5 full-text search. Returns matching messages, tool calls, and tool results with timestamps and workstream context.
 - **Auto-approve**: Yes.
-- **Agent availability**: Not available to sub-agents (top-level only).
+- **Agent availability**: Not available to task agents.
 
 ---
 
@@ -577,7 +644,11 @@ pre-configure skills at workstream creation.
 
 ---
 
-## Summary Table
+## Interactive Tool Summary
+
+This table describes the ordinary interactive surface. Coordinator sessions
+receive their delegation/lifecycle tools instead, and task agents receive the
+metadata-selected `TASK_AGENT_TOOLS` subset.
 
 | Tool         | Category   | Auto-approve | task_agent | primary_key |
 |--------------|------------|--------------|------------|-------------|
@@ -698,7 +769,7 @@ MCP-compatible service.
 3. **Schema conversion**: Each MCP tool's `inputSchema` is converted to OpenAI
    function-calling format. The tool name is prefixed: `mcp__{server}__{tool}`.
 
-4. **Merging**: MCP tools are appended after the 17 built-in tools via
+4. **Merging**: MCP tools are appended after the role's built-in tools via
    `merge_mcp_tools()`. Built-in tools appear first, giving them natural LLM priority.
    When dynamic tool search is active, MCP tools are deferred rather than directly
    visible -- the model discovers them via search as needed (see
@@ -834,6 +905,13 @@ capabilities for the `resources` capability. For servers that declare it:
 1. `list_resources` fetches static resources (fixed URIs).
 2. `list_resource_templates` fetches URI templates (parameterized patterns like
    `db://tables/{table}/rows/{id}`).
+
+The protocol advertises both lists through one aggregate `resources`
+capability, so a server may implement only one of them. If either request
+returns the JSON-RPC `Method not found` code (`-32601`), turnstone treats that
+half of the catalog as empty and keeps the other half; authentication,
+validation, transport, and all other discovery errors still fail the
+connection or refresh.
 
 Both are stored as `{uri, name, description, mimeType, server}` dicts and
 merged into a unified catalog.

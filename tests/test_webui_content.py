@@ -1,6 +1,8 @@
 """Tests for WebUI content accumulation — server-side single source of truth."""
 
 import queue
+import threading
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -27,6 +29,58 @@ def _drain_global() -> list[dict]:
     while not WebUI._global_queue.empty():
         events.append(WebUI._global_queue.get_nowait())
     return events
+
+
+def test_public_intent_verdict_waits_for_storage_and_records_llm_metric() -> None:
+    """The public UI hook keeps its synchronous persistence contract.
+
+    Splitting live publication from audit I/O for the session's judge callback
+    must not make direct WebUI callers fire-and-forget.  Its LLM metric remains
+    part of live publication and the public call returns only after the UPSERT.
+    """
+    ui = _make_ui()
+    storage = MagicMock()
+    persistence_started = threading.Event()
+    release_persistence = threading.Event()
+    returned = threading.Event()
+
+    def blocked_upsert(**_kwargs) -> None:
+        persistence_started.set()
+        if not release_persistence.wait(5):
+            raise RuntimeError("test verdict persistence was not released")
+
+    storage.upsert_intent_verdict.side_effect = blocked_upsert
+    metrics = MagicMock()
+    verdict = {
+        "verdict_id": "v-web-llm",
+        "call_id": "call-web-llm",
+        "tier": "llm",
+        "risk_level": "high",
+        "latency_ms": 37,
+    }
+
+    def publish() -> None:
+        ui.on_intent_verdict(verdict)
+        returned.set()
+
+    with (
+        patch("turnstone.core.storage._registry.get_storage", return_value=storage),
+        patch("turnstone.server._metrics", metrics),
+    ):
+        thread = threading.Thread(target=publish)
+        thread.start()
+        try:
+            assert persistence_started.wait(2)
+            metrics.record_judge_verdict.assert_called_once_with("llm", "high", 37)
+            assert not returned.is_set()
+            assert thread.is_alive()
+        finally:
+            release_persistence.set()
+            thread.join(2)
+
+    assert not thread.is_alive()
+    assert returned.is_set()
+    storage.upsert_intent_verdict.assert_called_once()
 
 
 class TestContentAccumulation:
@@ -72,6 +126,50 @@ class TestContentAccumulation:
         assert "content" not in error_events[0]
         assert ui._ws_turn_content == []
         assert ui._ws_turn_content_size == 0
+
+    def test_persistence_refresh_is_operator_only_and_non_consuming(self):
+        ui = _make_ui()
+        ui._ws_turn_content = ["preserve me"]
+        ui._ws_turn_content_size = len("preserve me")
+        session = MagicMock()
+        session.conversation_persistence_status = lambda: {"state": "conflict"}
+        ui.bind_session(session)
+        ws = MagicMock()
+        ws.state.value = "error"
+        # The registry row deliberately disagrees: the persistence field
+        # must come from the BOUND session (an id-reuse replacement row
+        # reporting healthy must not launder the badge).
+        ws.session.conversation_persistence_status = lambda: {"state": "healthy"}
+        mgr = MagicMock()
+        mgr.get.return_value = ws
+        WebUI._workstream_mgr = mgr
+        try:
+            ui.on_persistence_state_changed()
+        finally:
+            WebUI._workstream_mgr = None
+
+        event = _drain_global()[0]
+        assert event["type"] == "ws_state"
+        assert event["state"] == "error"
+        assert event["persistence_state"] == "conflict"
+        assert "content" not in event
+        assert ui._ws_turn_content == ["preserve me"]
+        assert ui._ws_turn_content_size == len("preserve me")
+
+    def test_persistence_state_derives_from_bound_session_not_registry(self):
+        """The badge keeps telling the truth while the row is out of the
+        map: failed-delete tombstone retention and retirement pop the
+        registry entry exactly when the journal needs the operator, and
+        the old by-id lookup laundered that window into "healthy"."""
+        ui = _make_ui()
+        session = MagicMock()
+        session.conversation_persistence_status = lambda: {"state": "conflict"}
+        ui.bind_session(session)
+        # No manager wired at all — the registry cannot be consulted.
+        assert WebUI._workstream_mgr is None
+        assert ui._current_persistence_state() == "conflict"
+        # Unbound (or collected) still fails closed to healthy.
+        assert _make_ui()._current_persistence_state() == "healthy"
 
     def test_thinking_broadcast_does_not_touch_accumulator(self):
         """_broadcast_state('thinking') should not affect the accumulator."""

@@ -32,6 +32,8 @@ call the factory during startup and pass the result as
 from __future__ import annotations
 
 import asyncio
+import functools
+import re
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
@@ -40,11 +42,15 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from turnstone.core.log import get_logger
-from turnstone.core.session_ui_base import AutoApproveReason
+from turnstone.core.session_manager import CloseOutcome, WorkstreamAlreadyExistsError
+from turnstone.core.session_replay import session_replay_preamble
+from turnstone.core.session_ui_base import CrossPrincipalApprovalError
 from turnstone.core.workstream import (
     INTERJECTION_CAP_CHARS,
     PENDING_SENDS_MAX,
     _PendingSend,
+    concrete_method,
+    workstream_persistence_state,
 )
 
 if TYPE_CHECKING:
@@ -73,6 +79,7 @@ log = get_logger(__name__)
 # error verbatim.  Length cap + control-char strip keep the message
 # actionable for legit alias typos while neutralising hostile payloads.
 _FACTORY_MISCONFIG_MAX_LEN = 200
+_CLIENT_SEND_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
 
 def _safe_factory_misconfig_message(exc: BaseException) -> str:
@@ -166,15 +173,11 @@ class EventsReplay(Protocol):
     live event loop starts. Each yielded dict gets JSON-serialised
     and sent as a single ``data:`` line to the client.
 
-    Interactive yields four things on connect: ``connected`` (model +
-    skip_permissions), ``status`` (token usage + context %, only when
-    ``session._last_usage`` exists), ``history`` (replayed conversation),
-    and ``pending_approval`` + cached intent verdicts. Coord yields
-    just one: ``pending_approval`` (the rest aren't needed because
-    coord's dashboard fetches history via a separate ``/history``
-    endpoint and doesn't render the per-tab status bar). Kinds that
-    don't need any pre-replay wire ``None`` and the live loop starts
-    immediately.
+    The shared handler pre-resolves viewer-specific project metadata onto the
+    request before calling this stable three-argument callback. Production
+    callbacks emit ``connected`` plus optional ``status``, then pending controls
+    and cached verdicts. Conversation history stays on the separate REST
+    endpoint. Kinds without replay wire ``None``.
     """
 
     def __call__(self, ws: Workstream, ui: Any, request: Request) -> Iterable[dict[str, Any]]:
@@ -218,6 +221,46 @@ CreateKwargsBuilder = Callable[
     ["Request", dict[str, Any], str, dict[str, Any] | None, str, int],
     dict[str, Any],
 ]
+# (request, ws, body, uid) -> extra response fields. Optional
+# kind-specific transaction gate fired after attachment validation but
+# before ``mgr.commit_create`` / audit / lifecycle publication. Interactive
+# uses it for the atomic storage fork; coord has no pre-commit work today.
+# Expected failures raise :class:`CreatePreCommitError`, causing the generic
+# handler to discard the unadvertised destination and return the exception's
+# sanitized response.
+CreatePreCommit = Callable[
+    ["Request", "Workstream", dict[str, Any], str],
+    "Awaitable[dict[str, Any]]",
+]
+
+
+class CreatePreCommitError(RuntimeError):
+    """Expected pre-commit refusal that requires destination rollback."""
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.public_message = message
+        self.status_code = status_code
+
+
+# Same shape as ``CreatePostInstall``, but runs after the transaction gate and
+# before lifecycle publication. It performs fallible storage/local setup and
+# prepares only bounded data for ``SessionEventEmitter.emit_created``; no live
+# event, watch registration, or worker dispatch may escape from this phase.
+CreatePrepareInstall = Callable[
+    [
+        "Request",
+        "Workstream",
+        dict[str, Any],
+        str,
+        dict[str, Any] | None,
+        int,
+        list[str],
+    ],
+    "Awaitable[dict[str, Any]]",
+]
+
+
 # (request, ws, body, uid, skill_data, applied_skill_version, attachment_ids) ->
 # extra response fields. Kind-specific tail end the lifted ``create``
 # body fires after the workstream is built, attachments are saved,
@@ -225,9 +268,9 @@ CreateKwargsBuilder = Callable[
 # response (e.g. interactive returns ``{resumed, message_count}``;
 # coord returns ``{}``). May spawn worker threads / register watch
 # runners / persist skill session config / dispatch initial messages
-# / pin routing. The factory does NOT wrap the call in try/except:
-# post-install failures should surface to the caller as 5xx so the
-# operator sees the misconfig instead of a half-built workstream.
+# / pin routing. This runs after commit and therefore must not contain
+# work whose failure should roll the create back; that belongs in
+# :data:`CreatePreCommit`.
 CreatePostInstall = Callable[
     [
         "Request",
@@ -240,6 +283,8 @@ CreatePostInstall = Callable[
     ],
     "Awaitable[dict[str, Any]]",
 ]
+
+
 # (request, ws, body, uid) -> None. Audit emitter for the create
 # event. Interactive emits ``workstream.created`` with
 # ``{kind, parent_ws_id}`` detail; coord emits ``coordinator.create``
@@ -395,14 +440,11 @@ class SessionEndpointConfig:
     # wires ``None`` and lets the cluster collector handle the
     # transition via ``CoordinatorAdapter.emit_rehydrated``.
     open_post_load: OpenPostLoad | None = None
-    # (ws, ui, request) -> Iterable[dict]. Kind-specific initial
-    # SSE replay payload the lifted ``events`` body yields after
-    # registering the per-UI listener queue but before the live
-    # event loop. Interactive replays connected + status + history
-    # + pending_approval (with cached intent verdicts). Coord replays
-    # just pending_approval (its dashboard fetches history via a
-    # separate ``/history`` endpoint and doesn't render the per-tab
-    # status bar). Kinds that don't need pre-replay wire ``None``.
+    # (ws, ui, request) -> Iterable[dict]. Kind-specific initial SSE replay
+    # payload the lifted ``events`` body yields before the live event loop.
+    # The shared handler pins viewer-specific project metadata on ``request``;
+    # production callbacks combine it with connected/status and pending
+    # controls. Conversation history stays on the separate REST bootstrap.
     events_replay: EventsReplay | None = None
     # (request) -> Executor for the SSE live-loop's blocking
     # ``queue.get`` wait. Interactive returns the dedicated
@@ -449,12 +491,22 @@ class SessionEndpointConfig:
     # kind-specific kwarg shape and threads whatever this returns
     # straight through to ``await asyncio.to_thread(mgr.create, **kwargs)``.
     create_build_kwargs: CreateKwargsBuilder | None = None
+    # (request, ws, body, uid) -> extra response fields. Runs after
+    # attachment validation and before the deferred create is committed,
+    # audited, or published. Interactive wires its atomic fork hook here;
+    # ``None`` skips the gate.
+    create_pre_commit: CreatePreCommit | None = None
+    # Fallible kind-specific setup after the atomic pre-commit gate but before
+    # ``commit_create`` publishes lifecycle birth. Interactive applies alias,
+    # skill, routing and prepared bounded event/watch data here. Coord has no
+    # such setup today.
+    create_prepare_install: CreatePrepareInstall | None = None
     # (request, ws, body, uid, skill_data, applied_skill_version,
     # attachment_ids) -> extra response fields. Kind-specific tail
-    # end fired after attachments save + audit. Interactive returns
-    # ``{resumed, message_count}`` and spawns the initial-message
-    # worker thread; coord returns ``{}`` and dispatches via
-    # ``coord_adapter.send`` when an initial_message is provided.
+    # end fired after commit + audit. Interactive performs UI/watch/routing
+    # bookkeeping and spawns the initial-message worker thread; coord
+    # dispatches via ``coord_adapter.send`` when an initial_message is
+    # provided.
     # ``None`` skips the post-install entirely (response is just
     # ``{ws_id, name, ...}`` with empty parity fields).
     create_post_install: CreatePostInstall | None = None
@@ -756,7 +808,7 @@ def make_approve_handler(
     reachable by coord sessions spawning interactive children.
     """
     from turnstone.core.auth import require_any_permission
-    from turnstone.core.web_helpers import read_json_or_400
+    from turnstone.core.web_helpers import auth_user_id, read_json_or_400
 
     async def approve(request: Request) -> Response:
         import asyncio
@@ -781,9 +833,24 @@ def make_approve_handler(
         if isinstance(body, JSONResponse):
             return body
         ws_id = request.path_params.get("ws_id", "")
-        approved = bool(body.get("approved", False))
+        approved = body.get("approved")
+        if not isinstance(approved, bool):
+            return JSONResponse({"error": "approved must be a boolean"}, status_code=400)
         feedback = body.get("feedback")
-        always = bool(body.get("always", False))
+        if feedback is not None and not isinstance(feedback, str):
+            return JSONResponse({"error": "feedback must be a string or null"}, status_code=400)
+        always = body.get("always", False)
+        if not isinstance(always, bool):
+            return JSONResponse({"error": "always must be a boolean"}, status_code=400)
+        body_call_id_raw = body.get("call_id")
+        if body_call_id_raw is not None and not isinstance(body_call_id_raw, str):
+            return JSONResponse({"error": "call_id must be a string or null"}, status_code=400)
+        body_cycle_id_raw = body.get("cycle_id")
+        if body_cycle_id_raw is not None and not isinstance(body_cycle_id_raw, str):
+            return JSONResponse({"error": "cycle_id must be a string or null"}, status_code=400)
+        body_call_id = (body_call_id_raw or "").strip()
+        body_cycle_id = (body_cycle_id_raw or "").strip()
+        resolver_principal_id = auth_user_id(request)
         if cfg.tenant_check is not None:
             err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
             if err_tenant is not None:
@@ -792,12 +859,13 @@ def make_approve_handler(
         if ws is None:
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
         ui = ws.ui
-        if ui is None or not hasattr(ui, "resolve_approval"):
+        resolve_approval = getattr(ui, "resolve_approval", None)
+        find_cycle = getattr(ui, "find_approval_cycle", None)
+        if not callable(resolve_approval) or not callable(find_cycle):
             return JSONResponse(
-                {"error": "session UI does not support approval"},
+                {"error": "session UI does not support principal-aware approval"},
                 status_code=409,
             )
-        auto_approve_tools = getattr(ui, "auto_approve_tools", None)
         # Cycle routing — with parallel task agents a workstream can
         # have SEVERAL approval cycles live at once, each its own
         # prompt.  A decision addresses exactly one:
@@ -809,147 +877,68 @@ def make_approve_handler(
         #     unrelated batch;
         #   - neither (CLI wrappers, old tabs) → the OLDEST live cycle,
         #     matching the order the prompts were issued.
-        body_call_id_raw = body.get("call_id", "")
-        body_call_id = body_call_id_raw.strip() if isinstance(body_call_id_raw, str) else ""
-        body_cycle_id_raw = body.get("cycle_id", "")
-        body_cycle_id = body_cycle_id_raw.strip() if isinstance(body_cycle_id_raw, str) else ""
-        find_cycle = getattr(ui, "find_approval_cycle", None)
         target_card: dict[str, Any] | None = None
         pinned_cycle_id: str | None = None
-        if find_cycle is not None:
-            target_card = find_cycle(cycle_id=body_cycle_id or None, call_id=body_call_id or None)
-            if target_card is None and (body_cycle_id or body_call_id):
-                # Selector given but nothing matched: the round was
-                # resolved/replaced after this client rendered it.
-                # Report the CURRENT oldest cycle (first entry of
-                # ``serialize_pending_approval_details``) so the client
-                # can re-render against what the server thinks is live.
-                current = find_cycle()
-                current_items = (current or {}).get("items") or []
-                primary = next(
-                    (item.get("call_id", "") for item in current_items if item.get("call_id")),
-                    None,
-                )
-                return JSONResponse(
-                    {
-                        "error": ("stale call_id" if body_call_id else "stale cycle_id"),
-                        "current_call_id": primary,
-                        "current_cycle_id": (current or {}).get("cycle_id"),
-                    },
-                    status_code=409,
-                )
-            # Pin the resolution to the exact cycle the lookup returned.
-            # For selector-less bodies the lookup and the resolve would
-            # otherwise EACH independently pick "the oldest" — a cycle
-            # resolving in the gap (gate timeout, peer tab, smart
-            # approval) silently retargets the resolve at the next
-            # cycle while the always-names below were collected from
-            # the previous one, whitelisting a batch the operator never
-            # looked at.
-            pinned_cycle_id = (target_card or {}).get("cycle_id") or None
-        else:
-            # Legacy/stub UI (tests, external SessionUI impls): fall back
-            # to the single-slot view for the always-names read below.
-            target_card = getattr(ui, "_pending_approval", None)
-            if body_call_id:
-                if target_card is None:
-                    return JSONResponse(
-                        {"error": "no pending approval", "current_call_id": None},
-                        status_code=409,
-                    )
-                legacy_ids = {
-                    item.get("call_id", "")
-                    for item in target_card.get("items") or []
-                    if item.get("call_id")
-                }
-                if body_call_id not in legacy_ids:
-                    primary = next(iter(sorted(legacy_ids)), None)
-                    return JSONResponse(
-                        {"error": "stale call_id", "current_call_id": primary},
-                        status_code=409,
-                    )
-        # Resolve FIRST, then whitelist: the "Approve + Always" names
-        # must describe the cycle that actually resolved.  On the cycle
-        # path the resolve is pinned to the lookup's cycle_id, so the
-        # only race left is that cycle resolving in the gap — then
-        # ``resolved_cycle`` comes back ``None`` and the whitelist below
-        # is skipped (approving a card someone else already resolved
-        # must not grow the auto-approve set).  ``always`` still rides
-        # the ``approval_resolved`` SSE event so peer tabs that didn't
-        # click can render the right status pill ("✓ approved · always"
-        # vs plain "✓ approved") without a side-channel broadcast.
+        target_card = find_cycle(cycle_id=body_cycle_id or None, call_id=body_call_id or None)
+        if target_card is None and (body_cycle_id or body_call_id):
+            # Selector given but nothing matched: the round was
+            # resolved/replaced after this client rendered it.
+            # Report the CURRENT oldest cycle (first entry of
+            # ``serialize_pending_approval_details``) so the client
+            # can re-render against what the server thinks is live.
+            current = find_cycle()
+            current_items = (current or {}).get("items") or []
+            primary = next(
+                (item.get("call_id", "") for item in current_items if item.get("call_id")),
+                None,
+            )
+            return JSONResponse(
+                {
+                    "error": ("stale call_id" if body_call_id else "stale cycle_id"),
+                    "current_call_id": primary,
+                    "current_cycle_id": (current or {}).get("cycle_id"),
+                },
+                status_code=409,
+            )
+        # Pin the resolution to the exact cycle the lookup returned.
+        # For selector-less bodies the lookup and the resolve would
+        # otherwise EACH independently pick "the oldest" — a cycle
+        # resolving in the gap (gate timeout, peer tab, smart
+        # approval) could silently retarget the resolve at the next
+        # cycle the operator never looked at.
+        pinned_cycle_id = (target_card or {}).get("cycle_id") or None
+        # Resolve against the pinned cycle. The UI owns principal validation,
+        # per-principal Always grants, durable attribution, and the resolved
+        # SSE event as one cycle transition.
         try:
-            if find_cycle is not None:
-                if pinned_cycle_id is not None:
-                    resolved_cycle = ui.resolve_approval(
-                        approved,
-                        feedback,
-                        always=always,
-                        cycle_id=pinned_cycle_id,
-                    )
-                elif body_call_id or body_cycle_id:
-                    # Lookup matched a card that carries no cycle_id
-                    # (custom registrations outside ``approve_tools``):
-                    # honor the client's own selector.
-                    resolved_cycle = ui.resolve_approval(
-                        approved,
-                        feedback,
-                        always=always,
-                        call_id=body_call_id or None,
-                        cycle_id=body_cycle_id or None,
-                    )
-                else:
-                    # No selector AND nothing pending at lookup time:
-                    # resolve nothing rather than racing a cycle that
-                    # registered in the gap — the client can't have
-                    # been looking at it.
-                    resolved_cycle = None
-            else:
-                resolved_cycle = ui.resolve_approval(
+            if pinned_cycle_id is not None:
+                resolved_cycle = resolve_approval(
+                    approved,
+                    feedback,
+                    always=always,
+                    cycle_id=pinned_cycle_id,
+                    resolver_principal_id=resolver_principal_id,
+                )
+            elif body_call_id or body_cycle_id:
+                # Lookup matched a card that carries no cycle_id
+                # (custom registrations outside ``approve_tools``):
+                # honor the client's own selector.
+                resolved_cycle = resolve_approval(
                     approved,
                     feedback,
                     always=always,
                     call_id=body_call_id or None,
                     cycle_id=body_cycle_id or None,
+                    resolver_principal_id=resolver_principal_id,
                 )
-        except TypeError:
-            # Pre-cycle SessionUI impls (external/custom) without the
-            # selector kwargs.
-            resolved_cycle = ui.resolve_approval(approved, feedback, always=always)
-        if (
-            always
-            and approved
-            and target_card
-            and auto_approve_tools is not None
-            # Cycle-registry UIs: whitelist only when OUR resolve landed
-            # on the pinned cycle (non-None return).  Stub/legacy UIs
-            # (no registry) keep the unconditional legacy behavior —
-            # their resolve's return value carries no cycle contract to
-            # gate on.
-            and (find_cycle is None or resolved_cycle is not None)
-        ):
-            tool_names: set[str] = {
-                it.get("approval_label", "") or it.get("func_name", "")
-                for it in target_card.get("items", [])
-                if it.get("needs_approval") and it.get("func_name") and not it.get("error")
-            }
-            tool_names.discard("")
-            # Budget-override is an interactive-only pseudo-tool that
-            # must never be added to the auto-approve set — discarding
-            # unconditionally is safe (no-op for coord).
-            tool_names.discard("__budget_override__")
-            if tool_names:
-                auto_approve_tools.update(tool_names)
-                # Tag the source so /dashboard pills can distinguish
-                # an explicit "Approve + Always" click from the
-                # skill-template path (which the user may have set
-                # up months ago).  Defensive ``getattr`` because the
-                # source map landed alongside this fix; pre-fix
-                # workstreams would lack it during a hot-deploy.
-                source_map = getattr(ui, "_auto_approve_tools_source", None)
-                if source_map is not None:
-                    for t in tool_names:
-                        source_map[t] = AutoApproveReason.ALWAYS
+            else:
+                # No selector AND nothing pending at lookup time:
+                # resolve nothing rather than racing a cycle that
+                # registered in the gap — the client can't have
+                # been looking at it.
+                resolved_cycle = None
+        except CrossPrincipalApprovalError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
         return JSONResponse({"status": "ok", "cycle_id": resolved_cycle})
 
     return approve
@@ -1053,7 +1042,18 @@ def make_close_handler(
         ws_before = mgr.get(ws_id)
         if ws_before is None:
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
-        if not mgr.close(ws_id):
+        close_outcome = await asyncio.to_thread(mgr.close_with_outcome, ws_id)
+        if close_outcome is CloseOutcome.UNRESOLVED_PERSISTENCE:
+            return JSONResponse(
+                {"error": "workstream has unresolved persistence"},
+                status_code=409,
+            )
+        if close_outcome is CloseOutcome.CLEANUP_PENDING:
+            return JSONResponse(
+                {"error": "workstream cleanup is still in progress; try again shortly"},
+                status_code=503,
+            )
+        if close_outcome is not CloseOutcome.CLOSED:
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
 
         storage = getattr(request.app.state, "auth_storage", None)
@@ -1102,6 +1102,7 @@ def make_refresh_title_handler(cfg: SessionEndpointConfig) -> Handler:
         import asyncio
 
         from turnstone.core.memory import get_workstream_display_name
+        from turnstone.core.web_helpers import auth_user_id
 
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
@@ -1124,7 +1125,10 @@ def make_refresh_title_handler(cfg: SessionEndpointConfig) -> Handler:
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
 
         current_title = await asyncio.to_thread(get_workstream_display_name, ws_id) or ""
-        ws.session.request_title_refresh(current_title)
+        ws.session.request_title_refresh(
+            current_title,
+            principal_id=auth_user_id(request),
+        )
         return JSONResponse({"status": "ok"})
 
     return refresh_title
@@ -1233,7 +1237,7 @@ def make_cancel_handler(
     thread so the UI recovers immediately.
 
     Both kinds share the cancel sequence (``session.cancel`` →
-    ``ui.resolve_approval(False)``).
+    ``ui.resolve_all_approvals(False)``).
     Per-kind divergence captured via the cfg + ``audit_emit``:
 
     - ``cancel_forensics`` (cfg) — when set, the lifted body calls
@@ -1274,15 +1278,14 @@ def make_cancel_handler(
       cancel addresses the workstream, so EVERY live cycle (parallel
       task agents can park several gates at once) wakes with its own
       denied result.  The sweep is a no-op when nothing is pending
-      (no stale ``approval_resolved`` broadcast on idle cancels);
-      legacy/stub UIs without it fall back to the old single-slot
-      ``resolve_approval`` gated on ``_pending_approval``.
+      (no stale ``approval_resolved`` broadcast on idle cancels).
     """
 
     async def cancel(request: Request) -> Response:
         import asyncio
 
-        from turnstone.core.web_helpers import read_json_or_400
+        from turnstone.core import session_worker
+        from turnstone.core.web_helpers import auth_user_id, read_json_or_400
 
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
@@ -1321,7 +1324,23 @@ def make_cancel_handler(
         if session is None or ui is None:
             return JSONResponse({"error": "No session"}, status_code=400)
 
-        was_running = bool(getattr(ws, "_worker_running", False))
+        # Pin the exact worker Stop addresses.  A cooperative cancel can make
+        # that owner exit before the force branch below acquires ``ws._lock``;
+        # a new send admitted after the cancel edge must not then be mistaken
+        # for — and force-abandoned as — the predecessor.
+        with ws._lock:
+            was_running = bool(ws._worker_running)
+            cancel_target = ws.worker_thread if was_running else None
+        structural_debt_method = cast(
+            "Callable[[], bool] | None",
+            concrete_method(session, "has_tool_structural_debt"),
+        )
+        idle_structural_force = bool(
+            force
+            and not was_running
+            and structural_debt_method is not None
+            and structural_debt_method()
+        )
         dropped: dict[str, Any] = {}
         if cfg.cancel_forensics is not None:
             try:
@@ -1342,32 +1361,31 @@ def make_cancel_handler(
         # idle cancels stay silent — the same property the old
         # pending-slot gate provided; the recovery semantics for a
         # stuck approval-pending state are preserved because a stuck
-        # cycle IS a live cycle.  Legacy/stub UIs without the sweep
-        # keep the old single-slot fallback.
+        # cycle IS a live cycle. Every production UI implements the
+        # attributed sweep; an incompatible custom UI is logged without
+        # weakening the workstream cancel itself.
         try:
             session.cancel()
         except Exception:
             log.debug("ws.cancel.session_failed ws=%s", ws_id[:8], exc_info=True)
         try:
-            if hasattr(ui, "resolve_all_approvals"):
-                ui.resolve_all_approvals(False, "Cancelled by user")
-            elif (
-                hasattr(ui, "resolve_approval")
-                and getattr(ui, "_pending_approval", None) is not None
-            ):
-                ui.resolve_approval(False, "Cancelled by user")
+            cast("SessionUIBase", ui).resolve_all_approvals(
+                False,
+                "Cancelled by user",
+                resolver_principal_id=auth_user_id(request),
+            )
         except Exception:
             log.debug(
-                "ws.cancel.resolve_approval_failed ws=%s",
+                "ws.cancel.resolve_all_approvals_failed ws=%s",
                 ws_id[:8],
                 exc_info=True,
             )
 
-        # The remaining steps only matter when a worker is actually
-        # running: force-recovery has nothing to recover otherwise,
-        # and the SSE ``cancelled`` event would mislead consumers that
-        # have no in-flight generation to cancel.
-        if was_running:
+        # An ordinary idle cancel stays silent. The one idle force case with
+        # real work to recover is an abnormal finalizer that left structural
+        # debt after its worker slot exited; repair that poisoned prefix before
+        # admitting another worker.
+        if was_running or idle_structural_force:
             if force:
                 # Force cancel: abandon the stuck worker thread (daemon,
                 # will die on process exit or stream timeout) and emit
@@ -1382,24 +1400,17 @@ def make_cancel_handler(
                 # cancel flag short-circuits the abandoned thread
                 # before it reaches the queue-drain seam, leaving the
                 # queued message orphaned until the next spawn).
-                # ``session_worker.send`` documents this invariant:
-                # "readers gating on either flag see a coherent
-                # (worker_thread, _worker_running) pair."
+                # ``session_worker.send`` documents this invariant: readers
+                # gating on the running flag see one coherent worker/thread/
+                # principal claim.
                 #
-                # Documented bet — force-cancelling a wedged QUICK command
-                # (worker_kind == "command", e.g. /resume stuck in storage
-                # I/O): clearing the flag releases the pending-send
-                # drain's park (_drain_pending_sends polls the same
-                # (_worker_running, worker_kind) pair the parked /send
-                # used to), so a deferred message's fresh worker can then
-                # run while the abandoned command thread finishes its
-                # in-place mutation — quick commands have no generation
-                # checkpoints to retire them (compact_now does).  Same
-                # blast radius as force-abandoning a send worker
-                # mid-tool; accepted because force-cancel is the operator
-                # escape hatch for an already-wedged session, not a
-                # routine path.  Revisit if commands ever gain generation
-                # discipline.
+                # A turn worker is no longer released on a documented
+                # mid-tool consistency bet: ChatSession first supersedes its
+                # generation and journals conservative UNKNOWN receipts for
+                # every accepted unanswered tool call. QUICK command workers
+                # still rely on their established command-specific mutation
+                # discipline; destructive history workers advertise
+                # ``_worker_force_abandonable=False`` and remain pinned.
                 #
                 # Abandon machinery FIRST — before the ownership clear
                 # and the idle emission below.  The latch and the queue
@@ -1414,32 +1425,105 @@ def make_cancel_handler(
                 # operator who had just pressed Stop at its hardest.
                 # The abandoned thread re-running the drain at its
                 # eventual death is idempotent.
-                try:
-                    session._drain_pending_advisories()
-                except Exception:
-                    log.debug(
-                        "ws.cancel.abandon_latch_failed ws=%s",
-                        ws_id[:8],
-                        exc_info=True,
+                force_abandoned = False
+
+                def _publish_force_terminal() -> None:
+                    if hasattr(ui, "_enqueue"):
+                        try:
+                            ui._enqueue({"type": "stream_end"})
+                        except Exception:
+                            log.debug(
+                                "ws.cancel.stream_end_failed ws=%s",
+                                ws_id[:8],
+                                exc_info=True,
+                            )
+                    if hasattr(ui, "on_state_change"):
+                        try:
+                            ui.on_state_change("idle")
+                        except Exception:
+                            log.debug(
+                                "ws.cancel.idle_state_failed ws=%s",
+                                ws_id[:8],
+                                exc_info=True,
+                            )
+
+                def _holds_abandonable_claim_locked() -> bool:
+                    # Caller holds ws._lock.
+                    return bool(
+                        ws._worker_running
+                        and ws.worker_thread is cancel_target
+                        and ws._worker_force_abandonable
                     )
-                with ws._lock:
-                    ws.worker_thread = None
-                    ws._worker_running = False
-                if hasattr(ui, "_enqueue"):
-                    try:
-                        ui._enqueue({"type": "stream_end"})
-                    except Exception:
-                        log.debug(
-                            "ws.cancel.stream_end_failed ws=%s",
+
+                def _release_worker_claim_locked() -> None:
+                    # Caller holds ws._lock and has verified
+                    # ``_holds_abandonable_claim_locked()``; the field set
+                    # itself is owned by session_worker (slot lifecycle).
+                    session_worker.release_slot_locked(ws)
+
+                force_method = concrete_method(session, "force_abandon_generation")
+                if force_method is not None:
+                    force_abandon = cast(
+                        "Callable[..., tuple[bool, Any]]",
+                        force_method,
+                    )
+
+                    def _target_is_current() -> bool:
+                        if cancel_target is None:
+                            if structural_debt_method is None or not structural_debt_method():
+                                return False
+                            with ws._lock:
+                                return bool(not ws._worker_running and ws.worker_thread is None)
+                        with ws._lock:
+                            return _holds_abandonable_claim_locked()
+
+                    def _clear_target() -> bool:
+                        if cancel_target is None:
+                            with ws._lock:
+                                return bool(not ws._worker_running and ws.worker_thread is None)
+                        with ws._lock:
+                            if not _holds_abandonable_claim_locked():
+                                return False
+                            _release_worker_claim_locked()
+                            return True
+
+                    force_abandoned, persistence_error = await asyncio.to_thread(
+                        force_abandon,
+                        target_is_current=_target_is_current,
+                        clear_target=_clear_target,
+                        publish_abandoned=_publish_force_terminal,
+                    )
+                    if persistence_error is not None:
+                        status = session.conversation_persistence_status()
+                        log.warning(
+                            "ws.cancel.force_persistence_unresolved ws=%s state=%s",
                             ws_id[:8],
-                            exc_info=True,
+                            status.get("state", "unknown"),
                         )
-                if hasattr(ui, "on_state_change"):
+                else:
+                    # Compatibility for small external/test session doubles.
+                    # Production ChatSession owns the stronger generation +
+                    # structural journal transaction above.
+                    with ws._lock:
+                        if _holds_abandonable_claim_locked():
+                            try:
+                                session._drain_pending_advisories()
+                            except Exception:
+                                log.debug(
+                                    "ws.cancel.abandon_latch_failed ws=%s",
+                                    ws_id[:8],
+                                    exc_info=True,
+                                )
+                            _release_worker_claim_locked()
+                            force_abandoned = True
+                    if force_abandoned:
+                        _publish_force_terminal()
+                if not force_abandoned and hasattr(ui, "_enqueue"):
                     try:
-                        ui.on_state_change("idle")
+                        ui._enqueue({"type": "cancelled"})
                     except Exception:
                         log.debug(
-                            "ws.cancel.idle_state_failed ws=%s",
+                            "ws.cancel.cancelled_event_failed ws=%s",
                             ws_id[:8],
                             exc_info=True,
                         )
@@ -1495,14 +1579,151 @@ RetryAuditEmitter = Callable[
     ["Request", str, "Workstream"],
     None,
 ]
-# (ws, user_msg) -> None. Re-sends ``user_msg`` on ``ws`` via the kind's
-# worker dispatch (driving :func:`turnstone.core.session_worker.send`
-# with the kind's own run / enqueue callbacks). The retry handler calls
-# it after :meth:`ChatSession.retry` truncates the last turn.
-RetryDispatcher = Callable[
-    ["Workstream", str],
-    None,
-]
+
+
+@dataclass(frozen=True)
+class _DestructiveCommand:
+    """The worker-slot channel a destructive command's body writes into.
+
+    ``outcome`` carries the body's result back to the handler:
+    :func:`_dispatch_destructive_command` reads ``"busy"`` and ``"error"``;
+    every other key belongs to the verb. ``done`` is set by the body, never by
+    the dispatcher — retry signals it the moment the *cut* lands and then keeps
+    running the replacement generation on the same slot, so the two events are
+    not interchangeable.
+    """
+
+    outcome: dict[str, Any]
+    done: threading.Event
+    publish_clear_ui: Callable[[], None]
+
+
+async def _dispatch_destructive_command(
+    *,
+    mgr: SessionManager,
+    ws: Workstream,
+    ws_id: str,
+    ui: Any,
+    session: ChatSession,
+    verb: str,
+    label: str,
+    not_found_label: str,
+    body: Callable[[_DestructiveCommand], None],
+    principal_id: str = "",
+) -> dict[str, Any] | JSONResponse:
+    """Run one destructive history mutation inside a single worker-slot claim.
+
+    Rewind and retry both cut committed history, so the idle check and the
+    complete in-memory/storage mutation must be ONE claim: a check followed by
+    an inline mutation lets a concurrent browser claim a turn in between, after
+    which the cut can delete that turn's USER row while its worker later
+    persists an orphan ASSISTANT response.
+
+    ``body`` runs on the claimed slot and writes into the returned command's
+    ``outcome``; it owns ``done`` (see :class:`_DestructiveCommand`). The
+    ``clear_ui`` publisher handed to it is passed down into the session's
+    atomic history revision so the frontend's REST ``/history`` refetch is
+    triggered from inside the truncation — never from the handler afterwards.
+
+    Returns the outcome dict once the body has signalled ``done``, or the
+    ``JSONResponse`` the handler must return verbatim: ``{"status": "busy"}``
+    when the slot was held, 503 on a spawn or mutation failure, and the
+    409/404 split below on a dispatch refusal.
+    """
+    import asyncio
+    import threading
+
+    from turnstone.core import session_worker
+
+    def _publish_clear_ui() -> None:
+        enqueue = getattr(ui, "_enqueue", None)
+        if not callable(enqueue):
+            raise RuntimeError("Session UI cannot publish a structural reset")
+        enqueue({"type": "clear_ui"})
+
+    command = _DestructiveCommand(
+        outcome={},
+        done=threading.Event(),
+        publish_clear_ui=_publish_clear_ui,
+    )
+
+    def _reject_busy() -> None:
+        command.outcome["busy"] = True
+        if hasattr(ui, "_enqueue"):
+            ui._enqueue({"type": "busy_error", "message": f"Cannot {verb} while processing."})
+
+    foreign_refused = False
+
+    def _before_spawn() -> bool:
+        # Same admission gate ordinary sends run: a retry installs the caller
+        # as the slot principal and dispatches a replacement send, which
+        # would otherwise die mid-turn on the advisory seam's ownership
+        # assert once another participant's persistence-retained input is
+        # reached (round-4 review). Rewind passes no principal and skips it.
+        nonlocal foreign_refused
+        if session_worker.foreign_queue_conflict(session, principal_id):
+            foreign_refused = True
+            return False
+        return True
+
+    try:
+        dispatched = session_worker.send(
+            ws,
+            enqueue=_reject_busy,
+            run=functools.partial(body, command),
+            expected_session=session,
+            before_spawn=_before_spawn,
+            thread_name=f"{verb}-{ws.id[:8]}",
+            worker_kind="command",
+            principal_id=principal_id,
+            force_abandonable=False,
+        )
+    except Exception:
+        log.exception("ws.%s.worker_spawn_failed ws=%s", verb, ws_id[:8])
+        return JSONResponse(
+            {"error": f"{label} could not be started — retry shortly."},
+            status_code=503,
+        )
+    if command.outcome.get("busy"):
+        return JSONResponse({"status": "busy"})
+    if not dispatched:
+        if foreign_refused:
+            return JSONResponse(
+                {
+                    "status": "cross_user_interjection",
+                    "error": (
+                        "Another participant's queued input is still waiting. "
+                        f"They must send or retract it before a {verb} can start."
+                    ),
+                },
+                status_code=409,
+            )
+        # ``session_worker.send`` refuses for more reasons than a closed
+        # workstream: a Stop that raced the claim capture, a soft close
+        # preparing, structural tool debt pending after a force-cancel, or
+        # a session swap. Those leave the workstream alive — answer 409
+        # (transient, retryable) and reserve 404 for a row that is
+        # actually gone.
+        if mgr.get(ws_id) is not None:
+            return JSONResponse(
+                {"error": "Workstream is temporarily busy — retry shortly."},
+                status_code=409,
+            )
+        return JSONResponse({"error": not_found_label}, status_code=404)
+
+    await asyncio.to_thread(command.done.wait)
+    if "error" in command.outcome:
+        log.warning(
+            "ws.%s.failed ws=%s error=%r",
+            verb,
+            ws_id[:8],
+            command.outcome["error"],
+        )
+        return JSONResponse(
+            {"error": f"{label} could not be persisted — history was unchanged."},
+            status_code=503,
+        )
+    return command.outcome
 
 
 def make_rewind_handler(
@@ -1521,12 +1742,14 @@ def make_rewind_handler(
     mgr → ws-lookup → busy-gate → ``rewind`` → ``clear_ui`` → audit
     sequence.
 
-    Unlike :func:`make_close_handler`, the body emits a ``clear_ui`` event
-    after the mutation — **always, including a rewind to zero messages**.
-    The frontend keys its REST ``/history`` refetch (and any queued
-    edit-and-resend) off this signal, not an inline history payload; the
-    unconditional emit carries the PR #503 fix (an ``if history:`` guard
-    once froze the composer on rewind-to-zero).
+    Unlike :func:`make_close_handler`, the body supplies a ``clear_ui``
+    publisher to the atomic mutation — **always, including a rewind to zero
+    messages**. The frontend keys its REST ``/history`` refetch (and any
+    queued edit-and-resend) off this signal, not an inline history payload;
+    publishing inside the truncation revision prevents a competing generic
+    repair event from closing the listener before ``clear_ui`` arrives. The
+    unconditional emit carries the PR #503 fix (an ``if history:`` guard once
+    froze the composer on rewind-to-zero).
 
     Args:
         cfg: per-kind policy bundle (auth, manager lookup, tenant check,
@@ -1589,22 +1812,39 @@ def make_rewind_handler(
         if session is None or ui is None:
             return JSONResponse({"error": "No session"}, status_code=400)
 
-        # Reject rewind while a generation is in flight — mutating
-        # ``messages`` under a running worker corrupts history / cursors.
-        # Gate on ``_worker_running`` (not ``worker_thread.is_alive()``)
-        # for parity with session_worker.send.
-        with ws._lock:
-            if ws._worker_running:
-                if hasattr(ui, "_enqueue"):
-                    ui._enqueue(
-                        {"type": "busy_error", "message": "Cannot rewind while processing."}
-                    )
-                return JSONResponse({"status": "busy"})
+        def _run_rewind(command: _DestructiveCommand) -> None:
+            from turnstone.core.session import GenerationCancelled
 
-        removed = session.rewind(raw_turns)
+            try:
+                command.outcome["removed"] = session.rewind(
+                    raw_turns,
+                    publish_reset=command.publish_clear_ui,
+                )
+            except (GenerationCancelled, Exception) as exc:
+                # One arm, not two with identical bodies (the codebase's
+                # established tuple idiom): rewind() raises the BaseException
+                # GenerationCancelled when the truncation's commit admission
+                # is refused by a racing close/delete/poison — it must land
+                # in the dispatcher's error arm like any other refusal, not
+                # escape ``except Exception``.
+                command.outcome["error"] = exc
+            finally:
+                command.done.set()
 
-        if hasattr(ui, "_enqueue"):
-            ui._enqueue({"type": "clear_ui"})
+        outcome = await _dispatch_destructive_command(
+            mgr=mgr,
+            ws=ws,
+            ws_id=ws_id,
+            ui=ui,
+            session=session,
+            verb="rewind",
+            label="Rewind",
+            not_found_label=cfg.not_found_label,
+            body=_run_rewind,
+        )
+        if isinstance(outcome, JSONResponse):
+            return outcome
+        removed = int(outcome.get("removed", 0))
 
         if audit_emit is not None:
             try:
@@ -1624,7 +1864,6 @@ def make_rewind_handler(
 def make_retry_handler(
     cfg: SessionEndpointConfig,
     *,
-    dispatch_retry: RetryDispatcher,
     audit_emit: RetryAuditEmitter | None = None,
     accepted_permissions: tuple[str, ...] = (),
 ) -> Handler:
@@ -1635,23 +1874,18 @@ def make_retry_handler(
     auth → mgr → ws-lookup → busy-gate → ``retry`` → ``clear_ui`` →
     audit → re-dispatch sequence across kinds.
 
-    The re-send goes through ``dispatch_retry`` (a per-kind closure that
-    drives :func:`turnstone.core.session_worker.send` with the kind's own
-    ``run`` / ``enqueue`` callbacks) rather than a hand-rolled thread, so
-    both kinds converge on the shared worker-dispatch primitive instead
-    of open-coding a third copy. A retry issued while busy is rejected up
-    front by the busy-gate below; the dispatcher's ``enqueue`` callback
-    hard-rejects (rather than queues) so the rare check-then-dispatch
-    race can't silently defer the resend behind the in-flight turn.
+    The destructive cut and replacement send run in one shared worker slot.
+    The slot begins as ``command`` (ordinary sends defer instead of entering a
+    half-truncated turn), then becomes ``turn`` immediately before the
+    replacement generation. This closes the old check -> truncate -> second
+    dispatch race.
 
-    ``clear_ui`` fires after ``retry()`` regardless of whether anything
-    was dropped (idempotent REST refetch on the frontend), matching the
-    pre-lift interactive handler.
+    ``clear_ui`` is published by ``retry()``'s atomic history revision
+    regardless of whether anything was dropped (idempotent REST refetch on
+    the frontend), matching the pre-lift interactive handler.
 
     Args:
         cfg: per-kind policy bundle.
-        dispatch_retry: ``(ws, user_msg) -> None`` re-send closure.
-            Required — retry is meaningless without it.
         audit_emit: kind's audit emitter; receives ``(request, ws_id,
             ws)``. **Both kinds hardcode the ``conversation.retry``
             action.** Wrapped in try/except.
@@ -1662,8 +1896,11 @@ def make_retry_handler(
 
     async def retry(request: Request) -> Response:
         import asyncio
+        import threading
 
+        from turnstone.core import session_worker
         from turnstone.core.auth import require_any_permission
+        from turnstone.core.session import GenerationCancelled
 
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
@@ -1692,28 +1929,97 @@ def make_retry_handler(
         if session is None or ui is None:
             return JSONResponse({"error": "No session"}, status_code=400)
 
-        with ws._lock:
-            if ws._worker_running:
-                if hasattr(ui, "_enqueue"):
-                    ui._enqueue({"type": "busy_error", "message": "Cannot retry while processing."})
-                return JSONResponse({"status": "busy"})
-
-        # A retry is a fresh turn initiated by the authenticated caller —
-        # rebind per-user MCP credential resolution to them before the
-        # re-send dispatches (the per-kind ``dispatch_retry`` closure
-        # calls ``send()`` without identity kwargs). getattr-guarded so
-        # per-kind session stubs without the method keep working.
+        # Retry owns one worker slot across BOTH the destructive cut and the
+        # replacement generation.  A second dispatcher after an inline cut is
+        # too late: a concurrent send can claim the idle slot in between and
+        # either be deleted by retry or cause the requested replacement to be
+        # rejected after history was already changed.
         from turnstone.core.web_helpers import auth_user_id
 
         acting_uid = auth_user_id(request)
-        bind_acting = getattr(session, "bind_acting_user", None)
-        if acting_uid and callable(bind_acting):
-            bind_acting(acting_uid)
 
-        retry_msg = session.retry()
+        def _run_retry(command: _DestructiveCommand) -> None:
+            try:
+                retry_msg = session.retry(publish_reset=command.publish_clear_ui)
+            except (GenerationCancelled, Exception) as exc:
+                # One arm, not two with identical bodies: retry() raises the
+                # BaseException GenerationCancelled when the cut's commit
+                # admission is refused by a racing close/delete/poison — the
+                # dispatcher's error arm owns both refusal shapes.
+                command.outcome["error"] = exc
+                command.done.set()
+                return
 
-        if hasattr(ui, "_enqueue"):
-            ui._enqueue({"type": "clear_ui"})
+            command.outcome["retry_msg"] = retry_msg
+            if not retry_msg:
+                command.done.set()
+                return
+
+            # The slot began as a command so ordinary sends defer rather than
+            # entering the interjection queue while history is being cut.  It
+            # becomes a turn slot atomically before the replacement send, with
+            # the authenticated principal installed for queue ownership (the
+            # field set is session_worker's — the slot-lifecycle owner).
+            with ws._lock:
+                if ws.worker_thread is not threading.current_thread():
+                    command.outcome["error"] = RuntimeError(
+                        "Retry worker lost its workstream claim"
+                    )
+                    command.done.set()
+                    return
+                session_worker.reclassify_slot_locked(
+                    ws,
+                    worker_kind="turn",
+                    principal_id=acting_uid,
+                    force_abandonable=True,
+                )
+            command.done.set()
+            me = threading.current_thread()
+            try:
+                session.send(retry_msg, acting_user_id=acting_uid or None)
+            except GenerationCancelled:
+                # send() self-handles an in-turn cancel; this arm is the
+                # pre-envelope raced-Stop residue. Converge the pane if this
+                # thread still owns the slot.
+                if ws.worker_thread is me:
+                    _emit_send_ui(ws, ui, "on_stream_end")
+                    _emit_send_ui(ws, ui, "on_state_change", "idle")
+            except Exception as exc:
+                # A raise BEFORE send()'s error-convergence envelope (a
+                # force-cancel or soft close landing between the cut and the
+                # re-send) emits nothing itself — the destructive cut already
+                # succeeded and the HTTP response already said ok, so without
+                # this net the pane shows truncated history and silence.
+                # Deliberately NOT routed through ensure_error_recorded: on a
+                # REUSED session a pre-try raise after a prior errored turn
+                # finds the persisted-error flag stale-True and the recorder
+                # would no-op (#865 owns the reuse-safe signal); the display
+                # string is sanitized inline instead. state=error via this
+                # path carries no fresh last_error row — also #865.
+                log.exception("ws.retry.worker_failed ws=%s", ws_id[:8])
+                if ws.worker_thread is me:
+                    from turnstone.core.memory import sanitize_error_text
+
+                    _emit_send_ui(ws, ui, "on_error", f"Error: {sanitize_error_text(str(exc))}")
+                    _emit_send_ui(ws, ui, "on_stream_end")
+                    _emit_send_ui(ws, ui, "on_state_change", "error")
+
+        outcome = await _dispatch_destructive_command(
+            mgr=mgr,
+            ws=ws,
+            ws_id=ws_id,
+            ui=ui,
+            session=session,
+            verb="retry",
+            label="Retry",
+            not_found_label=cfg.not_found_label,
+            body=_run_retry,
+            principal_id=acting_uid,
+        )
+        if isinstance(outcome, JSONResponse):
+            return outcome
+
+        retry_msg = outcome.get("retry_msg")
 
         if audit_emit is not None:
             try:
@@ -1726,8 +2032,6 @@ def make_retry_handler(
                 )
 
         retried = retry_msg is not None
-        if retry_msg is not None:
-            dispatch_retry(ws, retry_msg)
 
         return JSONResponse({"status": "ok", "retried": retried})
 
@@ -1924,15 +2228,15 @@ def make_open_handler(
 def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
     """Lifted body for ``GET {prefix}/{ws_id}/events`` — per-workstream SSE.
 
-    Both kinds share the SSE plumbing: register the per-UI listener
-    queue, run the kind-specific initial replay (``cfg.events_replay``,
-    typically ``connected`` + ``status`` + ``history`` + pending
-    approval / plan on interactive; just pending approval / plan on
-    coord), then drain the queue forever until either the workstream
-    closes (``ws_closed`` event) or the client disconnects.
+    Both kinds share the SSE plumbing: resolve viewer-specific project
+    metadata off-loop, register the per-UI listener queue, run the configured
+    initial replay (``cfg.events_replay``), then drain the queue forever until
+    either the workstream closes (``ws_closed`` event) or the client
+    disconnects. Cursor-only replay emits the shared connected/status preamble
+    directly because it deliberately skips kind-specific pending controls.
 
-    The kind-specific divergence is captured entirely by
-    ``cfg.events_replay``. The live-loop body, the listener
+    The kind-specific replay divergence is captured by
+    ``cfg.events_replay``. The cursor preamble, live-loop body, listener
     registration, the ``ws_closed`` exit, the disconnect detection,
     and the SSE-connect/disconnect metric recording are uniform.
 
@@ -2012,18 +2316,34 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
         # ``Last-Event-ID`` resume: native EventSource auto-reconnect
         # sends the header; the manual-reconnect path (which uses
         # ``new EventSource(url)`` and can't set custom headers) sends
-        # ``?last_event_id=N``.  Accept both; malformed values fall
-        # back to fresh-connect semantics so a broken intermediary
-        # can't break replay for a client that genuinely lost no
-        # events.
-        last_event_id_raw = request.headers.get("Last-Event-ID") or request.query_params.get(
-            "last_event_id"
-        )
-        last_event_id: int | None
+        # ``?last_event_id=N``.  Accept both.  A syntactically valid native
+        # reconnect header has priority over every URL bootstrap hint.  In
+        # particular, an EventSource may auto-reconnect the original initial
+        # URL (which still contains ``history_token``); once it has a numeric
+        # Last-Event-ID it is a normal ring reconnect and must not revalidate a
+        # one-shot REST handoff token.  Range validity is checked atomically
+        # against the UI's high-water mark below, so a numeric negative/future
+        # header takes this native path but fails closed as truncated.  A
+        # malformed native header does not get priority: it may have been
+        # mangled by an intermediary, so fall back to the URL cursor and,
+        # critically, retain the initial ``history_token`` validation.
+        last_event_id_header = request.headers.get("Last-Event-ID")
+
+        native_last_event_id: int | None = None
         try:
-            last_event_id = int(last_event_id_raw) if last_event_id_raw else None
+            native_last_event_id = int(last_event_id_header) if last_event_id_header else None
         except (TypeError, ValueError):
-            last_event_id = None
+            native_last_event_id = None
+
+        native_cursor_numeric = native_last_event_id is not None
+        if native_cursor_numeric:
+            last_event_id = native_last_event_id
+        else:
+            last_event_id_query = request.query_params.get("last_event_id")
+            try:
+                last_event_id = int(last_event_id_query) if last_event_id_query else None
+            except (TypeError, ValueError):
+                last_event_id = None
 
         # Three replay shapes:
         #   - ``last_event_id is None`` → ``"fresh"`` (today's behaviour):
@@ -2042,13 +2362,78 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
         # ``ui`` is a ``SessionUIBase`` subclass, so the cast is
         # tightening the type, not weakening it.
         ui_base = cast("SessionUIBase", ui)
+        from turnstone.core.web_helpers import auth_user_id
+
+        # Pin the authenticated viewer once per connection. Resolve optional
+        # project presentation metadata off the event loop and before listener
+        # registration, so database latency cannot stall unrelated async work
+        # or let this listener's queue accumulate while it waits.
+        replay_principal_id = auth_user_id(request).strip()
+        replay_project_name = ""
+        session = getattr(ws, "session", None)
+        project_name_for_principal = getattr(session, "project_name_for_principal", None)
+        if callable(project_name_for_principal):
+            try:
+                resolved_project_name = await asyncio.to_thread(
+                    project_name_for_principal,
+                    replay_principal_id,
+                )
+                if isinstance(resolved_project_name, str):
+                    replay_project_name = resolved_project_name
+            except Exception:
+                # Project metadata is optional presentation context. Fail
+                # closed to no badge without dropping the SSE bootstrap.
+                log.debug(
+                    "ws.events.project_name_failed ws=%s",
+                    ws_id[:8],
+                    exc_info=True,
+                )
+        request.state._session_replay_project_name = replay_project_name
         replay_status: str
         replay_events: list[dict[str, Any]] = []
         lost_count = 0
         earliest_available_id = 0
         in_progress_snap: dict[str, Any]
         snap_seq: int = 0
-        if last_event_id is None:
+        history_token = (
+            request.query_params.get("history_token") if not native_cursor_numeric else None
+        )
+        supports_user_turn_projection = request.query_params.get("user_turn") == "1"
+        supports_tool_turn_projection = request.query_params.get("tool_turn") == "1"
+        tokenless_fresh_bootstrap = not history_token and last_event_id is None
+        handoff_mismatch = False
+        if history_token:
+            # The ChatSession owns the history-revision lock. Validation and
+            # listener registration happen in one critical section, closing
+            # the REST-response -> SSE-open window without coupling this
+            # shared route to the journal implementation.
+            session = getattr(ws, "session", None)
+            register_handoff = getattr(session, "register_listener_for_history_handoff", None)
+            registration = (
+                register_handoff(history_token, last_event_id=last_event_id)
+                if callable(register_handoff)
+                else None
+            )
+            if registration is None:
+                handoff_mismatch = True
+                replay_status = "history_mismatch"
+                client_queue = None
+                in_progress_snap = {"content": "", "reasoning": "", "seq": 0}
+            else:
+                (
+                    client_queue,
+                    replay_events,
+                    replay_status,
+                    lost_count,
+                    earliest_available_id,
+                    snapshot,
+                ) = registration
+                if replay_status in {"fresh", "truncated"}:
+                    in_progress_snap = snapshot
+                    snap_seq = snapshot["seq"]
+                else:
+                    in_progress_snap = {"content": "", "reasoning": "", "seq": 0}
+        elif last_event_id is None:
             replay_status = "fresh"
             client_queue, in_progress_snap = ui_base.register_listener_with_in_progress_snapshot()
             snap_seq = in_progress_snap["seq"]
@@ -2107,14 +2492,13 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
         replay_cb = cfg.events_replay
 
         async def event_generator() -> Any:
-            import functools
             import random
 
             _metrics.record_sse_connect()
             loop = asyncio.get_running_loop()
 
             def _format_event(event: dict[str, Any]) -> dict[str, str]:
-                """Strip internal plumbing fields, attach SSE ``id:`` if present.
+                """Project one buffered event for this listener.
 
                 Shallow-copies the dict before any mutation because
                 ``_enqueue`` puts ONE reference into every listener
@@ -2132,10 +2516,69 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                 # the wire.  The fresh-path live drain filters on
                 # ``_seq`` BEFORE calling this helper.
                 ev_copy.pop("_seq", None)
+                canonical_user_turn = ev_copy.get("type") == "user_turn"
+                canonical_tool_turn = (
+                    ev_copy.get("type") == "tool_result" and ev_copy.get("accepted") is True
+                )
+                downgraded_user_turn = canonical_user_turn and not supports_user_turn_projection
+                downgraded_tool_turn = canonical_tool_turn and not supports_tool_turn_projection
+                if downgraded_user_turn or downgraded_tool_turn:
+                    # A pre-projection client cannot render this accepted row.
+                    # Give it the strong-repair event it already understands,
+                    # anchored at the cursor immediately BEFORE the row. If
+                    # /history repair fails, its reconnect therefore replays
+                    # this canonical event and receives the repair signal
+                    # again instead of skipping the unrepresented row.
+                    ev_copy = {
+                        "type": "replay_truncated",
+                        "ws_id": ws_id,
+                        "reason": (
+                            "user_turn_projection_unsupported"
+                            if downgraded_user_turn
+                            else "tool_turn_projection_unsupported"
+                        ),
+                    }
+                elif (canonical_user_turn or canonical_tool_turn) and isinstance(eid, int):
+                    # Typed consumers need the canonical row identity in the
+                    # decoded payload as well as EventSource's transport-only
+                    # ``lastEventId``. SDK parsers do not otherwise expose the
+                    # SSE id field, and both browser reducers use this value
+                    # for exact render deduplication.
+                    ev_copy["_event_id"] = eid
                 out: dict[str, str] = {"data": json.dumps(ev_copy)}
-                if eid is not None:
+                if (downgraded_user_turn or downgraded_tool_turn) and isinstance(eid, int):
+                    out["id"] = str(max(0, eid - 1))
+                elif eid is not None:
                     out["id"] = str(eid)
                 return out
+
+            def _current_state_event() -> dict[str, Any] | None:
+                """Build the idempotent current-state bootstrap frame."""
+                try:
+                    cur_state = getattr(ws.state, "value", None)
+                    if not isinstance(cur_state, str) or not cur_state:
+                        return None
+                    state_evt: dict[str, Any] = {
+                        "type": "state_change",
+                        "state": cur_state,
+                        "ws_id": ws_id,
+                    }
+                    sess = getattr(ws, "session", None)
+                    acting = (
+                        getattr(sess, "_acting_user_id", "") or getattr(sess, "_user_id", "")
+                        if sess is not None
+                        else ""
+                    )
+                    if acting:
+                        state_evt["acting_user_id"] = acting
+                    return state_evt
+                except Exception:
+                    log.debug(
+                        "ws.events.state_change_replay_failed ws=%s",
+                        ws_id[:8],
+                        exc_info=True,
+                    )
+                    return None
 
             try:
                 # Per-stream reconnect interval jitter.  Without this,
@@ -2147,6 +2590,29 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                 # below today's ping cadence while staggering peaks.
                 yield {"retry": random.randint(2500, 4500)}
 
+                if handoff_mismatch:
+                    # A committed conversation row crossed the REST history
+                    # response -> listener-registration boundary. Numeric ring
+                    # replay is not a substitute for that row (tool-only turns
+                    # need not be reconstructable from the ring), so instruct
+                    # the client to repeat /history and terminate this source.
+                    yield {
+                        "data": json.dumps(
+                            {
+                                "type": "history_resync",
+                                "ws_id": ws_id,
+                                "reason": "handoff_mismatch",
+                            }
+                        )
+                    }
+                    return
+
+                # Every non-mismatch path registered a real listener above.
+                # Assign a narrowed local for both the live drain and cleanup.
+                stream_queue = client_queue
+                if stream_queue is None:
+                    return
+
                 if replay_status == "replay_ok":
                     # Buffered events already cover everything since
                     # the client's ``Last-Event-ID`` — skip the
@@ -2157,6 +2623,30 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                     # their ``_event_id`` as SSE ``id:`` so a
                     # disconnect mid-replay resumes from the latest
                     # buffered id, not the original ``last_event_id``.
+                    # Reconnect deltas still need the idempotent connection /
+                    # status / current-state bootstrap. Do not invoke the full
+                    # replay callback here: its pending-control cards can also
+                    # exist in ``replay_events`` and appending both duplicates
+                    # operator controls.  Called directly — both kinds wired
+                    # byte-equivalent trivial wrappers, so the preamble
+                    # contract lives in session_replay_preamble alone (it
+                    # no-ops on a detached session internally).
+                    try:
+                        for ev in session_replay_preamble(
+                            ws.session,
+                            ui,
+                            project_name=replay_project_name,
+                        ):
+                            yield {"data": json.dumps(ev)}
+                    except Exception:
+                        log.debug(
+                            "ws.events.preamble_replay_failed ws=%s",
+                            ws_id[:8],
+                            exc_info=True,
+                        )
+                    state_evt = _current_state_event()
+                    if state_evt is not None:
+                        yield {"data": json.dumps(state_evt)}
                     for ev in replay_events:
                         yield _format_event(ev)
                 else:
@@ -2167,6 +2657,29 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                     # first so the client knows the buffer couldn't
                     # cover the gap and treats the snapshot below as
                     # the recovery floor.
+                    if replay_status == "fresh" and tokenless_fresh_bootstrap:
+                        # Rolling-upgrade floor for a pre-handoff browser. An
+                        # old tab loads REST history without a token; if a row
+                        # lands before this registration, synthetic replay
+                        # cannot prove that row was in its DOM. The deployed
+                        # reducer understands clear_ui and refetches history
+                        # in-place while this atomically-registered listener
+                        # remains open. Do not use replay_truncated here: an
+                        # old reducer closes and reconnects after that frame,
+                        # but quiescent /history has no numeric cursor, so it
+                        # would return tokenless and repeat this bootstrap
+                        # forever. Current clients always present a handoff
+                        # token on first connect.
+                        yield {
+                            "data": json.dumps(
+                                {
+                                    "type": "clear_ui",
+                                    "ws_id": ws_id,
+                                    "reason": "tokenless_history_bootstrap",
+                                }
+                            )
+                        }
+
                     if replay_status == "truncated":
                         # Node-side visibility for every replay-window
                         # miss (evicted ring AND the empty-ring
@@ -2193,8 +2706,8 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                             )
                         }
 
-                    # Replay phase — stream the kind-specific initial
-                    # payload one event at a time so the client sees
+                    # Replay phase — stream the kind-specific initial payload
+                    # one event at a time so the client sees
                     # the first byte immediately.  Pre-building into
                     # a list would block time-to-first-byte until the
                     # entire replay materialized AND let the listener
@@ -2222,33 +2735,9 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                     # workstream state and the in-progress snapshot.
                     # Both are best-effort — a ws.state read failure
                     # or empty buffers just yields nothing extra.
-                    try:
-                        cur_state = getattr(ws.state, "value", None)
-                        if isinstance(cur_state, str) and cur_state:
-                            state_evt: dict[str, Any] = {
-                                "type": "state_change",
-                                "state": cur_state,
-                                "ws_id": ws_id,
-                            }
-                            # A client connecting mid-turn learns who holds it,
-                            # so it can gate its send button (matches the live
-                            # state_change emitted from server.WebUI).
-                            sess = getattr(ws, "session", None)
-                            acting = (
-                                getattr(sess, "_acting_user_id", "")
-                                or getattr(sess, "_user_id", "")
-                                if sess is not None
-                                else ""
-                            )
-                            if acting:
-                                state_evt["acting_user_id"] = acting
-                            yield {"data": json.dumps(state_evt)}
-                    except Exception:
-                        log.debug(
-                            "ws.events.state_change_replay_failed ws=%s",
-                            ws_id[:8],
-                            exc_info=True,
-                        )
+                    state_evt = _current_state_event()
+                    if state_evt is not None:
+                        yield {"data": json.dumps(state_evt)}
                     if in_progress_snap["content"] or in_progress_snap["reasoning"]:
                         yield {
                             "data": json.dumps(
@@ -2256,6 +2745,32 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                                     "type": "in_progress_snapshot",
                                     "content": in_progress_snap["content"],
                                     "reasoning": in_progress_snap["reasoning"],
+                                    "ws_id": ws_id,
+                                }
+                            )
+                        }
+                    # Running task-agent context is transient UI state, not
+                    # conversation history. Fresh/truncated subscribers receive
+                    # the latest reading for each active parent through the same
+                    # idempotent reducer as live ``agent_context`` events.
+                    for agent_context in in_progress_snap.get("agent_contexts", []):
+                        yield {
+                            "data": json.dumps(
+                                {
+                                    **agent_context,
+                                    "ws_id": ws_id,
+                                }
+                            )
+                        }
+                    # A task compaction is transient parent-card state, just
+                    # like its context meter. Re-emit the latest lifecycle edge
+                    # so a refresh during a long recursive summary recreates
+                    # the nested progress card without inventing history.
+                    for agent_compaction in in_progress_snap.get("agent_compactions", []):
+                        yield {
+                            "data": json.dumps(
+                                {
+                                    **agent_compaction,
                                     "ws_id": ws_id,
                                 }
                             )
@@ -2328,12 +2843,12 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                 while True:
                     if await request.is_disconnected():
                         return
-                    if getattr(client_queue, "poisoned", False):
+                    if getattr(stream_queue, "poisoned", False):
                         # The queue overflowed: it latched ``poisoned``
                         # at the FIRST rejected put, freezing its
                         # contents as a contiguous prefix (see
                         # ``_ListenerQueue``).
-                        if getattr(client_queue, "closing", False):
+                        if getattr(stream_queue, "closing", False):
                             # ws teardown raced the overflow: the queue is
                             # poisoned AND its ws is closing.  Unwind as a
                             # CLEAN close — no ``stream_overflow`` frame,
@@ -2374,7 +2889,7 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                     try:
                         event = await loop.run_in_executor(
                             live_executor,
-                            functools.partial(client_queue.get, timeout=5),
+                            functools.partial(stream_queue.get, timeout=5),
                         )
                     except queue.Empty:
                         continue  # ping keeps the connection alive
@@ -2386,7 +2901,8 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                     yield _format_event(event)
             finally:
                 _metrics.record_sse_disconnect()
-                unregister(client_queue)
+                if client_queue is not None:
+                    unregister(client_queue)
 
         return EventSourceResponse(event_generator(), ping=5)
 
@@ -2403,9 +2919,9 @@ def make_create_handler(
 
     Both kinds share the create sequence (parse body → resolve uid
     → kind-specific validate → resolve skill → ``mgr.create`` (with
-    ``defer_emit_created=True``) → save attachments → ``mgr.discard``
-    on validation failure / ``mgr.commit_create`` on success → audit
-    → kind-specific post-install → respond). Per-kind divergence
+    ``defer_emit_created=True``) → save attachments → optional pre-commit
+    gate → ``mgr.discard`` on failure / ``mgr.commit_create`` on success
+    → audit → kind-specific post-install → respond). Per-kind divergence
     captured by the cfg + ``audit_emit``:
 
     - ``cfg.create_supports_attachments`` — when ``True``, the body
@@ -2423,8 +2939,11 @@ def make_create_handler(
       attachments+resume_ws combo; coord: 401-on-empty-uid).
     - ``cfg.create_build_kwargs`` — kind-specific kwargs for
       ``mgr.create``. Required when the kind mounts a create handler.
+    - ``cfg.create_pre_commit`` — kind-specific atomic gate after attachment
+      validation and before any audit/lifecycle publication (interactive's
+      transactional fork; coord has none).
     - ``cfg.create_post_install`` — kind-specific tail end (e.g.
-      interactive's resume + skill_config + initial-message worker
+      interactive's UI bookkeeping + skill_config + initial-message worker
       thread; coord's initial_message via coord_adapter.send).
     - ``audit_emit`` — ``workstream.created`` on interactive,
       ``coordinator.create`` on coord.
@@ -2438,7 +2957,10 @@ def make_create_handler(
        rejected upload produces zero lifecycle events. Failure path
        is ``mgr.discard`` + ``delete_workstream``; success path
        falls through.
-    3. ``mgr.commit_create(ws)`` runs BEFORE ``audit_emit`` and
+    3. ``cfg.create_pre_commit`` runs after validation but BEFORE commit,
+       audit, and publication. A refusal discards the destination while its
+       deferred lifecycle is still invisible.
+    4. ``mgr.commit_create(ws)`` runs BEFORE ``audit_emit`` and
        ``post_install`` so any state-change events ``post_install``
        triggers (e.g. a worker dispatched on ``initial_message``)
        reach the cluster collector for an already-known ws_id.
@@ -2513,7 +3035,7 @@ def make_create_handler(
     - **Always-include response shape.** The lifted body always
       returns ``{ws_id, name, resumed, message_count, attachment_ids}``,
       with the parity fields defaulting to ``False`` / ``0`` / ``[]``
-      on kinds whose post-install doesn't populate them. SDK
+      on kinds whose create hooks don't populate them. SDK
       consumers don't branch on kind.
 
     Args:
@@ -2591,14 +3113,16 @@ def make_create_handler(
             # creates carry the right owner. Token sources on end-user
             # tokens (including console-proxy tokens that carry the
             # real user's identity at the auth layer) are NOT trusted;
-            # only service identities. The deny-by-default keeps a
-            # malicious caller from impersonating other users.
+            # only service identities. Requiring the unassignable
+            # ``service`` scope as well as ``src=console`` keeps a
+            # forged/unscoped source label from opening the override.
             body_uid = body.get("user_id")
             if (
                 isinstance(body_uid, str)
                 and body_uid
                 and auth is not None
                 and getattr(auth, "token_source", "") in {"console"}
+                and "service" in getattr(auth, "scopes", frozenset())
             ):
                 uid = body_uid
 
@@ -2619,10 +3143,11 @@ def make_create_handler(
         # require_project_denies_create, not a mount property. On the
         # interactive mount, by this point the validator has applied any
         # parent-/resume-inherited project_id into body AND (for a fork)
-        # discarded any explicit pick to the source's project or "", so a
-        # private/dangling/projectless fork SOURCE funnels to the SAME uniform
-        # 400 as a projectless fresh create. (Coordinator has no fork/resume —
-        # its validator only checks attachability of an explicit pick.)
+        # discarded any explicit pick in favor of the source's project. A
+        # missing or invisible source was already rejected with the generic
+        # 404; this gate's uniform 400 covers accessible projectless/dangling
+        # sources. (Coordinator has no fork/resume — its validator only checks
+        # attachability of an explicit pick.)
         if cfg.create_gate_require_project:
             from turnstone.core.auth import (
                 REQUIRE_PROJECT_CODE,
@@ -2684,6 +3209,79 @@ def make_create_handler(
                 {"error": "create handler misconfigured"},
                 status_code=500,
             )
+
+        async def _finish_before_unwind(awaitable: Awaitable[Any]) -> Any:
+            """Shield admitted work, then preserve the caller's cancellation.
+
+            ``asyncio.to_thread`` keeps running after the awaiting request is
+            cancelled. Waiting for the admitted task prevents rollback from
+            racing a late storage commit. Repeated cancellation is absorbed
+            only until the task reaches a terminal state; the original
+            exception is then re-raised by the surrounding ``except``.
+            """
+            task = asyncio.ensure_future(awaitable)
+            try:
+                return await asyncio.shield(task)
+            except BaseException:
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue
+                    except BaseException:
+                        break
+                if task.done() and not task.cancelled():
+                    with contextlib.suppress(BaseException):
+                        task.exception()
+                raise
+
+        async def _settle_admitted(awaitable: Awaitable[Any]) -> Any:
+            """Wait through caller cancellation and return the task outcome."""
+            task = asyncio.ensure_future(awaitable)
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+            return task.result()
+
+        def _discard_and_delete(candidate: Workstream) -> None:
+            """Rollback one exact hidden incarnation as a single operation."""
+            from turnstone.core.attachment_buffer import get_attachment_buffer
+            from turnstone.core.memory import (
+                delete_workstream,
+                delete_workstream_if_fork_reserved,
+            )
+
+            def _drop_staged_uploads() -> None:
+                buffer = get_attachment_buffer()
+                for staged in buffer.list_for(ws_id=candidate.id, user_id=uid):
+                    buffer.discard(
+                        staged.attachment_id,
+                        ws_id=candidate.id,
+                        user_id=uid,
+                    )
+
+            def _delete_reserved_row() -> None:
+                if candidate._fork_reservation_token:
+                    delete_workstream_if_fork_reserved(
+                        candidate.id,
+                        candidate._fork_reservation_token,
+                    )
+                else:
+                    # Compatibility for a custom manager that predates
+                    # deferred reservation tokens.
+                    delete_workstream(candidate.id)
+
+            removed = mgr.discard(
+                candidate.id,
+                expected=candidate,
+                before_release=_drop_staged_uploads,
+                after_release=_delete_reserved_row,
+            )
+            if not removed:
+                return
+
         try:
             if body_skill and not (isinstance(resume_ws_id_raw, str) and resume_ws_id_raw):
                 from turnstone.core.storage._registry import get_storage as _get_storage
@@ -2756,13 +3354,17 @@ def make_create_handler(
                 # was authored under — never a fresh default.  A corrupt
                 # stamp is a loud 400, mirroring the rehydrate contract; an
                 # unstamped (legacy) source forks unstamped.
-                from turnstone.core.memory import resolve_workstream
                 from turnstone.core.personas import snapshot_from_config
                 from turnstone.core.storage._registry import get_storage as _get_storage
 
                 _st = _get_storage()
-                resume_target = await asyncio.to_thread(resolve_workstream, resume_ws_id_raw)
-                if _st is not None and resume_target:
+                # ``create_validate_request`` already canonicalized this value
+                # after the source ACL check. Do not feed that canonical id
+                # back through alias-first resolution: another row may legally
+                # use the 32-char id as its alias and would lend this fork the
+                # wrong construction-time persona.
+                resume_target = resume_ws_id_raw
+                if _st is not None:
                     try:
                         persona_snapshot = snapshot_from_config(
                             await asyncio.to_thread(_st.load_workstream_config, resume_target) or {}
@@ -2822,7 +3424,40 @@ def make_create_handler(
                 kwargs["persona_snapshot"] = persona_snapshot
             # Deferred emit — committed below post-attachment-
             # validation. See handler docstring's Ordering invariants.
-            ws = await asyncio.to_thread(mgr.create, defer_emit_created=True, **kwargs)
+            create_task = asyncio.ensure_future(
+                asyncio.to_thread(mgr.create, defer_emit_created=True, **kwargs)
+            )
+            try:
+                ws = await asyncio.shield(create_task)
+            except BaseException:
+                # The request may disappear while register/build_session is in
+                # a worker. Settle it, then roll back the exact returned
+                # reservation before propagating cancellation. This bracket
+                # begins before ``mgr.create`` rather than after it.
+                while not create_task.done():
+                    try:
+                        await asyncio.shield(create_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except BaseException:
+                        break
+                if (
+                    create_task.done()
+                    and not create_task.cancelled()
+                    and create_task.exception() is None
+                ):
+                    created = create_task.result()
+                    try:
+                        await _settle_admitted(asyncio.to_thread(_discard_and_delete, created))
+                    except BaseException:
+                        log.warning(
+                            "ws.create.cancelled_cleanup_failed ws=%s",
+                            created.id[:8],
+                            exc_info=True,
+                        )
+                raise
+        except WorkstreamAlreadyExistsError:
+            return JSONResponse({"error": "Workstream already exists"}, status_code=409)
         except RuntimeError as exc:
             # ``SessionManager.create`` documents RuntimeError as
             # "manager at capacity" — translate to 429 (rate-limit /
@@ -2865,68 +3500,137 @@ def make_create_handler(
         # ``mgr.discard`` (no ``emit_closed`` because the create was
         # deferred) + ``delete_workstream`` for the storage row. See
         # handler docstring's Ordering invariants for the rationale.
-        attachment_ids: list[str] = []
-        if uploaded_files:
-            saved_ids, save_err = await asyncio.to_thread(
-                validate_and_save_uploaded_files, uploaded_files, ws.id, uid
-            )
-            if save_err is not None:
-                from turnstone.core.memory import delete_workstream as _delete_ws
-
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(mgr.discard, ws.id)
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(_delete_ws, ws.id)
-                return save_err
-            attachment_ids = saved_ids
-
-        # --- Commit the deferred emit_created ----------------------------
-        # Synchronous: in-memory non-blocking work on every kind
-        # (interactive: no-op stub; coord: dict + ``queue.put_nowait``).
-        mgr.commit_create(ws)
-
-        # --- Audit emit --------------------------------------------------
-        if audit_emit is not None:
+        async def _rollback_uncommitted_create() -> None:
             try:
-                audit_emit(request, ws, body, uid)
-            except Exception:
-                # Mirrors make_close_handler / make_cancel_handler /
-                # make_open_handler — audit-write failures shouldn't
-                # surface as HTTP 500. Log + continue.
+                await _settle_admitted(asyncio.to_thread(_discard_and_delete, ws))
+            except BaseException:
+                # Rollback is best-effort at the HTTP boundary, but the exact
+                # conditional delete prevents a cleanup failure from touching
+                # a replacement incarnation.
                 log.warning(
-                    "ws.create.audit_failed ws=%s",
-                    ws.id[:8] if ws.id else "",
+                    "ws.create.rollback_failed ws=%s",
+                    ws.id[:8],
                     exc_info=True,
                 )
 
-        # --- Per-kind post-install ---------------------------------------
-        extra_response: dict[str, Any] = {}
-        if cfg.create_post_install is not None:
-            extra_response = await cfg.create_post_install(
-                request,
-                ws,
-                body,
-                uid,
-                skill_data,
-                applied_skill_version,
-                attachment_ids,
-            )
+        committed = False
+        try:
+            attachment_ids: list[str] = []
+            if uploaded_files:
+                saved_ids, save_err = cast(
+                    "tuple[list[str], JSONResponse | None]",
+                    await _finish_before_unwind(
+                        asyncio.to_thread(
+                            validate_and_save_uploaded_files,
+                            uploaded_files,
+                            ws.id,
+                            uid,
+                        )
+                    ),
+                )
+                if save_err is not None:
+                    return save_err
+                attachment_ids = saved_ids
 
-        create_payload: dict[str, Any] = {
-            "ws_id": ws.id,
-            "name": ws.name,
-            "resumed": bool(extra_response.get("resumed", False)),
-            "message_count": int(extra_response.get("message_count", 0)),
-            "attachment_ids": attachment_ids,
-        }
-        if extra_response.get("initial_message_status"):
-            # Present only when the post-install hook could NOT deliver
-            # the initial message (raced live worker, interjection queue
-            # full) — the workstream exists, but a bare 200 would read as
-            # "first message accepted".  Mirrors /send's in-body
-            # ``queue_full`` backpressure surface.
-            create_payload["initial_message_status"] = str(extra_response["initial_message_status"])
-        return JSONResponse(create_payload)
+            # --- Kind-specific transaction gate -------------------------
+            # Interactive performs its storage fork here: after every upload
+            # is known-good, while emit_created/audit/global UI publication
+            # are still deferred. A typed refusal therefore leaves no
+            # advertised phantom.
+            pre_commit_response: dict[str, Any] = {}
+            if cfg.create_pre_commit is not None:
+                pre_commit_response = await _finish_before_unwind(
+                    cfg.create_pre_commit(request, ws, body, uid)
+                )
+
+            # --- Kind-specific pre-publication setup --------------------
+            # Keep fallible storage/config preparation outside the manager
+            # lifecycle lock. The hook may only prepare bounded publication
+            # data; live events, watch registration and worker dispatch are
+            # committed by the emitter/post-install phases below.
+            prepare_response: dict[str, Any] = {}
+            if cfg.create_prepare_install is not None:
+                prepare_response = await _finish_before_unwind(
+                    cfg.create_prepare_install(
+                        request,
+                        ws,
+                        body,
+                        uid,
+                        skill_data,
+                        applied_skill_version,
+                        attachment_ids,
+                    )
+                )
+
+            # --- Commit the deferred emit_created ------------------------
+            # A concurrent close/delete may retire a caller-known id while
+            # the fork transaction runs. Treat losing the exact reserved
+            # Workstream object as a conflict; never audit or advertise it.
+            if not mgr.commit_create(ws):
+                raise CreatePreCommitError(
+                    "Workstream creation was superseded",
+                    status_code=409,
+                )
+            committed = True
+
+            # --- Audit emit ----------------------------------------------
+            if audit_emit is not None:
+                try:
+                    audit_emit(request, ws, body, uid)
+                except Exception:
+                    # Mirrors make_close_handler / make_cancel_handler /
+                    # make_open_handler — audit-write failures shouldn't
+                    # surface as HTTP 500. Log + continue.
+                    log.warning(
+                        "ws.create.audit_failed ws=%s",
+                        ws.id[:8] if ws.id else "",
+                        exc_info=True,
+                    )
+
+            # --- Per-kind post-install -----------------------------------
+            extra_response = {**pre_commit_response, **prepare_response}
+            if cfg.create_post_install is not None:
+                post_install_response = cast(
+                    "dict[str, Any]",
+                    await _finish_before_unwind(
+                        cfg.create_post_install(
+                            request,
+                            ws,
+                            body,
+                            uid,
+                            skill_data,
+                            applied_skill_version,
+                            attachment_ids,
+                        )
+                    ),
+                )
+                extra_response.update(post_install_response)
+
+            create_payload: dict[str, Any] = {
+                "ws_id": ws.id,
+                "name": ws.name,
+                "resumed": bool(extra_response.get("resumed", False)),
+                "message_count": int(extra_response.get("message_count", 0)),
+                "attachment_ids": attachment_ids,
+            }
+            if extra_response.get("initial_message_status"):
+                # Present only when the post-install hook could NOT deliver
+                # the initial message (raced live worker, interjection queue
+                # full) — the workstream exists, but a bare 200 would read as
+                # "first message accepted". Mirrors /send's in-body
+                # ``queue_full`` backpressure surface.
+                create_payload["initial_message_status"] = str(
+                    extra_response["initial_message_status"]
+                )
+            return JSONResponse(create_payload)
+        except CreatePreCommitError as exc:
+            return JSONResponse(
+                {"error": exc.public_message},
+                status_code=exc.status_code,
+            )
+        finally:
+            if not committed:
+                await _rollback_uncommitted_create()
 
     return create
 
@@ -3030,6 +3734,7 @@ def make_list_handler(cfg: SessionEndpointConfig) -> Handler:
                         "user_id": ws.user_id,
                         "project_id": project_id or None,
                         "persona": persona or None,
+                        "persistence_state": workstream_persistence_state(ws),
                     }
                 )
             return rows
@@ -3385,6 +4090,13 @@ def _resume_cursor_and_trim(
     """
     if awaiting_approval or not messages:
         return messages, None
+    # A journal row is visible through the live history handoff but has not
+    # completed its durable acknowledgement yet. It is already part of the
+    # authoritative REST snapshot; trimming it in favour of ring replay would
+    # discard exactly the row the handoff journal exists to preserve (and a
+    # tool-call-only row need not be reconstructable from numeric events).
+    if any(m.get("_pending_durability") for m in messages):
+        return messages, None
     can_replay = getattr(ui, "can_replay_from", None)
     if not callable(can_replay):
         return messages, None
@@ -3418,11 +4130,19 @@ def _resume_cursor_and_trim(
     return messages[:orphan_idx], cursor
 
 
-# One /history flight's result: (messages, resume cursor, load_failed).
-# ``load_failed`` is True only when ``load_messages`` RAISED — never for
-# a legitimately empty workstream; see ``_reconstruct`` inside
-# :func:`make_history_handler`.
-_HistoryFlightResult: TypeAlias = tuple[list[dict[str, Any]], int | None, bool]
+# One /history flight's result: (messages, resume cursor, load_failed,
+# live-handoff token, cold storage-only read).
+# ``load_failed`` is True when the durable load or the canonical public
+# decoration/projection pipeline raised — never for a legitimately empty
+# workstream; see ``_reconstruct`` inside :func:`make_history_handler`.
+_HistoryFlightResult: TypeAlias = tuple[list[dict[str, Any]], int | None, bool, str | None, bool]
+"""``(messages, cursor, load_failed, handoff_token, storage_fallback)``.
+
+``storage_fallback`` marks the cold storage-only read — the workstream is
+not loaded on this node, so there is no live writer and no splice to
+witness. The transcript is authoritative but carries no handoff token: it
+can seed a render and a tokenless stream bootstrap, never a cursor handoff.
+"""
 
 
 def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
@@ -3539,16 +4259,16 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
             if err_tenant is not None:
                 return err_tenant
 
-        # Existence + kind check. The workstream may live only in
-        # storage (closed coordinators are still readable via /history
-        # without rehydrating; persisted-but-not-loaded interactives
-        # are likewise readable). Mirrors the pre-lift coord
-        # ``_resolve_coordinator_or_404`` ladder: in-memory mgr.get →
-        # storage row + kind check → 404. Falling back to storage
-        # without the kind check would leak interactive rows through
-        # the coord endpoint (and vice versa) on a process that
-        # shares storage with the other kind. ``cfg.list_kind`` is
-        # guaranteed non-None by the misconfig gate above.
+        # Existence + kind check — a read verb that never (re)hydrates.  A
+        # session is loaded exactly when a pane opened this workstream on
+        # this node (panes POST /open before /history), which is the only
+        # case with a live writer whose REST -> SSE splice needs witnessing;
+        # its capture carries the opaque handoff token.  A not-loaded row has
+        # no live writer and is served straight from storage, tokenless: the
+        # payload seeds a render plus the tokenless stream bootstrap, never a
+        # cursor handoff.  Constructing a ChatSession here would turn history
+        # browsing into session-pool churn (and a capacity-refusal 503) for
+        # consumers that never open a stream.
         storage = getattr(request.app.state, "auth_storage", None)
         live_session = mgr.get(ws_id)
         if live_session is None:
@@ -3578,19 +4298,15 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         # dispatched after a rewind/retry must never join a flight whose
         # load_messages ran before it — the joined pre-rewind payload
         # reads as fresh truth client-side (the dispatch stamp is
-        # current) and reopened the over-rewind window.  Cold workstream:
-        # generation 0; the first post-load truncation bumps to 1, so a
-        # cold flight can never be joined across a rewind either.
+        # current) and reopened the over-rewind window.
         # mgr.get returns the Workstream WRAPPER — the counter lives on
         # its ChatSession (the G7 harness caught a direct getattr
         # silently defaulting to 0 forever, which re-enabled joining).
         # Typed access, not getattr chains, so mypy carries the shape.
-        # A cold/detached workstream keys on None, NEVER 0: an eviction
-        # or close landing inside a held flight's window would otherwise
-        # let a post-truncation request join a generation-0 live flight
-        # (rewinds need a live session, so two COLD flights are always
-        # mutually safe — and a rehydrated session restarting at 0 can
-        # never share the manager slot with its evicted predecessor).
+        # A loaded session (pane-opened) has a concrete generation here; a
+        # cold row keys its flight on ``None`` — every cold read shares one
+        # storage-only reconstruction, and a session installed mid-flight
+        # only changes LATER requests' keys.
         live_gen: int | None = (
             live_session.session._history_generation
             if live_session is not None and live_session.session is not None
@@ -3621,19 +4337,51 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         # add a join-vs-cancel race (a late joiner grabbing a task the
         # last leaver is cancelling) to a seam that is race-free
         # precisely because the flight is never cancelled.
-        messages, cursor, load_failed = await asyncio.shield(task)
+        messages, cursor, load_failed, handoff_token, storage_fallback = await asyncio.shield(task)
         if joined and load_failed:
-            # The shared draw hit a transient ``load_messages`` failure
-            # and produced the 200-empty payload.  Both clients render a
-            # 200-empty as an authoritative empty pane (the seedless
-            # clear_ui path has no SSE redelivery to repair it), so
-            # sharing the failed draw would fan ONE storage blip out as
-            # a pane wipe across every joiner.  Joiners therefore retry
-            # once, independently and unshared — exactly the blast
-            # radius the un-coalesced endpoint had.  The flight OWNER
-            # keeps its failed draw (same as a lone request today).
+            # The shared draw hit a transient durable-load or canonical
+            # public-projection failure and produced an unavailable result.
+            # Retry once independently so one transient fault is not fanned
+            # out to every joined pane.
+            #
+            # Before the explicit 503 contract this result was a 200-empty
+            # payload, which both clients rendered as authoritative history;
+            # with a pending handoff journal it could instead be a 200
+            # containing only the pending suffix plus a valid token.  Either
+            # shape hid the older durable transcript and cleared a repair
+            # latch on incomplete truth.  The final ``load_failed`` bit must
+            # therefore survive this retry and drive the non-2xx below.
             log.debug("ws.history.coalesced_retry ws=%s", ws_id[:8])
-            messages, cursor, _ = await _reconstruct(mgr, storage, request.app.state, ws_id, limit)
+            messages, cursor, load_failed, handoff_token, storage_fallback = await _reconstruct(
+                mgr, storage, request.app.state, ws_id, limit
+            )
+        if load_failed:
+            # Never authorize a browser to replace its transcript or complete
+            # a REST -> SSE handoff from an incomplete durable prefix.  The
+            # pending journal merge above remains useful internally (and for
+            # diagnostics), but a client cannot distinguish "pending-only"
+            # from complete history.  Both panes already treat non-2xx as a
+            # render no-op; handoff-repair mode retains its latch and retries
+            # without opening a cursorless/tokenless EventSource.
+            return JSONResponse(
+                {"error": "History temporarily unavailable"},
+                status_code=503,
+            )
+        if not handoff_token and not storage_fallback:
+            # A 200 history payload is allowed to seed a live EventSource, so
+            # tokenless snapshots are not authoritative: a row admitted after
+            # this response and before fresh listener registration would be
+            # absent from both halves.  Production ChatSession captures always
+            # return a token; reaching this arm means rehydration raced close or
+            # a session implementation lacks the handoff protocol.  The
+            # deliberate tokenless 200 is the cold storage-only read for any
+            # workstream not loaded on this node: its payload may seed a
+            # render plus a tokenless stream bootstrap, never a cursor handoff.
+            log.warning("ws.history.handoff_unavailable ws=%s", ws_id[:8])
+            return JSONResponse(
+                {"error": "History temporarily unavailable"},
+                status_code=503,
+            )
         # Each awaiter serializes its own JSONResponse from the shared
         # payload — cost parity with the un-coalesced endpoint (one
         # render per request).  Sharing pre-rendered bytes across
@@ -3641,7 +4389,14 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         # result to (bytes, flag), splitting the _HistoryFlightResult
         # contract the retry path still needs, for a herd-only
         # serialization micro-win.
-        return JSONResponse({"ws_id": ws_id, "messages": messages, "cursor": cursor})
+        return JSONResponse(
+            {
+                "ws_id": ws_id,
+                "messages": messages,
+                "cursor": cursor,
+                "handoff_token": handoff_token,
+            }
+        )
 
     async def _run_flight(
         key: tuple[str, int, int | None],
@@ -3681,16 +4436,38 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         client connects, the stream answers ``replay_truncated`` and
         the client resyncs.
 
-        Returns ``(messages, cursor, load_failed)`` — ``load_failed``
-        is True only when ``load_messages`` RAISED (transient storage
-        failure), never for a legitimately empty workstream.  The
-        caller uses it to keep an exception-empty payload from fanning
-        a pane wipe out to coalesced joiners (see the joiner retry in
-        ``history``).
+        Returns ``(messages, cursor, load_failed, handoff_token,
+        storage_fallback)`` —
+        ``load_failed`` is True when either the durable load or the canonical
+        public decoration/projection pipeline failed, never for a legitimately
+        empty workstream.  The caller uses it both to retry a joined shared
+        failure independently and to return 503 instead of authorizing an
+        incomplete or unprojected history render.
         """
-        live_session = mgr.get(ws_id)
         load_failed = False
+        storage_fallback = False
+        live_session = mgr.get(ws_id)
+        if live_session is None or live_session.session is None:
+            # Cold storage-only read — /history never (re)hydrates. A loaded
+            # session exists exactly when a pane opened this workstream on
+            # this node, the only case with a live writer whose splice needs
+            # witnessing. Tokenless payloads cannot seed a cursor handoff;
+            # the stream bootstrap re-renders. A vanished durable row keeps
+            # the 503 path: the caller's existence gates saw the row moments
+            # ago, so this is a delete race, not an empty workstream.
+            live_session = None
+            if storage is None:
+                return [], None, True, None, False
+            try:
+                row_probe = await asyncio.to_thread(storage.get_workstream, ws_id)
+            except Exception:
+                log.warning("ws.history.cold_lookup_failed ws=%s", ws_id[:8], exc_info=True)
+                return [], None, True, None, False
+            if row_probe is None:
+                return [], None, True, None, False
+            storage_fallback = True
         messages: list[dict[str, Any]] = []
+        handoff_token: str | None = None
         # Fresh-connect resume cursor (the ``Last-Event-ID`` the client
         # opens its initial SSE with).  Non-None only when the trailing
         # turn is an executing in-flight orphan that the ring buffer can
@@ -3698,35 +4475,87 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         # on every other path (and on any decoration failure below) so
         # the client takes the synthetic-snapshot floor.
         cursor: int | None = None
-        if storage is not None:
+        live_chat = live_session.session if live_session is not None else None
+        capture_handoff = (
+            concrete_method(live_chat, "capture_history_handoff") if live_chat is not None else None
+        )
+        if storage is not None or live_chat is not None:
             try:
                 # repair=False — display read; include_compaction=True so a
                 # persisted compaction marker projects as an in-place
                 # source="compaction" system row and the UI re-renders its
                 # compaction card after a reload.  See the
                 # reconstruct_messages docstring for both flags.
-                messages = await asyncio.to_thread(
-                    storage.load_messages,
-                    ws_id,
-                    limit=limit,
-                    repair=False,
-                    include_compaction=True,
-                )
+                def _load_messages(overscan: int = 0) -> list[dict[str, Any]]:
+                    # ``overscan`` is the pending-journal size: widening the
+                    # tail window by that many rows guarantees any committed
+                    # twin of a pending key is inside the loaded window, so
+                    # the merge never re-renders an already-committed row at
+                    # the transcript tail (out of order).
+                    if storage is None:
+                        return []
+                    return cast(
+                        "list[dict[str, Any]]",
+                        storage.load_messages(
+                            ws_id,
+                            limit=limit + max(0, overscan),
+                            repair=False,
+                            include_compaction=True,
+                        ),
+                    )
+
+                if capture_handoff is not None:
+                    messages, handoff_token = await asyncio.to_thread(
+                        capture_handoff, _load_messages
+                    )
+                    if storage is None:
+                        # No route-visible storage: the durable prefix is
+                        # unreadable here, so this render must not claim
+                        # transcript authority. Serve the live/journal view
+                        # as a deliberate tokenless render — the client's
+                        # bootstrap downgrade owns convergence via clear_ui.
+                        handoff_token = None
+                        storage_fallback = True
+                    # The storage read was tail-bounded to limit+overscan;
+                    # journal rows append after it, so re-apply the public
+                    # response bound to the merged authoritative view.
+                    messages = messages[-limit:]
+                else:
+                    messages = await asyncio.to_thread(_load_messages)
             except Exception:
-                # Warning, not debug: this 200-empty renders as an
-                # authoritative pane wipe in both clients, and under
-                # coalescing it is also what triggers the joiner retry —
-                # a storage blip here is operationally interesting for
-                # the same reason ``decoration_failed`` below is.
+                # Warning, not debug: the caller returns 503 and handoff
+                # repair remains latched until a later complete read.  Under
+                # coalescing this also triggers the joiner's one independent
+                # retry, so a storage blip here is operationally interesting
+                # for the same reason ``decoration_failed`` below is.
                 load_failed = True
                 log.warning("ws.history.load_failed ws=%s", ws_id[:8], exc_info=True)
+                # Preserve the exact pending journal suffix in the internal
+                # reconstruction result as a fail-visible floor.  It is NOT
+                # complete browser truth without the durable prefix: the
+                # caller keeps ``load_failed=True`` and returns 503, so no
+                # handoff token from this fallback can authorize a render.
+                if capture_handoff is not None:
+                    try:
+                        messages, handoff_token = await asyncio.to_thread(
+                            capture_handoff,
+                            lambda _overscan: [],
+                        )
+                        messages = messages[-limit:]
+                    except Exception:
+                        log.warning(
+                            "ws.history.pending_handoff_failed ws=%s",
+                            ws_id[:8],
+                            exc_info=True,
+                        )
         # Audit-trail decoration — attach persisted intent_verdict and
         # output_assessment data to each assistant.tool_calls entry so
         # the dashboard's history replay paints the same verdict pills
         # / output-warning bubbles the live SSE path shows.  Both
-        # storage queries are off-loop via ``to_thread``.  Best-effort:
-        # any failure leaves messages undecorated — replay degrades to
-        # the pre-decoration shape rather than 500-ing.
+        # storage queries are off-loop via ``to_thread``.  This is part of the
+        # authoritative public-history boundary: an uncaught failure anywhere
+        # in the decoration/reasoning/projection pass makes the reconstruction
+        # unavailable rather than authorizing its raw intermediate shape.
         if messages:
             try:
                 from turnstone.core.history_decoration import (
@@ -3763,9 +4592,11 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                 surface_persisted_reasoning = True
                 resolved_alias = ""
                 resolved_registry: Any = None
-                if live_session is not None:
-                    resolved_registry = getattr(live_session, "_registry", None)
-                    resolved_alias = getattr(live_session, "_model_alias", "") or ""
+                if live_chat is not None:
+                    # ``live_session`` is the Workstream wrapper; the registry
+                    # and alias live on the wrapped ChatSession.
+                    resolved_registry = getattr(live_chat, "_registry", None)
+                    resolved_alias = getattr(live_chat, "_model_alias", "") or ""
                 if not resolved_alias and storage is not None:
                     # Off-loop the sync storage call (mirrors get_workstream
                     # / load_messages / load_verdict_indexes / decorate /
@@ -3861,21 +4692,33 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                             if isinstance(steps, list) and steps:
                                 tc["agent_steps"] = steps
             except Exception:
-                # Operationally interesting: a persistent decoration
-                # failure (missing migration, driver mismatch, schema
-                # drift) silently strips verdict pills + output
-                # warnings from every reload of every workstream.
-                # Log at warning so it surfaces in normal log review
-                # rather than only when DEBUG is on.  Reset the cursor so a
-                # mid-pipeline failure can't pair an un-trimmed orphan with
-                # a fast-forward cursor (which would double-render it).
+                # This pipeline is the public-schema and privacy boundary, not
+                # optional decoration. Raw reconstructed rows may carry
+                # provider-native reasoning/signatures, producer identity,
+                # audit provenance, and storage idempotency fields. Never let
+                # an exception skip that boundary and turn its partially
+                # transformed input into an authoritative token-bearing 200.
+                # Clear every output axis and let the caller return 503 (or a
+                # joined request retry once independently).
+                messages = []
                 cursor = None
+                handoff_token = None
+                load_failed = True
                 log.warning(
                     "ws.history.decoration_failed ws=%s",
                     ws_id[:8],
                     exc_info=True,
                 )
-        return messages, cursor, load_failed
+        # Internal audit/journal metadata is never part of the public history
+        # schema. Projection constructs fresh dicts and drops it; this final
+        # scrub remains defense in depth for any future canonical projection
+        # that preserves an input mapping. Provenance can carry an acting
+        # principal id, so that key must always fail closed.
+        for message in messages:
+            message.pop("_commit_key", None)
+            message.pop("_pending_durability", None)
+            message.pop("_provenance", None)
+        return messages, cursor, load_failed, handoff_token, storage_fallback
 
     return history
 
@@ -4183,6 +5026,7 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
                 "state": ws.state.value,
                 "user_id": ws.user_id,
                 "kind": ws.kind,
+                "persistence_state": workstream_persistence_state(ws),
                 "pending_approval": pending_approval,
                 "pending_approval_details": pending_approval_details,
             }
@@ -4256,6 +5100,7 @@ def _make_dispatch_attempt(
     ordered_taken: list[str],
     send_id: str,
     acting_uid: str,
+    client_send_id: str = "",
     defer_fidelity: bool = False,
 ) -> Callable[[ChatSession], tuple[bool, dict[str, Any]]]:
     """Build one atomic queue-or-spawn attempt bound to ONE session capture.
@@ -4318,13 +5163,21 @@ def _make_dispatch_attempt(
             if defer_fidelity and (resolved_atts or len(message) > INTERJECTION_CAP_CHARS):
                 queue_outcome["rejected"] = "defer_full_fidelity"
                 return
+            admission = session_worker.claimed_slot_queue_admission(ws, acting_uid)
+            if admission is None:
+                queue_outcome["rejected"] = "cross_user_interjection"
+                return
+            _claimed, queue_kwargs = admission
             try:
-                cleaned, priority, msg_id = session.queue_message(
-                    message,
-                    attachment_ids=list(ordered_taken),
-                    queue_msg_id=send_id or None,
-                    interjector_user_id=acting_uid,
+                queue_kwargs.update(
+                    {
+                        "attachment_ids": list(ordered_taken),
+                        "queue_msg_id": send_id or None,
+                    }
                 )
+                if client_send_id:
+                    queue_kwargs["client_send_id"] = client_send_id
+                cleaned, priority, msg_id = session.queue_message(message, **queue_kwargs)
             except AttachmentsNotQueueableError:
                 queue_outcome["rejected"] = "attachments_busy"
                 return
@@ -4340,6 +5193,12 @@ def _make_dispatch_attempt(
             queue_outcome["priority"] = priority
             queue_outcome["msg_id"] = msg_id
 
+        def _before_spawn() -> bool:
+            if session_worker.foreign_queue_conflict(session, acting_uid):
+                queue_outcome["rejected"] = "cross_user_interjection"
+                return False
+            return True
+
         def _run() -> None:
             me = threading.current_thread()
             try:
@@ -4348,6 +5207,8 @@ def _make_dispatch_attempt(
                     kwargs["attachments"] = resolved_atts
                 if send_id:
                     kwargs["send_id"] = send_id
+                if client_send_id:
+                    kwargs["client_send_ids"] = (client_send_id,)
                 # Fresh turn: rebind per-user MCP credentials to the
                 # authenticated sender. Bound here (not via a send()
                 # kwarg) so per-kind session stubs with explicit send
@@ -4380,7 +5241,10 @@ def _make_dispatch_attempt(
             ws,
             enqueue=_enqueue,
             run=_run,
+            expected_session=session,
+            before_spawn=_before_spawn,
             thread_name=f"send-worker-{ws.id[:8]}",
+            principal_id=acting_uid,
         )
         if ok and not queue_outcome and cfg.spawn_metrics is not None:
             # Fresh spawn — the kind's per-turn metrics fire exactly once,
@@ -4692,6 +5556,18 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
         message = (body.get("message") or "").strip()
         if not message:
             return JSONResponse({"error": "message is required"}, status_code=400)
+        raw_client_send_id = body.get("client_send_id")
+        if raw_client_send_id is None:
+            client_send_id = ""
+        elif not isinstance(raw_client_send_id, str) or not _CLIENT_SEND_ID_RE.fullmatch(
+            raw_client_send_id
+        ):
+            return JSONResponse(
+                {"error": "client_send_id must match [A-Za-z0-9_-]{1,128}"},
+                status_code=400,
+            )
+        else:
+            client_send_id = raw_client_send_id
 
         if cfg.tenant_check is not None:
             err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
@@ -4854,6 +5730,7 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                         ordered_taken=ordered_taken,
                         send_id=pending_msg_id,
                         acting_uid=acting_uid,
+                        client_send_id=client_send_id,
                         defer_fidelity=True,
                     ),
                 )
@@ -4918,6 +5795,8 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                         "message": cleaned_display,
                         "priority": pending_priority,
                         "msg_id": pending_msg_id,
+                        **({"sender": acting_uid} if acting_uid else {}),
+                        **({"client_send_id": client_send_id} if client_send_id else {}),
                     },
                 )
             return JSONResponse(
@@ -4950,6 +5829,7 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
             ordered_taken=ordered_taken,
             send_id=send_id,
             acting_uid=acting_uid,
+            client_send_id=client_send_id,
         )
         session_now = ws.session
         if session_now is None:
@@ -4960,6 +5840,23 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
             if window_resp is None:  # unreachable: only the barrier probe returns None
                 return JSONResponse({"error": "defer failed"}, status_code=500)
             return window_resp
+        if queue_outcome.get("rejected") == "cross_user_interjection":
+            # A different participant tried to interject into someone else's
+            # in-flight turn or to claim a fresh turn while that participant's
+            # persistence-failure-retained input still awaits delivery.
+            return JSONResponse(
+                {
+                    "status": "cross_user_interjection",
+                    "error": (
+                        "Another participant's turn is in progress. Wait for it "
+                        "to finish, then send your message."
+                    ),
+                    "attached_ids": [],
+                    "dropped_attachment_ids": list(requested_ids),
+                },
+                status_code=409,
+            )
+
         if not ok:
             if ws._closed:
                 # ``send`` refused because the workstream closed between our
@@ -4987,24 +5884,6 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                 }
             )
 
-        if queue_outcome.get("rejected") == "cross_user_interjection":
-            # A different participant tried to interject into someone else's
-            # in-flight turn (see CrossUserInterjectionError). 409 Conflict so
-            # the client can surface "wait for the current turn" and resend as
-            # a fresh turn under their own identity.
-            return JSONResponse(
-                {
-                    "status": "cross_user_interjection",
-                    "error": (
-                        "Another participant's turn is in progress. Wait for it "
-                        "to finish, then send your message."
-                    ),
-                    "attached_ids": [],
-                    "dropped_attachment_ids": list(requested_ids),
-                },
-                status_code=409,
-            )
-
         dropped = [aid for aid in requested_ids if aid not in taken_set]
         if queue_outcome:
             # Reused a live worker; ``queue_message`` succeeded.  Best-
@@ -5021,6 +5900,8 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                         "message": queue_outcome["cleaned"],
                         "priority": queue_outcome["priority"],
                         "msg_id": queue_outcome["msg_id"],
+                        **({"sender": acting_uid} if acting_uid else {}),
+                        **({"client_send_id": client_send_id} if client_send_id else {}),
                     },
                 )
             return JSONResponse(

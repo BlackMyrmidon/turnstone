@@ -33,6 +33,7 @@ import pytest
 
 from tests._session_helpers import make_session
 from turnstone.core.session import COMPACTION_SOURCE, COMPACTION_SUMMARY_LABEL
+from turnstone.core.storage import get_storage
 from turnstone.core.trajectory import turns_from_dicts
 
 
@@ -42,17 +43,49 @@ def session(tmp_db, mock_openai_client):
     the summary output reserve is tiny and the carry budget is easy to compute
     (reserve=100, margin=500, spare=9_400, budget=min(2_500, 9_400)=2_500
     tokens → 10_000 chars at the uncalibrated 4.0 chars/token)."""
-    return make_session(
+    s = make_session(
         client=mock_openai_client,
         context_window=10_000,
         compact_max_tokens=100,
         max_tokens=1_000,
         tool_timeout=10,
     )
+    _register_session_workstream(s)
+    return s
+
+
+def _register_session_workstream(session):
+    """Give direct ChatSession fixtures their production parent row."""
+    get_storage().register_workstream(
+        session.ws_id,
+        user_id=session._user_id,
+        kind=session._kind,
+        parent_ws_id=session._parent_ws_id,
+    )
+    return session
 
 
 def _stub_summary(text: str = "DENSE"):
-    return SimpleNamespace(content=text, finish_reason="stop")
+    return SimpleNamespace(
+        content=text,
+        finish_reason="stop",
+        producer="test-summary-provider",
+    )
+
+
+def _summary_runtime(session):
+    return session._build_summary_runtime(session._primary_lane())
+
+
+def _carry_budget_chars(session, carries: int = 1) -> int:
+    return session._compaction_engine.carry_budget_chars(
+        _summary_runtime(session),
+        carries,
+    )
+
+
+def _summary_output_tokens(session) -> int:
+    return session._compaction_engine.summary_output_tokens(_summary_runtime(session))
 
 
 # ---------------------------------------------------------------------------
@@ -168,12 +201,12 @@ class TestCarryBudget:
         # overhead=0, reserve=100 (compact_max_tokens), margin=500,
         # spare=9_400; min(10_000 // 4, 9_400) = 2_500 tokens * 4.0 chars/token.
         _isolate_overhead(session)
-        assert session._carry_budget_chars() == 10_000
+        assert _carry_budget_chars(session) == 10_000
 
     def test_floors_on_tiny_window(self, tmp_db, mock_openai_client):
         tiny = make_session(client=mock_openai_client, context_window=1_000, tool_timeout=10)
         _isolate_overhead(tiny)
-        assert tiny._carry_budget_chars() == tiny._MIN_CARRY_BUDGET_CHARS
+        assert _carry_budget_chars(tiny) == tiny._compaction_engine.MIN_CARRY_BUDGET_CHARS
 
     @pytest.mark.parametrize("carries", [1, 2])
     def test_overhead_reserve_and_carries_fit_window_at_shipped_defaults(
@@ -188,9 +221,9 @@ class TestCarryBudget:
         away."""
         s = make_session(client=mock_openai_client, tool_timeout=10)
         _isolate_overhead(s, system_tokens=4_000)  # a chunky composed prompt
-        reserve = s._summary_output_tokens()
-        per_carry_tokens = s._carry_budget_chars(carries) / s._chars_per_token
-        margin = int(s.context_window * s._SUMMARY_SAFETY_MARGIN)
+        reserve = _summary_output_tokens(s)
+        per_carry_tokens = _carry_budget_chars(s, carries) / s._chars_per_token
+        margin = int(s.context_window * s._compaction_engine.SUMMARY_SAFETY_MARGIN)
         assert 4_000 + reserve + carries * per_carry_tokens + margin <= s.context_window
 
     def test_budget_shrinks_with_prompt_overhead(self, tmp_db, mock_openai_client):
@@ -198,9 +231,9 @@ class TestCarryBudget:
         a bigger system prompt leaves less to carry."""
         s = make_session(client=mock_openai_client, tool_timeout=10)
         _isolate_overhead(s, system_tokens=0)
-        roomy = s._carry_budget_chars(2)
+        roomy = _carry_budget_chars(s, 2)
         _isolate_overhead(s, system_tokens=8_000)
-        assert s._carry_budget_chars(2) < roomy
+        assert _carry_budget_chars(s, 2) < roomy
 
     def test_double_carry_splits_the_spare(self, tmp_db, mock_openai_client):
         """At shipped defaults the spare (window − overhead − reserve −
@@ -208,11 +241,11 @@ class TestCarryBudget:
         the solo quarter-window allowance."""
         s = make_session(client=mock_openai_client, tool_timeout=10)
         _isolate_overhead(s, system_tokens=2_000)
-        reserve = s._summary_output_tokens()
-        margin = int(s.context_window * s._SUMMARY_SAFETY_MARGIN)
+        reserve = _summary_output_tokens(s)
+        margin = int(s.context_window * s._compaction_engine.SUMMARY_SAFETY_MARGIN)
         spare = s.context_window - reserve - margin - 2_000
-        assert s._carry_budget_chars(2) == int((spare // 2) * s._chars_per_token)
-        assert s._carry_budget_chars(2) < s._carry_budget_chars(1)
+        assert _carry_budget_chars(s, 2) == int((spare // 2) * s._chars_per_token)
+        assert _carry_budget_chars(s, 2) < _carry_budget_chars(s, 1)
 
 
 class TestContinuationHintCarry:
@@ -353,8 +386,8 @@ class TestWindDownSpill:
         spare // 2, so two oversize carries land truncated to the shared
         budget instead of stacking two solo quarter-window allowances on top
         of the half-window summary reserve."""
-        s = make_session(client=mock_openai_client, tool_timeout=10)
-        per_carry = s._carry_budget_chars(2)
+        s = _register_session_workstream(make_session(client=mock_openai_client, tool_timeout=10))
+        per_carry = _carry_budget_chars(s, 2)
         ask = "ASK-HEAD " + "a" * (per_carry * 2) + " ASK-TAIL"
         spill = "PLAN-HEAD " + "b" * (per_carry * 2) + " PLAN-TAIL"
         s.messages = turns_from_dicts(
@@ -378,10 +411,11 @@ class TestWindDownSpill:
     def test_do_auto_compact_forwards_carry_spill(self, session):
         """The end-of-turn site passes carry_spill=stopped_to_compact through
         _do_auto_compact — pin the forwarding."""
+        generation = session._claim_generation()
         with patch.object(session, "_compact_messages", return_value=True) as cm:
-            session._do_auto_compact(my_generation=3, carry_spill=True)
+            session._do_auto_compact(my_generation=generation, carry_spill=True)
         assert cm.call_args.kwargs["carry_spill"] is True
-        assert cm.call_args.kwargs["my_generation"] == 3
+        assert cm.call_args.kwargs["my_generation"] == generation
 
 
 # ---------------------------------------------------------------------------
@@ -427,16 +461,18 @@ def _coord_client(tasks=None, children=None) -> MagicMock:
 def _coord_session(mock_openai_client, *, coord_client=..., **kwargs):
     from turnstone.core.workstream import WorkstreamKind
 
-    return make_session(
-        client=mock_openai_client,
-        context_window=10_000,
-        compact_max_tokens=100,
-        max_tokens=1_000,
-        tool_timeout=10,
-        kind=WorkstreamKind.COORDINATOR,
-        user_id="u1",
-        coord_client=_coord_client() if coord_client is ... else coord_client,
-        **kwargs,
+    return _register_session_workstream(
+        make_session(
+            client=mock_openai_client,
+            context_window=10_000,
+            compact_max_tokens=100,
+            max_tokens=1_000,
+            tool_timeout=10,
+            kind=WorkstreamKind.COORDINATOR,
+            user_id="u1",
+            coord_client=_coord_client() if coord_client is ... else coord_client,
+            **kwargs,
+        )
     )
 
 
@@ -488,8 +524,8 @@ class TestCoordinatorHandles:
         fails and they must revisit that trade rather than stack both.
         """
         coord = _coord_session(mock_openai_client)
-        interactive = make_session(
-            client=mock_openai_client, context_window=10_000, tool_timeout=10
+        interactive = _register_session_workstream(
+            make_session(client=mock_openai_client, context_window=10_000, tool_timeout=10)
         )
         prompts = []
         for s in (coord, interactive):
@@ -512,12 +548,14 @@ class TestCoordinatorHandles:
         children, so the reads are skipped entirely — not merely rendered
         empty — and its summary is what it was before this existed."""
         client = _coord_client()
-        s = make_session(
-            client=mock_openai_client,
-            context_window=10_000,
-            compact_max_tokens=100,
-            tool_timeout=10,
-            coord_client=client,  # present but irrelevant: kind decides
+        s = _register_session_workstream(
+            make_session(
+                client=mock_openai_client,
+                context_window=10_000,
+                compact_max_tokens=100,
+                tool_timeout=10,
+                coord_client=client,  # present but irrelevant: kind decides
+            )
         )
         text = _compact(s)
         assert "## Handles" not in text
@@ -616,14 +654,22 @@ class TestCoordinatorHandles:
         miscount comes from forgetting the term or from rendering before it.
         """
         s = _coord_session(mock_openai_client)
-        with patch.object(s, "_carry_budget_chars", wraps=s._carry_budget_chars) as budget:
+        with patch.object(
+            s._compaction_engine,
+            "carry_budget_chars",
+            wraps=s._compaction_engine.carry_budget_chars,
+        ) as budget:
             _compact(s, carry_spill=True)
-        assert budget.call_args[0][0] == 3  # handles + spill + ask
+        assert budget.call_args.args[1] == 3  # handles + spill + ask
 
         bare = _coord_session(mock_openai_client, coord_client=_coord_client([], []))
-        with patch.object(bare, "_carry_budget_chars", wraps=bare._carry_budget_chars) as budget:
+        with patch.object(
+            bare._compaction_engine,
+            "carry_budget_chars",
+            wraps=bare._compaction_engine.carry_budget_chars,
+        ) as budget:
             _compact(bare, carry_spill=True)
-        assert budget.call_args[0][0] == 2  # no handles, no third share
+        assert budget.call_args.args[1] == 2  # no handles, no third share
 
     def test_block_fits_the_budget_and_cuts_only_at_row_boundaries(
         self, tmp_db, mock_openai_client
@@ -633,7 +679,7 @@ class TestCoordinatorHandles:
         cannot resolve, dressed as one that can."""
         many = [{"id": f"tsk_{i:04d}", "title": "x" * 180, "status": "pending"} for i in range(60)]
         s = _coord_session(mock_openai_client, coord_client=_coord_client(many, CHILDREN))
-        budget = s._carry_budget_chars(1)
+        budget = _carry_budget_chars(s, 1)
         block = s._render_handles_block(*s._coordinator_handle_rows(), budget)
 
         assert len(block) <= budget
@@ -655,7 +701,7 @@ class TestCoordinatorHandles:
         s = _coord_session(mock_openai_client)
         s._ws_id = "ws-coord"
         with (
-            patch("turnstone.core.session.get_compaction_watermark", return_value=7),
+            patch.object(get_storage(), "get_compaction_watermark", return_value=7),
             patch("turnstone.core.session.save_message") as saved,
         ):
             _compact(s)

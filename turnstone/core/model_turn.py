@@ -38,18 +38,20 @@ Contract, held deliberately narrow:
 
 from __future__ import annotations
 
+import contextlib
 import random
 import time
 import uuid
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
     from types import EllipsisType
 
-    from turnstone.core.model_registry import ModelRegistry
+    from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
+from turnstone.core.admission import ModelAdmission
 from turnstone.core.deadline import DeadlineCancelledError
 from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
 from turnstone.core.log import get_logger
@@ -77,6 +79,9 @@ from turnstone.core.providers._protocol import (
     ModelCapabilities as ModelCapabilities,
 )
 from turnstone.core.providers._protocol import (
+    ProviderRequestMetrics as ProviderRequestMetrics,
+)
+from turnstone.core.providers._protocol import (
     StreamChunk as StreamChunk,
 )
 from turnstone.core.providers._protocol import (
@@ -93,11 +98,22 @@ from turnstone.core.providers._protocol import (
 from turnstone.core.providers._protocol import (
     merge_usage as merge_usage,
 )
+from turnstone.core.providers._protocol import (
+    serialized_tool_chars as serialized_tool_chars,
+)
 from turnstone.core.storage._utils import (
     _CLIENT_TOOL_CALL_BLOCK_TYPES,
     strip_orphan_client_tool_blocks,
 )
-from turnstone.core.trajectory import ProviderNative, ToolCall, Turn, dicts_from_turns
+from turnstone.core.trajectory import (
+    PROVENANCE_META_KEY,
+    ProviderNative,
+    ToolCall,
+    Turn,
+    TurnProvenance,
+    dicts_from_turns,
+    materialize_attachments,
+)
 
 log = get_logger(__name__)
 
@@ -112,7 +128,6 @@ _DRAIN_RETRIES = 2
 # synchronized re-issues amplify the very condition being retried
 # through.  Module-level so tests can zero it.
 _DRAIN_RETRY_BASE_DELAY = 0.5
-
 # Native-reasoning block membership lives in providers._protocol
 # (REASONING_BEARING_BLOCK_TYPES + has_reasoning_bearing_block, beside the
 # drain's double-reasoning check); this layer consumes the shared
@@ -127,6 +142,15 @@ class WirePreparationError(RuntimeError):
     Typing it here keeps retry/fallback ladders from recording backend
     health or walking every alias over a bug that fails identically on
     each.  The original exception rides ``__cause__``.
+    """
+
+
+class ModelAdmissionError(RuntimeError):
+    """The caller's local admitted-request hook failed before dispatch.
+
+    Unlike ``prepare_wire``, this hook may durably bind request context before
+    the serving lane's capacity lease. Its failure is still a local lifecycle
+    fault, never evidence that the selected model backend is unhealthy.
     """
 
 
@@ -439,7 +463,10 @@ class ModelLane:
 
     *alias* is the registry alias used for config resolution, ``""`` when
     the lane runs outside the registry (then every registry-backed pass
-    degrades to its documented miss behavior).
+    degrades to its documented miss behavior). ``registry_generation`` is
+    captured with the binding by :func:`resolve_model_binding`; zero is the
+    explicit direct-lane value. Together with ``model`` those fields are the
+    immutable serving identity stamped on a successful turn.
 
     *temperature* / *reasoning_effort* are the lane's OPERATOR-resolved
     sampling knobs — the assignment scheme's operator rungs only
@@ -464,11 +491,110 @@ class ModelLane:
     capabilities: ModelCapabilities | None = None
     extra_params: dict[str, Any] | None = None
     registry: ModelRegistry | None = None
+    # Registry snapshot paired atomically with alias/client/model/config by
+    # ``resolve_model_binding``.  Zero is the explicit non-registry value.
+    registry_generation: int = 0
     temperature: float | None = None
     reasoning_effort: str | None = None
     # Runtime credential resolver supplied by the host that owns OAuth state.
     # Kept on the lane because this synchronous module has no manager singleton.
-    backend_auth_resolver: Callable[[str], str | None] | None = None
+    backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None
+    # The immutable model-definition snapshot paired with ``client`` and
+    # ``provider``.  Dynamic credentials keep the principal/token live, but
+    # audience, scopes, grant mode, and static-key presence must come from the
+    # same registry generation as the endpoint they authenticate to. The
+    # deployment-wide model.auth_fail_closed switch remains a live per-mint
+    # policy read.
+    backend_auth_config: ModelConfig | None = None
+    # Stable per-alias registry gate.  The gate object survives hot-resizes,
+    # so old and newly resolved lanes coordinate through one FIFO.
+    admission: ModelAdmission | None = None
+
+
+@dataclass(frozen=True)
+class ResolvedModelBinding:
+    """One coherent registry snapshot for a session-owned model binding.
+
+    ``ModelLane`` carries the plant-call facets, including a reference to the
+    immutable config snapshot used by dynamic backend authentication.  The full
+    model config and registry generation also stay beside it as session
+    lifecycle state.  Rebinding replaces this object as a unit.
+    """
+
+    lane: ModelLane
+    config: ModelConfig | None
+    registry_generation: int
+
+
+@dataclass(frozen=True)
+class ModelLaneDiagnostics:
+    """Provider-facing diagnostic values projected from a lane."""
+
+    provider_name: str
+    provider_type: str
+    model: str
+    alias: str
+    base_url: str
+
+
+class ModelLaneInvariantError(RuntimeError):
+    """A lane reached a plant call without its required resolved facets."""
+
+
+def require_lane_capabilities(lane: ModelLane) -> ModelCapabilities:
+    """Return resolved capabilities or fail through a production-safe check."""
+    caps = lane.capabilities
+    if caps is None:
+        raise ModelLaneInvariantError(
+            f"model lane {lane.alias or lane.model!r} has no resolved capabilities"
+        )
+    return caps
+
+
+def lane_diagnostics(lane: ModelLane) -> ModelLaneDiagnostics:
+    """Return value-only diagnostic identity without leaking plant handles."""
+    raw_url = str(
+        getattr(lane.client, "base_url", None) or getattr(lane.client, "_base_url", None) or "?"
+    )
+    return ModelLaneDiagnostics(
+        provider_name=lane.provider.provider_name,
+        provider_type=type(lane.provider).__name__,
+        model=lane.model,
+        alias=lane.alias,
+        base_url=raw_url,
+    )
+
+
+def lane_error_is_retryable(lane: ModelLane, exc: BaseException) -> bool:
+    """Whether *exc* is retryable according to the lane that raised it."""
+    return type(exc).__name__ in lane.provider.retryable_error_names
+
+
+def same_model_lane_binding(left: ModelLane, right: ModelLane) -> bool:
+    """Whether two lanes name the same provider/client/model binding.
+
+    Capabilities, extra parameters, and sampling facets deliberately do not
+    participate: the owning ``ResolvedModelBinding.config`` value detects those
+    changes while a generation-only no-op retains the exact old lane object.
+    """
+    return (
+        left.client is right.client
+        and left.provider is right.provider
+        and left.model == right.model
+        and left.alias == right.alias
+        and left.admission is right.admission
+    )
+
+
+def lane_matches_explicit_handles(lane: ModelLane, client: Any, model: str) -> bool:
+    """Whether legacy constructor handles describe exactly *lane*.
+
+    ``ChatSession`` accepts the duplicate ``client`` and ``model`` arguments
+    for API compatibility, but provider-facing handle inspection stays inside
+    this boundary module.  Callers use this predicate only to reject a torn or
+    foreign :class:`ResolvedModelBinding`; plant work still receives the lane.
+    """
+    return lane.client is client and lane.model == model
 
 
 def lane_thinking_suppressed(lane: ModelLane) -> bool:
@@ -547,8 +673,7 @@ def lane_without_thinking(lane: ModelLane) -> ModelLane:
     """
     if not lane_thinking_suppressed(lane):
         return lane
-    caps = lane.capabilities
-    assert caps is not None  # lane_thinking_suppressed guarantees it
+    caps = require_lane_capabilities(lane)
     extra = lane.extra_params
     off = thinking_off_template_kwargs(caps.thinking_mode, caps.thinking_param)
     if off:
@@ -572,10 +697,13 @@ def resolve_lane(
     *,
     alias: str = "",
     registry: ModelRegistry | None = None,
+    registry_generation: int = 0,
     capabilities: ModelCapabilities | None = None,
     extra_params: dict[str, Any] | None | EllipsisType = ...,
+    cfg: ModelConfig | None | EllipsisType = ...,
     config_store: Any | None = None,
-    backend_auth_resolver: Callable[[str], str | None] | None = None,
+    backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
+    admission: ModelAdmission | None = None,
 ) -> ModelLane:
     """Build a :class:`ModelLane`, resolving what the caller didn't supply.
 
@@ -601,13 +729,23 @@ def resolve_lane(
     an alias that raced away degrades every facet to its miss behavior
     instead of raising into the caller's constructor.
     """
-    cfg = _get_config_or_none(registry, alias)
-    caps = capabilities or resolve_capabilities(provider, model, alias, registry, cfg=cfg)
+    resolved_cfg = _get_config_or_none(registry, alias) if cfg is ... else cfg
+    caps = capabilities or resolve_capabilities(provider, model, alias, registry, cfg=resolved_cfg)
     extra = (
-        provider_extra_params(provider, registry, alias, cfg=cfg)
+        provider_extra_params(provider, registry, alias, cfg=resolved_cfg)
         if extra_params is ...
         else extra_params
     )
+    if admission is None and registry is not None and alias:
+        # Direct registry-backed lane rebuilds (notably judge sampling lanes)
+        # still join the alias's stable gate.  Duck-typed test registries may
+        # manufacture attributes dynamically, hence the concrete type check.
+        try:
+            candidate = registry.get_admission(alias)
+        except Exception:
+            candidate = None
+        if isinstance(candidate, ModelAdmission):
+            admission = candidate
     return ModelLane(
         provider=provider,
         client=client,
@@ -616,10 +754,49 @@ def resolve_lane(
         capabilities=caps,
         extra_params=extra,
         registry=registry,
-        temperature=resolve_temperature_setting(cfg, config_store),
-        reasoning_effort=resolve_effort_setting(cfg, config_store),
+        registry_generation=registry_generation,
+        temperature=resolve_temperature_setting(resolved_cfg, config_store),
+        reasoning_effort=resolve_effort_setting(resolved_cfg, config_store),
         backend_auth_resolver=backend_auth_resolver,
+        backend_auth_config=resolved_cfg,
+        admission=admission,
     )
+
+
+def resolve_model_binding(
+    registry: ModelRegistry,
+    alias: str,
+    *,
+    config_store: Any | None = None,
+    backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
+) -> ResolvedModelBinding:
+    """Resolve every stable session-binding facet from one registry snapshot."""
+    # ``ModelRegistry`` accepts the empty spelling as "use the default", but
+    # the lane must carry the concrete alias it actually resolved.  Leaving an
+    # empty alias on a default binding disables registry-backed live flags and
+    # delegated backend authentication on every later plant call.
+    effective_alias = alias or registry.default
+    resolved: Any = registry.resolve_binding(effective_alias)
+    if len(resolved) == 6:
+        client, model, cfg, provider, admission, generation = resolved
+    else:
+        # Compatibility for lightweight registry fakes that predate admission;
+        # real ModelRegistry snapshots always take the six-value branch.
+        client, model, cfg, provider, generation = resolved
+        admission = None
+    lane = resolve_lane(
+        provider,
+        client,
+        model,
+        alias=effective_alias,
+        registry=registry,
+        registry_generation=generation,
+        cfg=cfg,
+        config_store=config_store,
+        backend_auth_resolver=backend_auth_resolver,
+        admission=admission,
+    )
+    return ResolvedModelBinding(lane=lane, config=cfg, registry_generation=generation)
 
 
 # --------------------------------------------------------------------------- #
@@ -798,19 +975,29 @@ class ModelTurnResult:
     computed against what the provider actually counted, lowerings the
     caller cannot see included.
 
-    *producer* is the SERVING lane's provider name (the storage row's
-    ``producer`` column) — the identity stamped on ``turn.native`` when a
-    native lane exists, carried separately so a native-less turn still
-    records who produced it and a fallback-served turn is not labeled
-    with the primary binding.
+    *provenance* is the immutable serving alias / backend model id / registry
+    generation / acting-principal tuple. The same JSON-safe value is stamped
+    on ``turn.meta.extra["provenance"]`` before this result leaves the plant
+    call, so a later registry or shared-workstream rebind cannot relabel an
+    accepted turn at commit time. *producer* and *serving_model* remain the
+    provider-native and compatibility projections of that serving lane.
+
+    *tool_def_chars* is the serialized size of the final provider-native tool
+    definitions handed to that serving lane.  The session's token calibration
+    combines it with ``wire_msgs``; carrying both prevents a fallback response
+    from being calibrated against the primary lane's different tool posture or
+    against the pre-adapter tool schema.
     """
 
     turn: Turn
     finish_reason: str
     usage: UsageInfo | None
     tool_calls: list[dict[str, Any]]
+    provenance: TurnProvenance = field(default_factory=TurnProvenance)
     wire_msgs: list[dict[str, Any]] | None = None
     producer: str = ""
+    serving_model: str = ""
+    tool_def_chars: int | None = None
 
     @property
     def content(self) -> str:
@@ -829,7 +1016,11 @@ def cap_tool_calls(result: ModelTurnResult, max_calls: int) -> tuple[list[dict[s
     capped = result.tool_calls[:max_calls]
     turn = result.turn
     if len(result.tool_calls) > len(capped):
-        turn = Turn.assistant(result.content, tool_calls=turn.tool_calls[: len(capped)])
+        turn = replace(
+            turn,
+            tool_calls=turn.tool_calls[: len(capped)],
+            native=None,
+        )
     return capped, turn
 
 
@@ -857,12 +1048,11 @@ def _raise_if_aborted(cancel_ref: Any, lane: ModelLane) -> None:
 
     Duck-typed on the same ``aborted`` predicate the drain-retry gate
     reads, so a ``None`` ref — most lanes — and a plain-list ref stay
-    legal.  One definition, two call sites in :func:`model_turn`: entry,
-    and immediately before ``create_streaming``.  Nothing interrupts the
-    credential resolve that runs between them — a mint already under way
-    completes even when the abort lands inside it.  The second read is
-    what turns such an abort into a skipped request rather than a sent
-    one, which is why it is not redundant with the first.
+    legal.  One definition, three call sites in :func:`model_turn`: entry,
+    after deterministic lowering but before credential resolution, and
+    immediately before ``create_streaming``.  Nothing interrupts a mint
+    already under way; the last read turns an abort during that mint into a
+    skipped request rather than a sent one.
 
     The raised message is control flow, not prose.  ``_is_ctx_overflow``
     classifies an exception class it does not recognize by TEXT, so
@@ -873,6 +1063,72 @@ def _raise_if_aborted(cancel_ref: Any, lane: ModelLane) -> None:
         return
     log.debug("model_turn.abort_before_dispatch", model=lane.model, alias=lane.alias)
     raise DeadlineCancelledError("cancel_ref aborted before dispatch")
+
+
+def lane_call_client(
+    lane: ModelLane,
+    *,
+    backend_auth_token: str | None = None,
+    cancel_ref: Any = None,
+) -> Any:
+    """Return the per-call SDK client for one coherent model lane.
+
+    Dynamic credentials are resolved against the lane's pinned config and
+    installed with ``with_options``, which reuses the registry client's
+    transport.  The returned clone is therefore not independently closed.
+    Cancellation is checked on both sides of the potentially blocking mint.
+    """
+    _raise_if_aborted(cancel_ref, lane)
+    resolved_backend_auth = backend_auth_token
+    if resolved_backend_auth is None and lane.backend_auth_resolver is not None:
+        try:
+            resolved_backend_auth = lane.backend_auth_resolver(
+                lane.alias,
+                lane.backend_auth_config,
+            )
+        except Exception:
+            # Stop owns the boundary even when the blocking mint completes by
+            # raising an authentication error. Without this read, the same
+            # abort is masked only on successful mints while a failed mint is
+            # misreported to the operator as a backend-auth outage.
+            _raise_if_aborted(cancel_ref, lane)
+            raise
+        _raise_if_aborted(cancel_ref, lane)
+    call_client = (
+        lane.client.with_options(api_key=resolved_backend_auth)
+        if resolved_backend_auth
+        else lane.client
+    )
+    _raise_if_aborted(cancel_ref, lane)
+    return call_client
+
+
+def _prepare_wire_for_lane(
+    messages: list[dict[str, Any]],
+    lane: ModelLane,
+    prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]] | None,
+    *,
+    cfg: Any | None,
+) -> list[dict[str, Any]]:
+    """Apply caller lowering and the lane's final deterministic projection.
+
+    Lowering failures retain only the exception class on the wrapper because a
+    caller-owned error message can quote stored conversation content. The cause
+    remains available to tracebacks without leaking through operator surfaces.
+    """
+    prepared = messages
+    if prepare_wire is not None:
+        try:
+            prepared = prepare_wire(prepared, lane)
+        except Exception as prep_err:
+            raise WirePreparationError(type(prep_err).__name__) from prep_err
+    return maybe_attach_vllm_chat_reasoning(
+        prepared,
+        lane.provider,
+        lane.registry,
+        lane.alias,
+        cfg=cfg,
+    )
 
 
 def model_turn(
@@ -888,8 +1144,10 @@ def model_turn(
     resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
     cancel_ref: list[Any] | None = None,
     backend_auth_token: str | None = None,
+    acting_principal_id: str = "",
     deferred_names: frozenset[str] | None = None,
     prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]] | None = None,
+    admit_request: Callable[[ModelLane], None] | None = None,
     on_chunk: Callable[[StreamChunk], None] | None = None,
 ) -> ModelTurnResult:
     """Advance a trajectory by one model turn: lower, sample, re-ingest.
@@ -916,12 +1174,14 @@ def model_turn(
     operator never engaged.  Pass an explicit value only to relay an
     operator- or user-resolved knob (the session's own knobs, a CLI flag).
 
-    *resolve_attachments* materializes by-reference ``AttachmentRef``
-    content at the provider translator (``{type: kind, attachment_id}``
-    placeholders → inline parts; one id may expand to several parts, e.g.
-    a rasterized PDF).  Turn IR never carries inline media bytes — a lane
-    with non-text content passes refs plus this resolver, exactly like the
-    main loop's wire path.
+    *resolve_attachments* materializes by-reference ``AttachmentRef`` content
+    after a context-first *admit_request* succeeds but before the outer model
+    capacity lease (``{type: kind, attachment_id}`` placeholders → inline
+    parts; one id may expand to several parts, e.g. a rasterized PDF). Ordinary
+    calls preserve their established lowering-before-materialization cadence.
+    Keeping nested perception/audio work outside the outer alias's gate avoids
+    self-deadlock at a limit of one. Turn IR itself never carries inline media
+    bytes.
 
     *mint* rewrites each returned tool call's id (provider-original →
     caller-scoped) before the Turn is built; the native blocks keep the
@@ -943,16 +1203,14 @@ def model_turn(
     — see :func:`drain_stream`).  Its ``aborted`` predicate gates every
     dispatch, not only a re-issue (:func:`_raise_if_aborted`): an
     abandoned call is not worth a request, and on a delegated-auth alias
-    not worth the credential resolve either — hence one read at entry,
-    ahead of lowering and ``lane.backend_auth_resolver``, and one
-    immediately before ``create_streaming``, which is the read that
-    actually keeps bytes off the wire.  The entry read costs a pending
-    credential failure, which a pending abort now masks; right, because
-    the caller is gone.  Neither read closes anything: a resolve already
-    under way finishes despite an abort landing inside it, and an abort
-    landing after the second read reaches the in-flight call the way it
-    always did — ``cancel_ref.append`` closes a handle that has not
-    arrived yet, ``abort`` closes one that has.
+    not worth the credential resolve either — hence reads at entry and after
+    lowering, ahead of ``lane.backend_auth_resolver``, plus one immediately
+    before ``create_streaming`` that keeps bytes off the wire when Stop lands
+    during the mint.  A pending abort intentionally masks a pending credential
+    failure because the caller is gone.  The reads close nothing: a resolve
+    already under way finishes, and an abort landing after the final read
+    reaches the in-flight call the way it always did — ``cancel_ref.append``
+    closes a handle that has not arrived yet, ``abort`` closes one that has.
 
     The raise is :class:`~turnstone.core.deadline.DeadlineCancelledError`,
     the deadline module's abandonment vocabulary.  ``GenerationCancelled``
@@ -980,6 +1238,13 @@ def model_turn(
     tool-search deferred-loading set is per-call state (it grows as the
     session discovers tools), so it is a parameter and not a
     ``ModelLane`` field.
+
+    *admit_request* is the request-admission seam used when admission changes
+    the cached prefix itself. It runs before ``prepare_wire``, dynamic backend
+    authentication, attachment materialization, and the serving lane's capacity
+    lease, so a refusal cannot trigger attachment storage/perception work and
+    none of that local work occupies a model slot. A successful hook may
+    durably bind the prefix before the request queues for model capacity.
 
     *on_chunk* is the streaming surface (#832): each normalized
     :class:`StreamChunk` reaches the caller as it arrives — via a tee
@@ -1022,7 +1287,15 @@ def model_turn(
     override its ``x-api-key``, so an injected header is silently dropped.
     ``None`` leaves the lane's static client credential in place. When the
     explicit argument is absent, ``lane.backend_auth_resolver`` resolves it
-    once before the drain-retry loop.
+    after admission for each transport attempt, so a queued call cannot age a
+    minted credential before it reaches the wire.
+
+    *acting_principal_id* is the caller's already-pinned effective principal,
+    not a live session lookup. It is never used to mint a credential here; it
+    only joins the immutable serving identity stamped after a successful
+    result. Session-backed CLI, eval, scheduled, and internal lanes pass their
+    effective owner credential principal; truly ownerless direct calls pass
+    the empty string.
     """
     if mint is not None and wire_id_map is None:
         raise ValueError(
@@ -1038,23 +1311,22 @@ def model_turn(
         sanitize_tool_call_arguments(dicts_from_turns(list(turns))),
         wire_id_map if wire_id_map is not None else {},
     )
-    if prepare_wire is not None:
+    if admit_request is not None:
         try:
-            # The serving lane rides along so caller lowering can be
-            # capability-correct per attempt — a fallback's fold posture
-            # is its own, not the primary's.
-            wire = prepare_wire(wire, lane)
-        except Exception as prep_err:
-            # A caller-data fault, never a backend signal — typed so the
-            # retry and fallback ladders cannot treat it as one.  The
-            # wrapper carries the cause's CLASS, not its message: this is
-            # our lowering over the caller's stored history, so the
-            # message can quote that history, and callers render
-            # ``str(exc)`` on surfaces that reach the operator and the
-            # persisted error row.  The message rides ``__cause__``, which
-            # tracebacks and debug logs still have.
-            raise WirePreparationError(type(prep_err).__name__) from prep_err
-    wire = maybe_attach_vllm_chat_reasoning(wire, lane.provider, lane.registry, lane.alias, cfg=cfg)
+            admit_request(lane)
+        except Exception as admission_err:
+            raise ModelAdmissionError(type(admission_err).__name__) from admission_err
+        _raise_if_aborted(cancel_ref, lane)
+    else:
+        # Ordinary lowering remains once per model_turn, before attachment
+        # materialization. Admitted lowering runs per transport attempt below
+        # because its prefix does not exist until the hook above succeeds.
+        wire = _prepare_wire_for_lane(
+            wire,
+            lane,
+            prepare_wire,
+            cfg=cfg,
+        )
     # The effort assignment scheme's lower rungs: explicit relay → lane
     # (operator) → in-code model definition → None.  None/unset knobs are
     # OMITTED from the wire so the inference engine's default rules
@@ -1067,80 +1339,113 @@ def model_turn(
         or (lane.capabilities.default_reasoning_effort if lane.capabilities else None)
         or None
     )
-    resolved_backend_auth = backend_auth_token
-    if resolved_backend_auth is None and lane.backend_auth_resolver is not None:
-        resolved_backend_auth = lane.backend_auth_resolver(lane.alias)
-    # Bind once: SDK ``with_options`` preserves the base transport/pool while
-    # replacing only the provider credential. A drain retry reuses this client.
-    call_client = (
-        lane.client.with_options(api_key=resolved_backend_auth)
-        if resolved_backend_auth
-        else lane.client
-    )
+    # Materialization may perform storage reads and nested perception/audio
+    # sampling. A context-first refusal above performs none of it. A successful
+    # request completes it before taking the outer alias's admission slot so a
+    # cap of one cannot deadlock on a nested call that needs the same alias.
+    served_wire = materialize_attachments(wire, resolve_attachments)
+    dispatched_wire = served_wire
     # A partially-surfaced stream is never silently re-issued — the
     # streaming caller owns re-issue.
     drain_retries = 0 if on_chunk is not None else _DRAIN_RETRIES
     attempt = 0
+    request_metrics: list[ProviderRequestMetrics] = []
     while True:
-        # Last read before the wire — it covers everything the entry read is
-        # too early to see: the lowering, and on a delegated-auth alias the
-        # credential resolve, which can block.
         _raise_if_aborted(cancel_ref, lane)
-        # ``create_streaming`` stays OUTSIDE the try: every adapter issues
-        # the HTTP request eagerly in its body (inside the SDK's own
-        # request-level retry), so an exception from it is a request-time
-        # failure that already got its retries; only drain-time failures
-        # are mid-stream deaths the SDK could never see.
-        # Dynamic backends bind the token as the client's api_key so the SDK
-        # emits it as its own auth header; with_options reuses the pool.
-        # (extra_headers can't override the Anthropic SDK's x-api-key.)
-        chunks = lane.provider.create_streaming(
-            client=call_client,
-            model=lane.model,
-            messages=wire,
-            tools=tools,
-            max_tokens=max_tokens,
-            temperature=temperature if temperature is not None else lane.temperature,
-            reasoning_effort=effective_effort,
-            extra_params=lane.extra_params,
-            deferred_names=deferred_names,
-            cancel_ref=cancel_ref,
-            capabilities=lane.capabilities,
-            replay_reasoning_to_model=resolve_replay_reasoning_to_model(
-                lane.registry, lane.alias, caps=lane.capabilities, cfg=cfg
-            ),
-            resolve_attachments=resolve_attachments,
-        )
-        try:
-            result = drain_stream(
-                _tee_chunks(chunks, on_chunk) if on_chunk else chunks,
-                scan_inline_reasoning=lane_scans_inline_reasoning(lane),
+        if admit_request is not None:
+            # Preserve the established per-transport-attempt lowering cadence,
+            # but keep it outside the capacity lease.  Admission itself runs
+            # once above: its durable prefix cannot change during a same-wire
+            # drain retry.
+            dispatched_wire = _prepare_wire_for_lane(
+                served_wire,
+                lane,
+                prepare_wire,
+                cfg=cfg,
             )
-            break
-        except Exception as exc:
-            attempt += 1
-            if (
-                attempt > drain_retries
-                or bool(getattr(cancel_ref, "aborted", False))
-                or type(exc).__name__ not in lane.provider.retryable_error_names
-            ):
-                raise
-            delay = _DRAIN_RETRY_BASE_DELAY * (2 ** (attempt - 1)) * (0.5 + random.random())
-            log.warning(
-                "model_turn.drain_retry",
-                error_type=type(exc).__name__,
-                attempt=attempt,
+            _raise_if_aborted(cancel_ref, lane)
+        lease = lane.admission.acquire(cancel_ref=cancel_ref) if lane.admission else None
+        drain_error: Exception | None = None
+        with lease if lease is not None else contextlib.nullcontext():
+            # Dynamic credential mint and the full create+drain remain inside
+            # the hold; local request admission completed before this slot was
+            # acquired. The context exits before any retry backoff below.
+            call_client = lane_call_client(
+                lane,
+                backend_auth_token=backend_auth_token,
+                cancel_ref=cancel_ref,
+            )
+            _raise_if_aborted(cancel_ref, lane)
+            if admit_request is None:
+                dispatched_wire = served_wire
+            _raise_if_aborted(cancel_ref, lane)
+            mark_dispatch = getattr(cancel_ref, "mark_dispatch", None)
+            if callable(mark_dispatch):
+                with contextlib.suppress(Exception):
+                    mark_dispatch()
+            # ``create_streaming`` stays OUTSIDE the drain-error catch: every
+            # adapter issues eagerly in its body, so a request-time failure has
+            # already received the SDK's own retries and propagates unchanged.
+            chunks = lane.provider.create_streaming(
+                client=call_client,
                 model=lane.model,
-                retry_in=round(delay, 2),
+                messages=dispatched_wire,
+                tools=tools,
+                max_tokens=max_tokens,
+                temperature=temperature if temperature is not None else lane.temperature,
+                reasoning_effort=effective_effort,
+                extra_params=lane.extra_params,
+                deferred_names=deferred_names,
+                cancel_ref=cancel_ref,
+                capabilities=lane.capabilities,
+                replay_reasoning_to_model=resolve_replay_reasoning_to_model(
+                    lane.registry, lane.alias, caps=lane.capabilities, cfg=cfg
+                ),
+                # Already materialized above after request admission; provider
+                # translators retain their no-op fallback for direct callers.
+                resolve_attachments=None,
+                request_metrics_ref=request_metrics,
             )
-            if delay > 0:
-                time.sleep(delay)
-            if bool(getattr(cancel_ref, "aborted", False)):
-                # The deadline abandoned this worker while it was backing off.
-                # The loop-top read would stop the re-issue anyway; this arm
-                # exists to die with the ORIGINAL transport failure rather than
-                # the abandonment error, so the cause of the death survives.
-                raise
+            try:
+                result = drain_stream(
+                    _tee_chunks(chunks, on_chunk) if on_chunk else chunks,
+                    scan_inline_reasoning=lane_scans_inline_reasoning(lane),
+                )
+            except Exception as exc:
+                drain_error = exc
+            finally:
+                close = getattr(chunks, "close", None)
+                if callable(close):
+                    with contextlib.suppress(Exception):
+                        close()
+
+        if drain_error is None:
+            break
+        attempt += 1
+        if (
+            attempt > drain_retries
+            or bool(getattr(cancel_ref, "aborted", False))
+            or type(drain_error).__name__ not in lane.provider.retryable_error_names
+        ):
+            raise drain_error
+        delay = _DRAIN_RETRY_BASE_DELAY * (2 ** (attempt - 1)) * (0.5 + random.random())
+        log.warning(
+            "model_turn.drain_retry",
+            error_type=type(drain_error).__name__,
+            attempt=attempt,
+            model=lane.model,
+            alias=lane.alias,
+            registry_generation=lane.registry_generation,
+            retry_in=round(delay, 2),
+        )
+        if delay > 0:
+            time.sleep(delay)
+        if bool(getattr(cancel_ref, "aborted", False)):
+            # The deadline abandoned this worker while it was backing off.
+            # The loop-top read would stop the re-issue anyway; this arm
+            # exists to die with the ORIGINAL transport failure rather than
+            # the abandonment error, so the cause of the death survives.
+            raise drain_error
 
     raw_calls: list[dict[str, Any]] = list(result.tool_calls or [])
     # Record blanks BEFORE the uuid back-fill: a back-filled id exists only
@@ -1155,7 +1460,8 @@ def model_turn(
         # turn degrading to loose reasoning text.
         had_blank_ids = False
     if mint is not None:
-        assert wire_id_map is not None  # enforced by the guard above
+        if wire_id_map is None:
+            raise ModelLaneInvariantError("tool-call id minting requires an id recovery map")
         for tc in raw_calls:
             original_id = tc["id"]
             minted = mint(original_id)
@@ -1194,11 +1500,26 @@ def model_turn(
         if native_blocks
         else None
     )
+    provenance = TurnProvenance(
+        model_alias=lane.alias,
+        backend_model_id=lane.model,
+        registry_generation=lane.registry_generation,
+        acting_principal_id=acting_principal_id,
+    )
+    turn = Turn.assistant(result.content or "", tool_calls=tool_calls, native=native)
+    turn.meta.extra[PROVENANCE_META_KEY] = provenance.to_meta()
     return ModelTurnResult(
-        turn=Turn.assistant(result.content or "", tool_calls=tool_calls, native=native),
+        turn=turn,
         finish_reason=result.finish_reason,
         usage=result.usage,
         tool_calls=raw_calls,
-        wire_msgs=wire,
+        provenance=provenance,
+        wire_msgs=dispatched_wire,
         producer=lane.provider.provider_name,
+        serving_model=lane.model,
+        tool_def_chars=(
+            request_metrics[-1].serialized_tool_chars
+            if request_metrics
+            else serialized_tool_chars(tools)
+        ),
     )

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
     from contextlib import AbstractContextManager
 
     from turnstone.core.storage._notify import NotifyStream
@@ -22,6 +23,13 @@ if TYPE_CHECKING:
 #: it) agree on ONE set that cannot drift.
 USER_SCOPED_AUTH_TYPES: frozenset[str] = frozenset({"oauth_user", "oauth_obo"})
 
+# Internal durable-incarnation fence. New manager rows receive it at
+# registration; legacy rows receive one atomically when an exact delete/fork
+# snapshot is claimed. It lives in ``workstream_config`` so row + fence can be
+# installed without a schema change. Clone and publication retain it for ABA
+# protection; public config reads/writes and fork snapshots always exclude it.
+FORK_RESERVATION_CONFIG_KEY = "__fork_destination_reservation"
+
 
 class StorageConflictError(Exception):
     """Raised by storage methods when a unique-constraint violation occurs.
@@ -31,6 +39,94 @@ class StorageConflictError(Exception):
     conflicted (e.g. ``"users.username"`` vs ``"oidc_identities.PRIMARY"``)
     when the backend can distinguish them.
     """
+
+
+class ConversationCommitConflictError(StorageConflictError):
+    """A keyed conversation retry does not match the committed operation.
+
+    A ``commit_key`` identifies one immutable logical write.  Returning the
+    existing row for a retry with different role-specific fields, metadata,
+    event cursor, or ordered attachment references would acknowledge data the
+    caller did not commit, so atomic attachment paths refuse that mismatch.
+    """
+
+
+class ConversationCommitWorkstreamGoneError(RuntimeError):
+    """A keyed conversation commit's durable parent row no longer exists.
+
+    Keyed saves refuse to recreate a hard-deleted workstream, so this failure
+    is permanent: no retry of the same commit can ever succeed.  The durability
+    journal uses the type to stop retrying instead of classifying the miss as
+    a transient storage failure.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class AttachmentWrite:
+    """One content-addressed blob reference in an atomic conversation write.
+
+    The ordered input sequence is the message's reference list.  Repeated
+    ``attachment_id`` values therefore represent repeated references and each
+    contribute one to the global refcount.
+    """
+
+    attachment_id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    kind: str
+    content: bytes
+
+
+class ForkCloneError(RuntimeError):
+    """Base class for an atomic workstream-clone refusal."""
+
+
+class ForkSourceUnavailableError(ForkCloneError):
+    """The source is missing, inaccessible, or no longer safely cloneable.
+
+    Missing and authorization-denied sources deliberately share one exception
+    so an API caller cannot use the fork path as a private-workstream oracle.
+    """
+
+
+class ForkDestinationConflictError(ForkCloneError):
+    """The destination is missing, belongs to another principal, or is non-empty."""
+
+
+@dataclass(frozen=True, slots=True)
+class ForkCloneExpectation:
+    """Construction-time session envelope a fork transaction must still match.
+
+    Fork creation constructs the destination session before the storage clone
+    runs because persona MCP gating and project-memory wiring happen in the
+    constructor.  The source can change between that preflight and the clone.
+    Carrying this immutable witness into the transaction makes such drift a
+    retryable source refusal instead of committing history under a stale live
+    security envelope. Source and destination reservation tokens additionally
+    fence delete/re-register and pre-publication rollback/retry races.
+    """
+
+    persona_config: tuple[tuple[str, str], ...]
+    project_id: str
+    project_name: str
+    project_writable: bool
+    destination_reservation_token: str
+    source_reservation_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class ForkCloneSnapshot:
+    """Canonical source state committed by :meth:`StorageBackend.clone_workstream`.
+
+    ``turns`` is the same recovered, checkpoint-bounded trajectory a resume
+    loads. ``config`` and ``project_id`` are the source values installed on the
+    destination in the same transaction.
+    """
+
+    turns: tuple[Turn, ...]
+    config: dict[str, str]
+    project_id: str | None
 
 
 class OIDCIdentity(TypedDict):
@@ -192,6 +288,7 @@ class StorageBackend(Protocol):
         is_error: bool = False,
         producer: str | None = None,
         meta: str | None = None,
+        commit_key: str | None = None,
     ) -> int:
         """Log a message to the conversations table.
 
@@ -209,9 +306,82 @@ class StorageBackend(Protocol):
         cursor space, distinct from the returned ``id`` PK.  NULL when the
         caller has no live UI counter (offline / bulk / fork re-saves).
 
-        ``meta`` is the pre-serialized JSON of an operator-context ``system``
-        turn's structured per-kind fields (the ``_source_meta`` side channel);
-        opaque to storage and NULL for ordinary rows.
+        ``meta`` is pre-serialized role-specific conversation metadata
+        (operator context, tool disposition/preview plus the tool turn's acting
+        principal, shared-workstream sender, or accepted-assistant model
+        provenance); opaque to storage and NULL when a row has no metadata.
+
+        ``commit_key`` is a caller-generated, non-empty idempotency identity scoped to
+        ``ws_id``.  The first save inserts the row; subsequent saves with the
+        same non-NULL key and identical normalized fields return that row's
+        existing ``id`` without appending or replacing content. A mismatched
+        retry raises :class:`ConversationCommitConflictError`. A keyed save
+        requires the durable workstream row to exist in the same transaction;
+        it refuses a retry after hard delete instead of recreating an orphan
+        conversation. NULL preserves append-only legacy/offline semantics,
+        including historical parent-less writers. PostgreSQL conditionally
+        takes the same parent-first lock as prune/delete when that parent
+        exists. If the call observes a parent before blocking behind deletion,
+        it refuses the post-delete insert; a call that genuinely begins
+        parentless may still create an orphan. NULL therefore remains
+        unsuitable for a live accepted row, which MUST use a key. An empty
+        string is rejected.
+        """
+        ...
+
+    def save_user_message_with_attachments(
+        self,
+        ws_id: str,
+        content: str,
+        attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+        *,
+        source: str | None = None,
+        event_id: int | None = None,
+        meta: str | None = None,
+        commit_key: str,
+    ) -> int:
+        """Atomically commit one keyed USER row and its attachment references.
+
+        The conversation row, new content-addressed blobs, exact per-reference
+        refcount increments, and ordered ``conversations.attachments`` list are
+        one database transaction.  A retry with the same ``(ws_id,
+        commit_key)`` and identical normalized payload returns the original row
+        id without changing refcounts.  A retry whose row payload or ordered
+        attachment ids differ raises
+        :class:`ConversationCommitConflictError`; no partial mutation survives
+        any failure. The durable workstream parent is locked/validated in the
+        same transaction, so a retry after hard delete is refused without
+        recreating either the row or attachment ownership.
+
+        This operation is intentionally narrower than :meth:`save_message`:
+        ordinary rows and attachment-free USER rows retain their established
+        persistence path.
+        """
+        ...
+
+    def save_tool_message_with_attachments(
+        self,
+        ws_id: str,
+        content: str,
+        tool_name: str,
+        tool_call_id: str,
+        attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+        *,
+        event_id: int | None = None,
+        is_error: bool = False,
+        meta: str | None = None,
+        commit_key: str,
+    ) -> int:
+        """Atomically commit one keyed TOOL row and its attachment references.
+
+        The immutable identity covers content, tool name/call id, event cursor,
+        error disposition, metadata, and the exact ordered attachment ids. Blob
+        bytes, size, MIME, and kind are validated under the content-addressed id;
+        newly inserted blobs carry ``origin='tool'``. An identical retry returns
+        the original row id without replaying refcount increments. Any mismatch
+        or partial failure raises and leaves the whole transaction unchanged.
+        The durable workstream parent is locked/validated in that transaction;
+        hard delete therefore cannot leave a later retry as an orphan.
         """
         ...
 
@@ -221,8 +391,9 @@ class StorageBackend(Protocol):
         Each dict must include ``ws_id``, ``role``, and ``content``
         (which may be ``None`` for assistant messages with only tool_calls).
         Optional keys: ``tool_name``, ``tool_call_id``, ``provider_data``,
-        ``tool_calls``, ``source``, ``meta``.  Timestamp and workstream
-        updated-at are handled internally.
+        ``tool_calls``, ``source``, ``meta``, and ``attachment_ids`` (an
+        ordered list of existing content-addressed ids). Attachment refcounts,
+        timestamp, and workstream updated-at are handled in the same transaction.
         """
         ...
 
@@ -279,6 +450,45 @@ class StorageBackend(Protocol):
         marker and returns the bounded ``[summary] + [tail]`` view;
         ``checkpointed=False`` returns the full transcript (markers dropped) for
         export/audit consumers that must not lose pre-compaction history.
+        """
+        ...
+
+    def clone_workstream(
+        self,
+        source_ws_id: str,
+        destination_ws_id: str,
+        *,
+        principal_id: str,
+        trusted_internal: bool = False,
+        expected_session: ForkCloneExpectation | None = None,
+    ) -> ForkCloneSnapshot:
+        """Atomically authorize and snapshot-copy one workstream into another.
+
+        The transaction re-evaluates the source's current project visibility
+        and attachability for ``principal_id``, snapshots its canonical
+        checkpoint-bounded history and configuration, retains every referenced
+        attachment blob, replaces the destination configuration, and binds the
+        destination to the source's effective project (or no project when the
+        source link is absent/dangling).
+
+        The destination must already exist, belong to ``principal_id``, contain
+        no conversation rows, and carry the same normalized project binding the
+        source resolves to inside the transaction. A mismatch means source
+        project context changed after destination construction and refuses the
+        clone. When ``expected_session`` is supplied, the transaction also
+        requires both durable incarnation tokens, the source persona stamp, and
+        the principal's effective active project-memory context to equal the
+        values used to construct the live destination session.
+        ``state='creating'`` sources are never cloneable. ``trusted_internal``
+        is reserved for non-user
+        service/CLI callers and bypasses the principal/ACL checks; it does not
+        relax source or destination existence, project coherence, envelope
+        coherence, emptiness, or attachment integrity checks.
+
+        Raises :class:`ForkSourceUnavailableError` for a missing, inaccessible,
+        or corrupt source and :class:`ForkDestinationConflictError` when the
+        destination preconditions do not hold. No partial history, config, or
+        attachment-refcount changes survive either failure.
         """
         ...
 
@@ -422,6 +632,17 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def truncate_messages_tail(self, ws_id: str, remove_count: int) -> int:
+        """Atomically remove up to *remove_count* newest conversation rows.
+
+        The backend locks the durable workstream, derives both the current row
+        count and latest compaction floor inside that transaction, and never
+        deletes rows backing the latest compaction marker.  Attachment
+        refcounts are released for exactly the rows deleted.  Missing
+        workstreams and storage failures raise; a negative count is invalid.
+        """
+        ...
+
     # -- Workstream management -------------------------------------------------
 
     def list_workstreams_with_history(
@@ -472,7 +693,13 @@ class StorageBackend(Protocol):
         ...
 
     def prune_workstreams(self, retention_days: int = 90) -> tuple[int, int]:
-        """Remove orphaned + stale unnamed workstreams. Returns (orphans, stale)."""
+        """Atomically remove orphaned + stale unnamed workstreams.
+
+        Candidate predicates are rechecked while holding the same parent-row
+        lock (or SQLite writer reservation) used by keyed conversation commits.
+        Deletion releases all attachment references transactionally. Returns
+        ``(orphans, stale)``.
+        """
         ...
 
     def resolve_workstream(self, alias_or_id: str) -> str | None:
@@ -487,6 +714,45 @@ class StorageBackend(Protocol):
 
     def load_workstream_config(self, ws_id: str) -> dict[str, str]:
         """Load workstream configuration. Returns empty dict if none stored."""
+        ...
+
+    def finalize_deferred_create(
+        self,
+        ws_id: str,
+        fork_reservation_token: str,
+        *,
+        alias: str | None = None,
+        config: dict[str, str] | None = None,
+        node_id: str | None = None,
+        override_reason: str = "local",
+    ) -> bool:
+        """Atomically apply prepublication writes to one reserved incarnation.
+
+        The durable workstream row and private fork reservation must both
+        match. Alias conflict or ownership loss returns ``False`` with no
+        mutation. The private reservation is retained for exact cancellation
+        rollback until lifecycle publication succeeds.
+        """
+        ...
+
+    def publish_deferred_create(
+        self,
+        ws_id: str,
+        fork_reservation_token: str,
+    ) -> bool:
+        """Publish exactly one reserved ``creating`` workstream.
+
+        The state transition is an incarnation-checked compare-and-swap.  A
+        missing row, mismatched token, or already-published row returns
+        ``False`` without mutation.  The private token remains as the durable
+        incarnation fence used by exact hard-delete; clone admission also
+        requires ``state='creating'`` so the token is not a reusable fork
+        capability after publication.
+        """
+        ...
+
+    def get_workstream_reservation_token(self, ws_id: str) -> str:
+        """Return the private durable incarnation token, or ``""``."""
         ...
 
     # -- Workstream metadata ---------------------------------------------------
@@ -519,7 +785,22 @@ class StorageBackend(Protocol):
         Richer than :meth:`get_workstream_metadata` — includes ``state``,
         ``user_id``, ``kind``, ``parent_ws_id``, and timestamps.  Used by
         coordinator ``inspect_workstream`` and any caller that needs the
-        authoritative row.
+        authoritative row. This is a raw internal read: it deliberately
+        returns provisional ``state='creating'`` reservations. User-visible,
+        open, export, and mutation surfaces must apply their lifecycle and
+        authorization gates rather than treating every returned row as
+        published.
+        """
+        ...
+
+    def ensure_workstream_incarnation_snapshot(self, ws_id: str) -> dict[str, Any] | None:
+        """Return the row plus a stable private incarnation token.
+
+        The authoritative row read and creation of a token for legacy rows are
+        one transaction.  Callers can therefore authorize this immutable
+        snapshot and use its token for a later conditional mutation without a
+        delete/re-register ABA becoming authorized by the old decision.
+        Ordinary row/config reads must not expose the private token.
         """
         ...
 
@@ -548,34 +829,45 @@ class StorageBackend(Protocol):
         scope_id: str,
         content: str,
     ) -> None:
-        """Create a structured memory record."""
+        """Create a structured memory record with a non-empty description."""
         ...
 
     def upsert_structured_memory(
         self,
         memory_id: str,
         name: str,
-        description: str | None,
+        description: str,
         mem_type: str | None,
         scope: str,
         scope_id: str,
         content: str,
+        *,
+        require_active_project: bool = False,
+        acting_principal_id: str = "",
     ) -> tuple[dict[str, str], bool]:
         """Insert a structured memory, or update it in place on a
         ``(name, scope, scope_id)`` conflict.
 
         Atomic ``INSERT ... ON CONFLICT DO UPDATE ... RETURNING`` — no
         IntegrityError round-trip, race-safe under concurrent saves of the same
-        key.  ``description`` / ``mem_type`` of ``None`` mean "unset": the
-        column default ("" / "general") is used on insert and the stored value
-        is kept on conflict; a non-``None`` value (including "" or "general") is
-        written.
+        key. ``description`` must contain non-whitespace text on every insert
+        or update. A ``mem_type`` of ``None`` means "unset": the column default
+        is used on insert and the stored value is kept on conflict.
 
-        Returns ``(row, was_update)`` (like Django's ``update_or_create``): the
-        full saved row, and ``True`` when an existing row was updated rather
+        Returns ``(row, was_update)`` (like Django's ``update_or_create``): a
+        body-free summary row, and ``True`` when an existing row was updated rather
         than inserted.  Callers MUST supply a fresh unique ``memory_id`` — it is
         compared against the returned row's id to tell INSERT from UPDATE, so a
         reused id would report ``was_update=False`` on a real update.
+
+        When ``acting_principal_id`` is supplied for project scope, the backend
+        must resolve active project write access in the same transaction as the
+        upsert. ``require_active_project`` retains the trusted internal path's
+        active-project guard when there is no acting principal.
+
+        Workstream-scoped writes similarly lock and verify their durable parent
+        in the same transaction, so a deleted workstream cannot gain orphaned
+        memory rows.
         """
         ...
 
@@ -584,19 +876,71 @@ class StorageBackend(Protocol):
         ...
 
     def get_structured_memory_by_name(
-        self, name: str, scope: str = "global", scope_id: str = ""
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
     ) -> dict[str, str] | None:
         """Lookup structured memory by (name, scope, scope_id). Returns dict or None."""
         ...
 
+    def get_and_touch_structured_memory(self, memory_id: str) -> dict[str, str] | None:
+        """Atomically return one full body while recording its access."""
+        ...
+
+    def get_and_touch_structured_memory_by_name(
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
+        *,
+        acting_principal_id: str = "",
+    ) -> dict[str, str] | None:
+        """Atomically return one scoped full body while recording its access."""
+        ...
+
+    def update_structured_memory_description(
+        self, memory_id: str, description: str
+    ) -> dict[str, str] | None:
+        """Atomically update an authored memory description and return the row."""
+        ...
+
     def delete_structured_memory(
-        self, name: str, scope: str = "global", scope_id: str = ""
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
     ) -> bool:
         """Delete a structured memory by (name, scope, scope_id). Returns True if existed."""
         ...
 
+    def delete_structured_memory_returning(
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
+        *,
+        acting_principal_id: str = "",
+    ) -> dict[str, str] | None:
+        """Atomically delete and return a memory selected by its scoped name."""
+        ...
+
     def delete_structured_memory_by_id(self, memory_id: str) -> bool:
         """Delete a structured memory by its primary key. Returns True if existed."""
+        ...
+
+    def delete_structured_memory_by_id_returning(self, memory_id: str) -> dict[str, str] | None:
+        """Atomically delete and return a memory selected by primary key."""
+        ...
+
+    def find_structured_memory_scopes(
+        self,
+        name: str,
+        scopes: list[tuple[str, str]],
+        *,
+        acting_principal_id: str = "",
+    ) -> list[tuple[str, str]]:
+        """Return visible scope pairs containing ``name`` in one small query."""
         ...
 
     def list_structured_memories(
@@ -625,12 +969,14 @@ class StorageBackend(Protocol):
         scopes: list[tuple[str, str]],
         mem_type: str = "",
         limit: int = 100,
+        *,
+        acting_principal_id: str = "",
     ) -> list[dict[str, str]]:
         """List memories matching ANY of the (scope, scope_id) pairs in *scopes*.
 
-        A pair with an empty ``scope_id`` matches the scope alone (used for
-        ``("global", "")``).  Single SQL query — replaces the per-scope fan-out
-        pattern that issued one query per visible scope.
+        Every pair is exact, including the canonical ``("global", "")`` pair.
+        Single SQL query — replaces the per-scope fan-out pattern that issued
+        one query per visible scope.
         """
         ...
 
@@ -640,6 +986,8 @@ class StorageBackend(Protocol):
         scopes: list[tuple[str, str]],
         mem_type: str = "",
         limit: int = 20,
+        *,
+        acting_principal_id: str = "",
     ) -> list[dict[str, str]]:
         """OR-of-terms search across memories visible under *scopes*.
 
@@ -648,17 +996,61 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def touch_structured_memories(self, keys: list[tuple[str, str, str]]) -> int:
-        """Batch-touch multiple memories.
+    def list_visible_memory_index_entries(
+        self,
+        scopes: list[tuple[str, str]],
+        *,
+        acting_principal_id: str = "",
+    ) -> list[dict[str, str]]:
+        """Return complete visible index metadata without memory bodies."""
+        ...
 
-        Each key is ``(name, scope, scope_id)``.  Callers should deduplicate
-        before calling; each key increments ``access_count`` once per call.
-        Returns count of rows found and updated.
+    def get_memory_index_health_inputs(self) -> dict[str, list[dict[str, Any]]]:
+        """Return live topology plus all index metadata in one read snapshot.
+
+        Keys include index entries, workstreams, projects, memberships, users,
+        roles, user-role assignments, and role overrides.
+        The health calculator combines pre-rendered per-scope metrics from
+        these rows; it never scans every memory once per visibility envelope.
+        """
+        ...
+
+    def get_memory_index_snapshot(
+        self,
+        ws_id: str,
+    ) -> dict[str, Any] | None:
+        """Load the immutable index bound to one durable workstream row."""
+        ...
+
+    def acquire_memory_index_snapshot(
+        self,
+        ws_id: str,
+        principal_id: str,
+        *,
+        commit_context: Callable[[dict[str, Any]], AbstractContextManager[None]] | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically bind the first principal's complete index.
+
+        Workstream validation, live project ACL resolution, the
+        metadata read and first-writer insertion are one coherent database
+        transaction. A missing, provisional, or deleted workstream returns
+        ``None``. When a concrete candidate exists, ``commit_context`` is
+        entered around the final commit, after all blocking reads/rendering.
+        Its pre-yield phase may validate and raise, rolling back any newly
+        inserted candidate; the backend commit occurs as the context body at
+        yield. Its post-yield phase runs after commit and must remain
+        deterministic publication — an exception there cannot roll back the
+        already-committed snapshot.
         """
         ...
 
     def count_structured_memories(
-        self, mem_type: str = "", scope: str = "", scope_id: str = ""
+        self,
+        mem_type: str = "",
+        scope: str = "",
+        scope_id: str = "",
+        *,
+        acting_principal_id: str = "",
     ) -> int:
         """Count structured memories with optional type and scope filters."""
         ...
@@ -680,8 +1072,15 @@ class StorageBackend(Protocol):
         parent_ws_id: str | None = None,
         project_id: str | None = None,
         persona: str | None = None,
-    ) -> None:
-        """Create a workstreams row (no-op if already exists).
+        fork_reservation_token: str = "",
+    ) -> bool:
+        """Create a workstreams row and report whether it was inserted.
+
+        The ``workstreams.ws_id`` primary key is the authoritative live-ID
+        reservation. An existing row returns ``False``; generated-ID callers
+        may draw another ID while caller-selected IDs surface the collision.
+        Hard deletion releases the ID for later reuse after removing the
+        workstream and its owned state in the same transaction.
 
         ``kind`` accepts a ``WorkstreamKind`` member or its raw string value
         (``"interactive"`` / ``"coordinator"``); the storage edge validates
@@ -691,6 +1090,13 @@ class StorageBackend(Protocol):
         workstream was created with (display carrier — the snapshot lives in
         ``workstream_config``) — all normalized from the empty string to
         ``None`` at the storage edge.
+
+        ``fork_reservation_token`` is private create-path plumbing. When
+        non-empty, the backend stores it with the new row in the same
+        transaction under :data:`FORK_RESERVATION_CONFIG_KEY`; a rejected
+        duplicate must not alter the incumbent row's token. The token fences
+        exact operations against delete/re-register races; it is not part of
+        memory-index identity.
         """
         ...
 
@@ -742,6 +1148,42 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def delete_stale_creating_reservations(
+        self,
+        kind: WorkstreamKind | str,
+        cutoff: str,
+        exclude_ws_ids: list[str],
+        *,
+        live_node_ids: list[str],
+        local_node_id: str | None,
+    ) -> list[str]:
+        """Hard-delete abandoned provisional creates of *kind*.
+
+        Eligible rows must still be ``state='creating'``, have
+        ``updated < cutoff``, and not appear in ``exclude_ws_ids``. State, age
+        and deletion are checked under one backend transaction/row lock. When
+        the private incarnation token exists it is rechecked under that same
+        lock. Legacy/corrupt tokenless reservations are also recoverable: the
+        locked durable row itself is the incarnation fence, and backends emit
+        a warning when reclaiming one. Implementations must use the ordinary
+        complete-delete machinery so conversations, config, overrides and
+        attachment refcounts are cleaned together.
+
+        ``live_node_ids`` is required rather than optional: callers must skip
+        this operation when service liveness cannot be established. Rows owned
+        by a live peer are protected. ``local_node_id`` is the current
+        process's service id and is deliberately exempt from that protection;
+        after a restart the predecessor's rows carry the same stable id, while
+        the current process's live reservations are protected by
+        ``exclude_ws_ids`` plus the age cutoff.
+
+        This is intentionally separate from
+        :meth:`bulk_close_stale_orphans`. A provisional create was never
+        advertised and must be deleted, never made reopenable as ``closed``.
+        Returns the ids actually deleted.
+        """
+        ...
+
     def touch_workstream(self, ws_id: str) -> None:
         """Bump a workstream row's ``updated`` timestamp without touching its
         state.
@@ -765,7 +1207,20 @@ class StorageBackend(Protocol):
         ...
 
     def delete_workstream(self, ws_id: str) -> bool:
-        """Delete a workstream and all its conversations + config."""
+        """Delete a workstream and owned state, releasing its ID for reuse."""
+        ...
+
+    def delete_workstream_if_fork_reserved(
+        self,
+        ws_id: str,
+        fork_reservation_token: str,
+    ) -> bool:
+        """Delete only the durable incarnation carrying ``token``.
+
+        The token check and complete workstream deletion are one transaction.
+        It applies to provisional and published manager-created rows; a missing
+        or replaced row returns ``False`` without mutation.
+        """
         ...
 
     def list_orphan_conversations(self) -> list[dict[str, Any]]:
@@ -847,7 +1302,8 @@ class StorageBackend(Protocol):
 
         ``since`` is an ISO-8601 string matching the storage format
         (``YYYY-MM-DDTHH:MM:SS`` in UTC).  Lex compare is safe for the
-        same-offset timestamps storage writes.
+        same-offset timestamps storage writes.  Provisional
+        ``state='creating'`` rows are excluded until lifecycle publication.
         """
         ...
 
@@ -864,6 +1320,9 @@ class StorageBackend(Protocol):
         exclude_after: int | None = None,
     ) -> list[Any]:
         """Search conversation history. Returns (timestamp, ws_id, role, content, tool_name).
+
+        Conversation rows belonging to a provisional ``state='creating'``
+        workstream are excluded until lifecycle publication.
 
         ``user_id`` scopes results by project tenancy: rows are dropped when
         their workstream sits in an existing PRIVATE project and *user_id* is
@@ -889,7 +1348,8 @@ class StorageBackend(Protocol):
         """Return most recent conversation messages.
 
         ``user_id`` scopes rows by project tenancy exactly as in
-        :meth:`search_history`; ``None`` applies no scoping.
+        :meth:`search_history`; ``None`` applies no tenancy scoping.  Creating
+        workstreams remain excluded for every caller.
         """
         ...
 
@@ -938,7 +1398,11 @@ class StorageBackend(Protocol):
         ...
 
     def delete_user(self, user_id: str) -> bool:
-        """Delete user and cascade-delete all their tokens. Returns True if existed."""
+        """Delete a user and their dependent rows. Return whether the user existed.
+
+        A missing user is side-effect free, including when malformed historical
+        dependent rows still reference the absent id.
+        """
         ...
 
     def create_api_token(
@@ -1381,7 +1845,11 @@ class StorageBackend(Protocol):
         ...
 
     def assign_role(self, user_id: str, role_id: str, assigned_by: str) -> None:
-        """Assign a role to a user. No-op if already assigned."""
+        """Assign a role to a user. No-op if already assigned.
+
+        Raises ``ValueError`` when the user or role does not exist; assignment
+        never creates orphan authority rows.
+        """
         ...
 
     def unassign_role(self, user_id: str, role_id: str) -> bool:
@@ -1413,6 +1881,9 @@ class StorageBackend(Protocol):
         Returns ``(added, removed)`` — the role ids that actually
         transitioned in each direction so the caller can emit the same
         per-role audit log lines the per-role loop produced.
+
+        Raises ``ValueError`` when ``user_id`` or a desired role does not
+        exist; reconciliation never creates orphan authority rows.
         """
         ...
 
@@ -1823,7 +2294,8 @@ class StorageBackend(Protocol):
 
         Pairs with ``sum_workstream_tokens_batch`` to give the
         coordinator wait-loop one query per tick instead of two-per-id.
-        Row shape matches ``get_workstream`` (same projection).
+        Row shape and raw lifecycle semantics match ``get_workstream`` (same
+        projection), including provisional ``state='creating'`` rows.
 
         SECURITY: same caveat as ``sum_workstream_tokens_batch`` —
         no ownership / authorization check inside the batch result.
@@ -1900,6 +2372,8 @@ class StorageBackend(Protocol):
         judge_model: str,
         latency_ms: int,
         user_decision: str = "pending",
+        resolver_principal_id: str = "",
+        execution_principal_id: str = "",
     ) -> None:
         """Record an intent validation verdict.
 
@@ -1937,6 +2411,8 @@ class StorageBackend(Protocol):
         judge_model: str,
         latency_ms: int,
         user_decision: str = "pending",
+        resolver_principal_id: str = "",
+        execution_principal_id: str = "",
     ) -> None:
         """INSERT a verdict row, or UPDATE the judge-output fields on conflict.
 
@@ -2422,6 +2898,7 @@ class StorageBackend(Protocol):
         auth_mode: str = "static",
         obo_audience: str = "",
         obo_scopes: str = "",
+        max_concurrency: int = 0,
     ) -> None:
         """Create a model definition. No-op if definition_id already exists."""
         ...

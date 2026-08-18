@@ -662,7 +662,7 @@ class CoordinatorClient:
         except Exception:
             log.debug("coord_client.is_own_subtree.lookup_failed ws=%s", ws_id, exc_info=True)
             return False
-        if row is None:
+        if row is None or row.get("state") == "creating":
             return False
         if row.get("parent_ws_id") != self._coord_ws_id:
             return False
@@ -681,6 +681,8 @@ class CoordinatorClient:
         path.  Returns False on a missing / None row so callers can
         safely pass ``rows.get(wid)``.
         """
+        if row is not None and row.get("state") == "creating":
+            return False
         if ws_id == self._coord_ws_id:
             return True
         if row is None:
@@ -2150,6 +2152,7 @@ class CoordinatorClient:
 
 
 _PROVIDER_FIDELITY_KEYS: frozenset[str] = frozenset({"_provider_content", "provider_blocks"})
+_PRIVATE_MESSAGE_KEYS: frozenset[str] = frozenset({"_commit_key", "_provenance"})
 
 
 def _serialize_messages(
@@ -2171,9 +2174,15 @@ def _serialize_messages(
     for r in rows:
         if isinstance(r, dict):
             if include_provider_content:
-                out.append(r)
+                out.append({k: v for k, v in r.items() if k not in _PRIVATE_MESSAGE_KEYS})
             else:
-                out.append({k: v for k, v in r.items() if k not in _PROVIDER_FIDELITY_KEYS})
+                out.append(
+                    {
+                        k: v
+                        for k, v in r.items()
+                        if k not in _PROVIDER_FIDELITY_KEYS and k not in _PRIVATE_MESSAGE_KEYS
+                    }
+                )
         else:
             # Fall back to a string repr so at least something lands.
             out.append({"raw": str(r)})

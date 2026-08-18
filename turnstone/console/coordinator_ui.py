@@ -38,6 +38,8 @@ from turnstone.core.session_ui_base import SessionUIBase, fire_judge_verdict_met
 from turnstone.core.workstream import WorkstreamState
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from turnstone.console.collector import ClusterCollector
     from turnstone.console.metrics import ConsoleMetrics
     from turnstone.core.session_manager import SessionManager
@@ -274,6 +276,89 @@ class ConsoleCoordinatorUI(SessionUIBase):
             evt["acting_user_id"] = self._acting_user_id
         self._enqueue(evt)
 
+    def on_persistence_state_changed(self) -> None:
+        """Refresh the cluster row after journal failure or recovery.
+
+        The update stays on the operator cluster bus; it does not enter the
+        coordinator conversation event stream. It snapshots counters without
+        consuming terminal turn content and does not persist a synthetic
+        workstream-state transition.
+        """
+        # The registry read serves ONLY the row-state field (``ws.state``
+        # lives on the manager's row); the persistence field derives through
+        # the session bound at construction, so a miss — or an id-reuse
+        # replacement — can no longer report another session's journal.  A
+        # miss means the row left the cluster roster: nothing to refresh.
+        mgr = ConsoleCoordinatorUI._coord_mgr
+        collector = ConsoleCoordinatorUI._collector
+        if mgr is None or collector is None:
+            return
+        ws = mgr.get(self.ws_id)
+        if ws is None:
+            return
+        payload = self.snapshot_state_payload_non_consuming()
+        try:
+            collector.emit_console_ws_state(
+                self.ws_id,
+                ws.state.value,
+                tokens=payload["tokens"],
+                context_ratio=payload["context_ratio"],
+                activity=payload["activity"],
+                activity_state=payload["activity_state"],
+                persistence_state=self._current_persistence_state(),
+            )
+        except Exception:
+            log.debug(
+                "coord_ui.persistence_state_fanout_failed ws=%s",
+                self.ws_id,
+                exc_info=True,
+            )
+
+    def on_state_change_deferred(
+        self,
+        state: str,
+        *,
+        deferred_persistence: list[Callable[[], None]],
+        owner_valid: Callable[[], bool],
+    ) -> None:
+        """Defer durable state and every observer publication as one unit."""
+        evt: dict[str, Any] = {"type": "state_change", "state": state}
+        if self._acting_user_id:
+            evt["acting_user_id"] = self._acting_user_id
+
+        def _publish_local() -> None:
+            self._enqueue(evt)
+
+        if ConsoleCoordinatorUI._coord_mgr is not None:
+            try:
+                ws_state = WorkstreamState(state)
+            except ValueError:
+                log.debug("coord_ui.unknown_state state=%r ws=%s", state, self.ws_id)
+            else:
+                try:
+                    admitted = ConsoleCoordinatorUI._coord_mgr.set_state_deferred(
+                        self.ws_id,
+                        ws_state,
+                        deferred_persistence=deferred_persistence,
+                        after_persist=_publish_local,
+                        owner_valid=owner_valid,
+                    )
+                except Exception:
+                    log.debug(
+                        "coord_ui.set_state_failed ws=%s",
+                        self.ws_id,
+                        exc_info=True,
+                    )
+                else:
+                    if admitted:
+                        return
+
+        def _publish_local_if_owned() -> None:
+            if owner_valid():
+                _publish_local()
+
+        deferred_persistence.append(_publish_local_if_owned)
+
     def on_rename(self, name: str) -> None:
         self._enqueue({"type": "rename", "name": name})
         # Fan out to the cluster collector so the dashboard's coord
@@ -321,12 +406,8 @@ class ConsoleCoordinatorUI(SessionUIBase):
             return
         fire_judge_verdict_metric(cm, verdict, "heuristic")
 
-    def on_intent_verdict(
-        self,
-        verdict: dict[str, Any],
-        judge_event: object | None = None,
-    ) -> None:
-        super().on_intent_verdict(verdict, judge_event)
+    def _record_llm_judge_metric(self, verdict: dict[str, Any]) -> None:
+        """Record the console metric for one LLM-tier verdict."""
         cm = ConsoleCoordinatorUI._console_metrics
         if cm is None:
             return

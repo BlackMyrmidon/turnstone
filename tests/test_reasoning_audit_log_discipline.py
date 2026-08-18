@@ -27,7 +27,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
-from tests._session_helpers import make_session, scripted_provider
+from tests._session_helpers import make_registered_session, replace_session_lane, scripted_provider
 from turnstone.core.history_decoration import (
     extract_reasoning_for_history,
     extract_reasoning_text_from_provider_content,
@@ -229,22 +229,30 @@ class TestReasoningAuditLogDiscipline:
 
     def test_synth_reasoning_block_via_stream_response_does_not_log_reasoning(
         self,
+        tmp_db: str,
     ) -> None:
         """Drives session._stream_response (the real drain seam —
         _stream_attempt no longer exists post-#832; invokes
         model_turn.synth_reasoning_block at end-of-turn via
         finalize_provider_blocks) with a fake ``reasoning_delta=_MARKER``
         chunk; asserts no log call carried the marker text."""
-        session = make_session()
-        session._provider = scripted_provider(
-            [
-                StreamChunk(reasoning_delta=_MARKER, is_first=True),
-                StreamChunk(content_delta="answer"),
-                StreamChunk(
-                    finish_reason="stop",
-                    usage=UsageInfo(prompt_tokens=10, completion_tokens=20, total_tokens=30),
-                ),
-            ]
+        session = make_registered_session()
+        replace_session_lane(
+            session,
+            provider=scripted_provider(
+                [
+                    StreamChunk(reasoning_delta=_MARKER, is_first=True),
+                    StreamChunk(content_delta="answer"),
+                    StreamChunk(
+                        finish_reason="stop",
+                        usage=UsageInfo(
+                            prompt_tokens=10,
+                            completion_tokens=20,
+                            total_tokens=30,
+                        ),
+                    ),
+                ]
+            ),
         )
         session.messages.append(Turn.user("hi"))
         captured, patchers = _capture_log_calls()

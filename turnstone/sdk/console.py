@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from turnstone.api.console_schemas import (
     AdminMemoryInfo,
+    AdminMemorySummary,
     ClusterNodesResponse,
     ClusterOverviewResponse,
     ClusterSnapshotResponse,
@@ -36,11 +37,14 @@ from turnstone.api.console_schemas import (
     ListToolPoliciesResponse,
     ListUserRolesResponse,
     McpServerDetail,
+    MemoryIndexHealthResponse,
     NodeDetailResponse,
     OrgInfo,
     ParseSkillResponse,
     RegistrySearchResponse,
     RoleInfo,
+    RouteCreateResponse,
+    RouteLiveResponse,
     SettingInfo,
     SkillDiscoverResponse,
     SkillInfo,
@@ -164,10 +168,9 @@ class AsyncTurnstoneConsole(_BaseClient):
         initial_message: str = "",
         skill: str = "",
         persona: str = "",
+        project_id: str = "",
         resume_ws: str = "",
-        auto_approve: bool = False,
-        auto_approve_tools: str = "",
-        user_id: str = "",
+        judge_model: str = "",
     ) -> ConsoleCreateWsResponse:
         body: dict[str, Any] = {}
         if node_id:
@@ -182,14 +185,12 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["skill"] = skill
         if persona:
             body["persona"] = persona
+        if project_id:
+            body["project_id"] = project_id
         if resume_ws:
             body["resume_ws"] = resume_ws
-        if auto_approve:
-            body["auto_approve"] = True
-        if auto_approve_tools:
-            body["auto_approve_tools"] = auto_approve_tools
-        if user_id:
-            body["user_id"] = user_id
+        if judge_model:
+            body["judge_model"] = judge_model
         return await self._request(
             "POST",
             "/v1/api/cluster/workstreams/new",
@@ -213,24 +214,27 @@ class AsyncTurnstoneConsole(_BaseClient):
         name: str = "",
         model: str = "",
         auto_approve: bool = False,
-        auto_approve_tools: str = "",
+        auto_approve_tools: str | list[str] = "",
         initial_message: str = "",
         skill: str = "",
         persona: str = "",
+        project_id: str = "",
         resume_ws: str = "",
+        judge_model: str = "",
         target_node: str = "",
         user_id: str = "",
         client_type: str = "",
+        notify_targets: str | list[dict[str, str]] = "",
         ws_id: str = "",
         attachments: list[AttachmentUpload] | None = None,
-    ) -> dict[str, Any]:
+    ) -> RouteCreateResponse:
         """Create a workstream via the console's routing proxy.
 
         Posts to /v1/api/route/workstreams/new.  When *attachments* is
         non-empty, the request is sent as multipart and the console
         routes via ``?ws_id=<hex>`` (auto-generated when not supplied)
-        so the body lands on the owning node directly.  Returns the
-        full response dict including ``node_url`` and ``node_id``.
+        so the body lands on the owning node directly. Returns a typed
+        response including the selected node and routing strategy.
         """
         body: dict[str, Any] = {}
         if name:
@@ -247,14 +251,20 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["skill"] = skill
         if persona:
             body["persona"] = persona
+        if project_id:
+            body["project_id"] = project_id
         if resume_ws:
             body["resume_ws"] = resume_ws
+        if judge_model:
+            body["judge_model"] = judge_model
         if target_node:
             body["target_node"] = target_node
         if user_id:
             body["user_id"] = user_id
         if client_type:
             body["client_type"] = client_type
+        if notify_targets and notify_targets != "[]":
+            body["notify_targets"] = notify_targets
 
         if attachments:
             # The console's multipart route_create routes by `?ws_id=` only —
@@ -288,11 +298,17 @@ class AsyncTurnstoneConsole(_BaseClient):
                 files=files,
                 data={"meta": _json.dumps(body)},
                 params={"ws_id": ws_id},
+                response_model=RouteCreateResponse,
             )
 
         if ws_id:
             body["ws_id"] = ws_id
-        return await self._request("POST", "/v1/api/route/workstreams/new", json_body=body)
+        return await self._request(
+            "POST",
+            "/v1/api/route/workstreams/new",
+            json_body=body,
+            response_model=RouteCreateResponse,
+        )
 
     # -- routing proxy: attachments -----------------------------------------
 
@@ -349,6 +365,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         message: str,
         *,
         attachment_ids: list[str] | None = None,
+        client_send_id: str | None = None,
     ) -> dict[str, Any]:
         """Send a message to a coordinator workstream.
 
@@ -359,6 +376,8 @@ class AsyncTurnstoneConsole(_BaseClient):
         body: dict[str, Any] = {"message": message}
         if attachment_ids is not None:
             body["attachment_ids"] = attachment_ids
+        if client_send_id is not None:
+            body["client_send_id"] = client_send_id
         return await self._request("POST", f"/v1/api/workstreams/{ws_id}/send", json_body=body)
 
     async def coordinator_upload_attachment(
@@ -478,6 +497,14 @@ class AsyncTurnstoneConsole(_BaseClient):
         Returns {"node_url": "...", "node_id": "..."}.
         """
         return await self._request("GET", "/v1/api/route", params={"ws_id": ws_id})
+
+    async def route_workstream_live(self, ws_id: str) -> RouteLiveResponse:
+        """Check whether a routed workstream is loaded without opening it."""
+        return await self._request(
+            "GET",
+            f"/v1/api/route/workstreams/{ws_id}/live",
+            response_model=RouteLiveResponse,
+        )
 
     # -- streaming -----------------------------------------------------------
 
@@ -937,6 +964,27 @@ class AsyncTurnstoneConsole(_BaseClient):
             response_model=AdminMemoryInfo,
         )
 
+    async def update_memory_description(
+        self,
+        memory_id: str,
+        description: str,
+    ) -> AdminMemorySummary:
+        from turnstone.core.memory_index import normalize_memory_description
+
+        return await self._request(
+            "PATCH",
+            f"/v1/api/admin/memories/{memory_id}",
+            json_body={"description": normalize_memory_description(description)},
+            response_model=AdminMemorySummary,
+        )
+
+    async def memory_index_health(self) -> MemoryIndexHealthResponse:
+        return await self._request(
+            "GET",
+            "/v1/api/admin/memories/index-health",
+            response_model=MemoryIndexHealthResponse,
+        )
+
     async def delete_memory(self, memory_id: str) -> StatusResponse:
         return await self._request(
             "DELETE",
@@ -1247,10 +1295,9 @@ class TurnstoneConsole:
         initial_message: str = "",
         skill: str = "",
         persona: str = "",
+        project_id: str = "",
         resume_ws: str = "",
-        auto_approve: bool = False,
-        auto_approve_tools: str = "",
-        user_id: str = "",
+        judge_model: str = "",
     ) -> ConsoleCreateWsResponse:
         return self._runner.run(
             self._async.create_workstream(
@@ -1260,10 +1307,9 @@ class TurnstoneConsole:
                 initial_message=initial_message,
                 skill=skill,
                 persona=persona,
+                project_id=project_id,
                 resume_ws=resume_ws,
-                auto_approve=auto_approve,
-                auto_approve_tools=auto_approve_tools,
-                user_id=user_id,
+                judge_model=judge_model,
             )
         )
 
@@ -1280,17 +1326,20 @@ class TurnstoneConsole:
         name: str = "",
         model: str = "",
         auto_approve: bool = False,
-        auto_approve_tools: str = "",
+        auto_approve_tools: str | list[str] = "",
         initial_message: str = "",
         skill: str = "",
         persona: str = "",
+        project_id: str = "",
         resume_ws: str = "",
+        judge_model: str = "",
         target_node: str = "",
         user_id: str = "",
         client_type: str = "",
+        notify_targets: str | list[dict[str, str]] = "",
         ws_id: str = "",
         attachments: list[AttachmentUpload] | None = None,
-    ) -> dict[str, Any]:
+    ) -> RouteCreateResponse:
         return self._runner.run(
             self._async.route_create_workstream(
                 name=name,
@@ -1300,10 +1349,13 @@ class TurnstoneConsole:
                 initial_message=initial_message,
                 skill=skill,
                 persona=persona,
+                project_id=project_id,
                 resume_ws=resume_ws,
+                judge_model=judge_model,
                 target_node=target_node,
                 user_id=user_id,
                 client_type=client_type,
+                notify_targets=notify_targets,
                 ws_id=ws_id,
                 attachments=attachments,
             )
@@ -1320,9 +1372,15 @@ class TurnstoneConsole:
         message: str,
         *,
         attachment_ids: list[str] | None = None,
+        client_send_id: str | None = None,
     ) -> dict[str, Any]:
         return self._runner.run(
-            self._async.coordinator_send(ws_id, message, attachment_ids=attachment_ids)
+            self._async.coordinator_send(
+                ws_id,
+                message,
+                attachment_ids=attachment_ids,
+                client_send_id=client_send_id,
+            )
         )
 
     def coordinator_upload_attachment(
@@ -1409,6 +1467,9 @@ class TurnstoneConsole:
 
     def route_lookup(self, ws_id: str) -> dict[str, Any]:
         return self._runner.run(self._async.route_lookup(ws_id))
+
+    def route_workstream_live(self, ws_id: str) -> RouteLiveResponse:
+        return self._runner.run(self._async.route_workstream_live(ws_id))
 
     # -- streaming -----------------------------------------------------------
 
@@ -1674,6 +1735,16 @@ class TurnstoneConsole:
 
     def get_memory(self, memory_id: str) -> AdminMemoryInfo:
         return self._runner.run(self._async.get_memory(memory_id))
+
+    def update_memory_description(
+        self,
+        memory_id: str,
+        description: str,
+    ) -> AdminMemorySummary:
+        return self._runner.run(self._async.update_memory_description(memory_id, description))
+
+    def memory_index_health(self) -> MemoryIndexHealthResponse:
+        return self._runner.run(self._async.memory_index_health())
 
     def delete_memory(self, memory_id: str) -> StatusResponse:
         return self._runner.run(self._async.delete_memory(memory_id))

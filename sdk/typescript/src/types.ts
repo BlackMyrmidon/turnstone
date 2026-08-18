@@ -2,6 +2,13 @@
 // Shared types
 // ---------------------------------------------------------------------------
 
+/** Sanitized operator-visible state of accepted conversation persistence. */
+export type ConversationPersistenceState =
+  | "healthy"
+  | "pending"
+  | "retrying"
+  | "conflict";
+
 export interface ErrorResponse {
   error: string;
 }
@@ -56,6 +63,11 @@ export interface SendRequest {
    * workstream are auto-consumed; an empty list disables auto-consume.
    */
   attachment_ids?: string[];
+  /**
+   * Opaque optimistic-send correlation echoed by user_turn/history.
+   * Reusing it does not collapse or deduplicate accepted turns.
+   */
+  client_send_id?: string;
 }
 
 export interface SendResponse {
@@ -116,7 +128,26 @@ export interface ApproveRequest {
   approved: boolean;
   feedback?: string | null;
   always?: boolean;
-  ws_id: string;
+  /** Resolve exactly this approval cycle. */
+  cycle_id?: string | null;
+  /** Resolve the approval cycle containing this tool call. */
+  call_id?: string | null;
+}
+
+export interface ApproveResponse {
+  status: string;
+  /** The cycle resolved by the request, or null when none was pending. */
+  cycle_id: string | null;
+}
+
+export interface CancelRequest {
+  force?: boolean;
+}
+
+export interface CancelResponse {
+  status: string;
+  /** Credential-redacted snapshot of pending work affected by cancellation. */
+  dropped: Record<string, unknown>;
 }
 
 export interface CommandRequest {
@@ -128,7 +159,20 @@ export interface CreateWorkstreamRequest {
   name?: string;
   model?: string;
   auto_approve?: boolean;
+  /** Tool names accepted as a CSV string or array; blanks are removed server-side. */
+  auto_approve_tools?: string | string[];
+  /** Override judge model alias for this workstream. */
+  judge_model?: string;
+  /**
+   * Owner override for trusted service identities. Ordinary callers remain
+   * bound to their authenticated principal.
+   */
+  user_id?: string;
   resume_ws?: string;
+  /** Completion-notification targets as JSON text or structured target objects. */
+  notify_targets?: string | Array<Record<string, string>>;
+  /** Client surface label such as web, cli, chat, or scheduled. */
+  client_type?: string;
   skill?: string;
   /**
    * Persona name (slug) to create the workstream with. Resolved and
@@ -193,6 +237,8 @@ export interface WorkstreamInfo {
   parent_ws_id: string | null;
   user_id: string;
   project_id: string | null;
+  /** Defaults to `healthy` when omitted by an older node. */
+  persistence_state?: ConversationPersistenceState;
 }
 
 export interface ListWorkstreamsResponse {
@@ -208,14 +254,33 @@ export interface WorkstreamDetailResponse {
   state: string;
   user_id: string;
   kind: string;
+  /** Defaults to `healthy` when omitted by an older node. */
+  persistence_state?: ConversationPersistenceState;
 }
 
 export interface WorkstreamHistoryResponse {
   ws_id: string;
-  // Tail of the workstream's reconstructed message history
-  // (provider-fidelity OpenAI-like shape). Bounded by the ?limit=
-  // query param (default 100, max 500).
+  /**
+   * Requested limit-bounded tail of the authoritative total accepted
+   * conversation-row prefix.
+   * Roles include user, assistant, tool, and system; projected compaction and
+   * cancellation markers participate in the same prefix.
+   */
   messages: Record<string, unknown>[];
+  /** Initial event-ring cursor returned by the history projection, if needed. */
+  cursor: number | null;
+  /**
+   * Opaque one-shot token naming the exact live prefix used for this render.
+   * Null for a workstream that is not currently loaded.
+   */
+  handoff_token: string | null;
+}
+
+export interface StreamEventsOptions {
+  /** Initial event-ring cursor, normally copied from `getHistory()`. */
+  lastEventId?: number;
+  /** One-shot live-prefix token, copied only from the history just rendered. */
+  historyToken?: string;
 }
 
 export interface DashboardWorkstream {
@@ -232,6 +297,8 @@ export interface DashboardWorkstream {
   node?: string;
   model?: string;
   model_alias?: string;
+  /** Defaults to `healthy` when omitted by an older node. */
+  persistence_state?: ConversationPersistenceState;
 }
 
 export interface DashboardAggregate {
@@ -498,6 +565,8 @@ export interface ClusterWorkstreamInfo {
   activity?: string;
   activity_state?: string;
   tool_calls?: number;
+  /** Defaults to `healthy` when omitted by an older node. */
+  persistence_state?: ConversationPersistenceState;
 }
 
 export interface ClusterWorkstreamsResponse {
@@ -541,13 +610,33 @@ export interface ConsoleCreateWsRequest {
   skill?: string;
   /** Persona slug — resolved and snapshotted at creation. */
   persona?: string;
+  /** Project to attach the workstream to. */
+  project_id?: string;
   resume_ws?: string;
+  /** Override judge model alias for this workstream. */
+  judge_model?: string;
 }
 
 export interface ConsoleCreateWsResponse {
   status: string;
   correlation_id: string;
   target_node: string;
+}
+
+export interface RouteCreateRequest extends CreateWorkstreamRequest {
+  /** Pin placement to this node by generating a matching rendezvous key. */
+  target_node?: string;
+}
+
+export interface RouteCreateResponse extends CreateWorkstreamResponse {
+  node_url: string;
+  node_id: string;
+  routing_strategy: "rendezvous" | "target_node" | "resume";
+}
+
+export interface RouteLiveResponse {
+  ws_id: string;
+  live: boolean;
 }
 
 export interface ConsoleHealthResponse {
@@ -805,26 +894,31 @@ export interface WorkstreamsOptions {
 export interface SaveMemoryRequest {
   name: string;
   content: string;
-  description?: string;
+  description: string;
   type?: "user" | "general" | "feedback" | "reference";
   scope?: "global" | "workstream" | "user";
   scope_id?: string;
 }
 
-export interface MemoryInfo {
+export interface MemorySummary {
   memory_id: string;
   name: string;
   description: string;
   type: string;
   scope: string;
   scope_id: string;
-  content: string;
   created: string;
   updated: string;
+  last_accessed: string;
+  access_count: number;
+}
+
+export interface MemoryInfo extends MemorySummary {
+  content: string;
 }
 
 export interface ListMemoriesResponse {
-  memories: MemoryInfo[];
+  memories: MemorySummary[];
   total: number;
 }
 
@@ -843,29 +937,36 @@ export interface ListMemoriesOptions {
   limit?: number;
 }
 
-export interface DeleteMemoryOptions {
+export interface MemoryScopeOptions {
   scope?: string;
   scope_id?: string;
 }
 
+export type GetMemoryOptions = MemoryScopeOptions;
+export type DeleteMemoryOptions = MemoryScopeOptions;
+
 // -- Console API: Admin Memories --------------------------------------------
 
-export interface AdminMemoryInfo {
+export interface AdminMemorySummary {
   memory_id: string;
   name: string;
   description: string;
   type: string;
   scope: string;
   scope_id: string;
-  content: string;
+  scope_label: string;
   created: string;
   updated: string;
   last_accessed: string;
   access_count: number;
 }
 
+export interface AdminMemoryInfo extends AdminMemorySummary {
+  content: string;
+}
+
 export interface ListAdminMemoriesResponse {
-  memories: AdminMemoryInfo[];
+  memories: AdminMemorySummary[];
   total: number;
 }
 
@@ -882,6 +983,16 @@ export interface AdminSearchMemoriesOptions {
   scope?: string;
   scope_id?: string;
   limit?: number;
+}
+
+export interface MemoryIndexHealthResponse {
+  budget_chars: number;
+  over_budget: boolean;
+  max_char_count: number;
+  max_entry_count: number;
+  over_by_chars: number;
+  invalid_description_count: number;
+  envelope_count: number;
 }
 
 // -- Console API: MCP Servers -----------------------------------------------

@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # TC002 suppressed deliberately: pydantic resolves the stringified annotation
 # at class-build time, so SkipJsonSchema must exist at runtime — under
 # TYPE_CHECKING the import vanishes and model creation fails.
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002
 
+from turnstone.api.server_schemas import CreateWorkstreamRequest, CreateWorkstreamResponse
+from turnstone.core.model_registry import MAX_MODEL_CONCURRENCY
 from turnstone.core.skill_kind import SkillKind
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
+
+# Pydantic resolves this annotation while constructing the model schema.
+from turnstone.core.workstream import ConversationPersistenceState  # noqa: TC001
 
 # ---------------------------------------------------------------------------
 # Cluster overview
@@ -83,6 +88,13 @@ class ClusterWorkstreamInfo(BaseModel):
     activity: str = ""
     activity_state: str = ""
     tool_calls: int = 0
+    persistence_state: ConversationPersistenceState = Field(
+        default="healthy",
+        description=(
+            "Sanitized durable-history status for a live row. Older nodes and "
+            "unloaded persisted-only rows default to healthy."
+        ),
+    )
 
 
 class ClusterWorkstreamsResponse(BaseModel):
@@ -161,7 +173,8 @@ class ConsoleCreateWsRequest(BaseModel):
         description="Project to attach the workstream to (validated against membership, empty = none)",
     )
     resume_ws: str = Field(
-        default="", description="Workstream ID to resume (loads previous conversation)"
+        default="",
+        description=("Source workstream ID or alias to fork atomically into the new workstream"),
     )
     judge_model: str = Field(
         default="", description="Override judge model alias for this workstream"
@@ -603,6 +616,8 @@ class VerdictInfo(BaseModel):
     tier: str
     judge_model: str = ""
     user_decision: str = ""
+    resolver_principal_id: str = ""
+    execution_principal_id: str = ""
     latency_ms: int = 0
     created: str
 
@@ -676,23 +691,48 @@ class CreateChannelUserRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class AdminMemoryInfo(BaseModel):
+class AdminMemorySummary(BaseModel):
     memory_id: str
     name: str
     description: str = ""
     type: str
     scope: str
     scope_id: str = ""
-    content: str
+    scope_label: str = ""
     created: str
     updated: str
     last_accessed: str = ""
     access_count: int = 0
 
 
+class AdminMemoryInfo(AdminMemorySummary):
+    content: str
+
+
 class ListAdminMemoriesResponse(BaseModel):
-    memories: list[AdminMemoryInfo]
+    memories: list[AdminMemorySummary]
     total: int = 0
+
+
+class UpdateMemoryDescriptionRequest(BaseModel):
+    description: str = Field(min_length=1, max_length=512)
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def _normalize_description(cls, value: object) -> str:
+        from turnstone.core.memory_index import normalize_memory_description
+
+        return normalize_memory_description(value)
+
+
+class MemoryIndexHealthResponse(BaseModel):
+    budget_chars: int
+    over_budget: bool
+    max_char_count: int
+    max_entry_count: int
+    over_by_chars: int
+    invalid_description_count: int
+    envelope_count: int
 
 
 # ---------------------------------------------------------------------------
@@ -1000,6 +1040,18 @@ class RegistryInstallRequest(BaseModel):
 # Admin: Model Definitions
 # ---------------------------------------------------------------------------
 
+ModelMaxConcurrency: TypeAlias = Annotated[
+    int,
+    Field(
+        strict=True,
+        ge=0,
+        le=MAX_MODEL_CONCURRENCY,
+        description=(
+            "Maximum concurrent model generations for this alias in one process; zero means unlimited."
+        ),
+    ),
+]
+
 
 class ModelDefinitionInfo(BaseModel):
     definition_id: str
@@ -1009,6 +1061,7 @@ class ModelDefinitionInfo(BaseModel):
     base_url: str = ""
     api_key: str = ""
     context_window: int = 32768
+    max_concurrency: ModelMaxConcurrency = 0
     capabilities: str = "{}"
     enabled: bool = True
     temperature: float | None = None
@@ -1057,6 +1110,7 @@ class CreateModelDefinitionRequest(BaseModel):
     base_url: str = ""
     api_key: str = ""
     context_window: int = 32768
+    max_concurrency: ModelMaxConcurrency = 0
     capabilities: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
     temperature: float | None = None
@@ -1076,6 +1130,12 @@ class UpdateModelDefinitionRequest(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
     context_window: int | None = None
+    # The runtime update handler is presence-keyed.  Keep null out of the
+    # advertised union because explicit JSON null is refused; clients clear a
+    # limit by sending the canonical unlimited value, zero.
+    max_concurrency: ModelMaxConcurrency | SkipJsonSchema[None] = Field(
+        default_factory=lambda: None
+    )
     # SkipJsonSchema drops the null member from the ADVERTISED union while the
     # Python type still tolerates None: the presence-keyed update handler
     # refuses an explicit JSON null, so advertising null would let generated
@@ -1377,12 +1437,37 @@ class RouteResponse(BaseModel):
     node_id: str
 
 
-class RouteCreateResponse(BaseModel):
+class RouteLiveResponse(BaseModel):
+    """Non-mutating live-session probe for one routed workstream."""
+
+    ws_id: str
+    live: bool
+
+
+class RouteCreateRequest(CreateWorkstreamRequest):
+    """JSON workstream creation through the routing proxy."""
+
+    target_node: str = Field(
+        default="",
+        description=(
+            "Optional node id to pin placement to. The console generates a "
+            "workstream id whose rendezvous owner is that node."
+        ),
+    )
+
+
+class RouteCreateResponse(CreateWorkstreamResponse):
     """Workstream creation via the routing proxy."""
 
-    ws_id: str = ""
-    node_url: str = ""
-    node_id: str = ""
+    node_url: str
+    node_id: str
+    routing_strategy: Literal["rendezvous", "target_node", "resume"] = Field(
+        description=(
+            "Placement reason: rendezvous for a destination id, target_node for "
+            "a generated pinned id, or resume when an atomic fork is routed by "
+            "its canonical source id"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1460,6 +1545,16 @@ class CoordinatorSendRequest(BaseModel):
     """Body for POST /v1/api/workstreams/{ws_id}/send."""
 
     message: str = Field(description="User message to queue onto the coordinator's worker.")
+    client_send_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description=(
+            "Opaque browser correlation token echoed in the accepted `user_turn` "
+            "event and history row. It is not an idempotency key."
+        ),
+    )
     attachment_ids: list[str] | None = Field(
         default=None,
         description=(
@@ -1510,14 +1605,25 @@ class CoordinatorApproveRequest(BaseModel):
     approved: bool = Field(description="True approves the pending tool call(s); False denies.")
     feedback: str | None = Field(
         default=None,
-        description="Optional human feedback string forwarded to the model.",
+        description=(
+            "Optional feedback forwarded under the initiating execution principal; "
+            "authorized peer resolvers must omit it."
+        ),
     )
     always: bool = Field(
         default=False,
         description=(
-            "When approved=True, also adds the pending tool name(s) to the session's "
-            "auto-approve set so subsequent calls of the same tool skip the prompt."
+            "For a same-principal approval, adds the pending tool name(s) to that "
+            "execution principal's auto-approve set. Authorized peers cannot set it."
         ),
+    )
+    cycle_id: str | None = Field(
+        default=None,
+        description="Resolve this exact approval cycle",
+    )
+    call_id: str | None = Field(
+        default=None,
+        description="Resolve the approval cycle containing this tool call",
     )
 
 
@@ -1680,7 +1786,8 @@ class ClusterWsDetailResponse(BaseModel):
     live: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "Live in-flight counters (state, tokens, activity, pending_approval) when "
+            "Live in-flight counters and sanitized durable-history status "
+            "(state, tokens, activity, pending_approval, persistence_state) when "
             "the owning node returns them; null on degrade."
         ),
     )

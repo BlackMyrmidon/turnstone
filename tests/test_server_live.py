@@ -30,6 +30,7 @@ import httpx
 import pytest
 from openai import OpenAI
 
+from tests._session_helpers import replace_session_lane
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import init_storage, reset_storage
 
@@ -158,6 +159,7 @@ def tmp_db():
 
 def _make_session(client, model_id, tmp_db, **kwargs) -> tuple[ChatSession, RecordingUI]:
     """Create a ChatSession with RecordingUI and sensible test defaults."""
+    from turnstone.core.memory import register_workstream
     from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 
     ui = RecordingUI()
@@ -173,8 +175,12 @@ def _make_session(client, model_id, tmp_db, **kwargs) -> tuple[ChatSession, Reco
     )
     defaults.update(kwargs)
     session = ChatSession(**defaults)
+    # Production creates the parent workstream before admitting any keyed
+    # conversation row.  These direct-session tests mirror that ordering so
+    # the storage orphan-write fence remains exercised rather than bypassed.
+    register_workstream(session.ws_id, user_id=kwargs.get("user_id"))
     # Mock-based tests use Chat Completions format (client.chat.completions)
-    session._provider = OpenAIChatCompletionsProvider()
+    replace_session_lane(session, provider=OpenAIChatCompletionsProvider())
     session.auto_approve = True
     return session, ui
 
@@ -325,7 +331,13 @@ class TestBackendConnectivity:
             temperature=0.0,
             stream=False,
         )
-        assert resp.choices[0].message.content or resp.choices[0].message.reasoning_content
+        message = resp.choices[0].message
+        # OpenAI-compatible servers use either non-standard field for parsed
+        # reasoning (vLLM: ``reasoning``; llama.cpp: ``reasoning_content``).
+        reasoning = getattr(message, "reasoning", None) or getattr(
+            message, "reasoning_content", None
+        )
+        assert message.content or reasoning
         assert resp.usage.total_tokens > 0
 
 

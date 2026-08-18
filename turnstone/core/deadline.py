@@ -57,24 +57,103 @@ class StreamAbortRef(list[Any]):
     fix here must be mirrored there.
     """
 
-    __slots__ = ("_aborted",)
+    __slots__ = (
+        "_aborted",
+        "_cancel_event",
+        "_cancel_handles",
+        "_timing_lock",
+        "_admission_wait_started",
+        "_admission_wait_credit",
+        "_dispatch_count",
+        "_last_dispatch_at",
+    )
 
-    def __init__(self) -> None:
+    def __init__(self, cancel_event: threading.Event | None = None) -> None:
         super().__init__()
         self._aborted = False
+        self._cancel_event = cancel_event
+        self._cancel_handles: list[Any] = []
+        self._timing_lock = threading.Lock()
+        self._admission_wait_started: float | None = None
+        self._admission_wait_credit = 0.0
+        self._dispatch_count = 0
+        self._last_dispatch_at: float | None = None
 
     def append(self, stream: Any) -> None:
         super().append(stream)
-        if self._aborted:
+        if self.aborted:
             with contextlib.suppress(Exception):
                 stream.close()
+
+    def register_cancel_handle(self, handle: Any) -> None:
+        """Expose *handle* to abort without marking a stream as accepted.
+
+        Providers use this while validating an HTTP response body that arrived
+        before a usable event stream.  Keeping it out of the list preserves the
+        caller's creation-vs-mid-stream classifier; the same late-arrival race
+        as :meth:`append` still closes an already-aborted handle immediately.
+        """
+        self._cancel_handles.append(handle)
+        if self.aborted:
+            with contextlib.suppress(Exception):
+                handle.close()
+
+    def unregister_cancel_handle(self, handle: Any) -> None:
+        """Remove one identity-matched cancellation-only handle."""
+        for index, registered in enumerate(self._cancel_handles):
+            if registered is handle:
+                self._cancel_handles.pop(index)
+                break
 
     def abort(self) -> None:
         """Close any captured stream; late arrivals close on append."""
         self._aborted = True
-        for stream in list(self):
+        for stream in [*list(self), *list(self._cancel_handles)]:
             with contextlib.suppress(Exception):
                 stream.close()
+
+    def begin_admission_wait(self) -> None:
+        """Freeze this call's deadline while it waits for model admission."""
+        with self._timing_lock:
+            if self._admission_wait_started is None:
+                self._admission_wait_started = time.monotonic()
+
+    def end_admission_wait(self) -> None:
+        """Resume the deadline and retain the elapsed admission credit."""
+        now = time.monotonic()
+        with self._timing_lock:
+            started = self._admission_wait_started
+            if started is None:
+                return
+            self._admission_wait_credit += max(0.0, now - started)
+            self._admission_wait_started = None
+
+    def admission_wait_credit(self) -> float:
+        """Return completed plus currently accruing admission-wait time."""
+        now = time.monotonic()
+        with self._timing_lock:
+            credit = self._admission_wait_credit
+            if self._admission_wait_started is not None:
+                credit += max(0.0, now - self._admission_wait_started)
+            return credit
+
+    def mark_dispatch(self) -> None:
+        """Record a provider dispatch without changing deadline semantics."""
+        with self._timing_lock:
+            self._dispatch_count += 1
+            self._last_dispatch_at = time.monotonic()
+
+    @property
+    def dispatch_count(self) -> int:
+        """Number of provider dispatch attempts observed by this ref."""
+        with self._timing_lock:
+            return self._dispatch_count
+
+    @property
+    def last_dispatch_at(self) -> float | None:
+        """Monotonic timestamp of the latest provider dispatch, if any."""
+        with self._timing_lock:
+            return self._last_dispatch_at
 
     @property
     def aborted(self) -> bool:
@@ -91,7 +170,7 @@ class StreamAbortRef(list[Any]):
         meets the arriving handle at :meth:`append`, which is why that
         hook is not redundant with them.
         """
-        return self._aborted
+        return self._aborted or bool(self._cancel_event is not None and self._cancel_event.is_set())
 
 
 def run_abortable_with_deadline(
@@ -114,7 +193,7 @@ def run_abortable_with_deadline(
             timeout=...,
         )
     """
-    abort_ref = StreamAbortRef()
+    abort_ref = StreamAbortRef(cancel_event)
     return run_with_deadline(
         lambda: fn(abort_ref),
         timeout=timeout,
@@ -122,6 +201,7 @@ def run_abortable_with_deadline(
         poll=poll,
         thread_name=thread_name,
         on_abandon=abort_ref.abort,
+        deadline_credit=abort_ref.admission_wait_credit,
     )
 
 
@@ -133,6 +213,7 @@ def run_with_deadline(
     poll: float = 1.0,
     thread_name: str = "deadline-worker",
     on_abandon: Callable[[], None] | None = None,
+    deadline_credit: Callable[[], float] | None = None,
 ) -> _T:
     """Run ``fn()`` on a daemon thread, bounded by ``timeout``/``cancel_event``.
 
@@ -152,6 +233,11 @@ def run_with_deadline(
 
     ``poll`` bounds how often ``cancel_event`` is checked (and thus the worst-
     case latency from a cancel to this function returning).
+
+    ``deadline_credit`` may dynamically extend the original deadline.  The
+    abortable wrapper uses it only for time spent queued at model admission;
+    lowering, attachment materialization, credential minting, dispatch,
+    draining, and retry backoff continue to consume the original budget.
     """
     box: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
 
@@ -185,7 +271,11 @@ def run_with_deadline(
 
         if cancel_event is not None and cancel_event.is_set():
             _abandon(DeadlineCancelledError())
-        remaining = deadline - time.monotonic()
+        credit = 0.0
+        if deadline_credit is not None:
+            with contextlib.suppress(Exception):
+                credit = max(0.0, float(deadline_credit()))
+        remaining = deadline + credit - time.monotonic()
         if remaining <= 0:
             _abandon(DeadlineExceededError())
         try:

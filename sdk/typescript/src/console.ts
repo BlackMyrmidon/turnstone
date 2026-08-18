@@ -1,8 +1,10 @@
 import { BaseClient, type ClientOptions } from "./base.js";
 import type { ClusterEvent } from "./events.js";
+import { normalizeMemoryDescription } from "./memory_description.js";
 import type {
   AdminListMemoriesOptions,
   AdminMemoryInfo,
+  AdminMemorySummary,
   AdminSearchMemoriesOptions,
   AttachmentContent,
   AttachmentUpload,
@@ -18,8 +20,6 @@ import type {
   ConsoleCreateWsRequest,
   ConsoleCreateWsResponse,
   ConsoleHealthResponse,
-  CreateWorkstreamRequest,
-  CreateWorkstreamResponse,
   ListAttachmentsResponse,
   CreateMcpServerRequest,
   CreatePolicyOptions,
@@ -36,9 +36,13 @@ import type {
   ListSettingsResponse,
   ListSkillResourcesResponse,
   ListSkillsResponse,
+  MemoryIndexHealthResponse,
   McpServerDetail,
   RegistryInstallRequest,
   RegistrySearchResponse,
+  RouteCreateRequest,
+  RouteCreateResponse,
+  RouteLiveResponse,
   SkillDiscoverResponse,
   SkillInfo,
   SkillInstallRequest,
@@ -154,10 +158,8 @@ export class TurnstoneConsole extends BaseClient {
    * owning node directly.
    */
   async routeCreateWorkstream(
-    opts?: CreateWorkstreamRequest & { target_node?: string },
-  ): Promise<
-    CreateWorkstreamResponse & { node_url?: string; node_id?: string }
-  > {
+    opts?: RouteCreateRequest,
+  ): Promise<RouteCreateResponse> {
     const attachments = opts?.attachments;
     if (attachments && attachments.length > 0) {
       // The console's multipart route_create routes by `?ws_id=` only —
@@ -190,6 +192,13 @@ export class TurnstoneConsole extends BaseClient {
     return this.request("POST", "/v1/api/route/workstreams/new", {
       json: opts ?? {},
     });
+  }
+
+  async routeWorkstreamLive(wsId: string): Promise<RouteLiveResponse> {
+    return this.request(
+      "GET",
+      `/v1/api/route/workstreams/${encodeURIComponent(wsId)}/live`,
+    );
   }
 
   async routeUploadAttachment(
@@ -486,6 +495,20 @@ export class TurnstoneConsole extends BaseClient {
 
   async getMemory(memoryId: string): Promise<AdminMemoryInfo> {
     return this.request("GET", `/v1/api/admin/memories/${memoryId}`);
+  }
+
+  async updateMemoryDescription(
+    memoryId: string,
+    description: string,
+  ): Promise<AdminMemorySummary> {
+    const normalized = normalizeMemoryDescription(description);
+    return this.request("PATCH", `/v1/api/admin/memories/${memoryId}`, {
+      json: { description: normalized },
+    });
+  }
+
+  async memoryIndexHealth(): Promise<MemoryIndexHealthResponse> {
+    return this.request("GET", "/v1/api/admin/memories/index-health");
   }
 
   async deleteMemory(memoryId: string): Promise<StatusResponse> {

@@ -36,6 +36,21 @@ users to the admin Settings API.
 
 ---
 
+## Approval Wait Timeout
+
+`tools.approval_timeout_seconds` controls how long a workstream waits for a
+human approval decision. The default `0` disables passive timeout denial: the
+workstream waits until an authorized user approves or rejects the request, or
+until the workstream is cancelled or closed. Set `3600` to restore the previous
+one-hour behavior.
+
+The value is captured when each approval batch begins. A hot reload therefore
+affects the next approval without changing the deadline of a request already
+waiting. This setting does not make approvals durable across process restarts;
+pending approval cycles remain in memory.
+
+---
+
 ## Per-Model Sampling Overrides
 
 The global `model.temperature`, `model.max_tokens`, and `model.reasoning_effort`
@@ -53,6 +68,39 @@ Resolution order for sampling parameters:
 When a per-model override is `NULL` (empty in the UI), the global default is
 used. Switching models via `/model <alias>` re-resolves sampling parameters
 from the new model's overrides or global defaults.
+
+### Per-model concurrency
+
+Each model definition may set `max_concurrency` to limit simultaneous model
+generations for that alias in one Turnstone process. `0` or an omitted value
+means unlimited. The gate is shared by every role using the alias—interactive
+turns, coordinators, task agents, judges, output guards, perception, compaction,
+and title generation—and a streaming generation holds its slot until the
+stream is fully drained or closed.
+
+Admission is strictly per alias. Two aliases remain independent even when they
+point to the same URL; Turnstone does not infer shared capacity from endpoint
+text. Queue time is excluded from judge/output-guard deadline accounting, and
+each retry releases its slot before backoff and reacquires for the next wire
+attempt. The cap is local to each process, not cluster-wide; account for the
+number of nodes targeting the same inference server. Cohere/Jina reranking
+selected through the Reranker role consumes the same gate as every other use of
+that alias. Direct STT/TTS protocol calls do not consume this generation cap.
+
+### Judge batch parallelism
+
+`judge.parallel_evaluations` controls how many independent tool calls from one
+approval batch the intent judge evaluates concurrently. It is an integer from
+1 through 16 and defaults to 1, preserving serial evaluation until an operator
+opts into wider fan-out. Changes are hot-read at the next batch; work already
+in flight keeps its captured worker count.
+
+This is a per-batch fan-out setting, not another backend capacity limit. The
+judge model alias's `max_concurrency` gate still caps total generations across
+all judge batches and every other role using that alias. Actual overlap is
+therefore bounded by the batch size, `judge.parallel_evaluations`, and available
+alias admission slots. A smaller positive alias cap also narrows the batch's
+worker pool so excess judge threads do not queue ahead of later alias traffic.
 
 ### Model backend authentication
 
@@ -134,6 +182,15 @@ delegated-mode rows and memo entries. `entra_app` rows belong to the shared
 revocation, an already-minted app bearer remains usable until its recorded
 expiry.
 
+Each model call resolves its dynamic credential against the immutable model
+definition snapshot that supplied that call's provider, client, endpoint, and
+model ID. An admin edit can therefore never pair an old `base_url` with a new
+audience, grant mode, or static-key fallback input. The principal and token
+remain per-call/live; the connection and model-owned auth configuration move
+together as one binding on the next operation. The deployment-wide
+`model.auth_fail_closed` switch is intentionally read live on every mint, so an
+operator can tighten fallback policy immediately without rebuilding sessions.
+
 `obo_audience` and `obo_scopes` are literal and capped at 2048 characters
 each. Environment-variable expansion is deliberately not applied, so the
 allow-list decision cannot vary by node or expand beyond the persisted
@@ -211,16 +268,16 @@ initialization:
 |---------|----------|
 | `model` | default_alias, auth_audience_allowlist, auth_fail_closed, temperature, max_tokens, reasoning_effort, task_alias, task_effort |
 | `session` | instructions, retention_days, compact_max_tokens, auto_compact_pct |
-| `tools` | timeout, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
+| `tools` | timeout, approval_timeout_seconds, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
 | `server` | workstream_idle_timeout, max_workstreams |
 | `cluster` | node_fan_out_limit, mcp_max_servers |
 | `mcp` | config_path, registry_url |
 | `ratelimit` | enabled, requests_per_second, burst, trusted_proxies |
 | `health` | backend_probe_interval, backend_probe_timeout, circuit_breaker_threshold, circuit_breaker_cooldown |
-| `judge` | enabled, model, provider, base_url, api_key, confidence_threshold, max_context_ratio, timeout, read_only_tools, output_guard, redact_secrets, cancel_on_approval |
+| `judge` | enabled, model, smart_approvals, confidence_threshold, max_context_ratio, timeout, parallel_evaluations, read_only_tools, output_guard, output_guard_budget_seconds, output_guard_llm, output_guard_model, output_guard_llm_timeout, redact_secrets, cancel_on_approval |
 | `interface` | close_tab_action, theme |
 | `skills` | discovery_url |
-| `memory` | relevance_k, fetch_limit, max_content, nudge_cooldown, nudges |
+| `memory` | relevance_k, index_budget_chars, model_index_over_budget_notice, max_content, nudge_cooldown, nudges |
 
 Settings are addressed by dotted key (e.g. `memory.relevance_k`). Each has a
 declared type (`int`, `float`, `str`, `bool`), optional `min_value`/`max_value`
@@ -394,13 +451,11 @@ Reset a setting to its registry default by removing it from storage.
 
 ## Secret Settings
 
-Settings with `is_secret=True` (currently only `judge.api_key`) are blocked
-from the write API with a `403` response. This prevents accidental exposure
-through the admin UI or audit logs. Secret settings must be configured via
-`config.toml` or environment variables.
-
-The list endpoint masks secret values: stored secrets appear as `"***"`
-rather than their actual value.
+The registry currently defines no production secret system setting. The generic
+machinery nevertheless treats any future `is_secret=True` entry as write-only:
+list and write responses return `"***"`, and submitting that sentinel preserves
+the stored value. Model API keys are fields on model definitions—not
+`judge.*` system settings—and use the Models tab's separate write-only flow.
 
 ---
 
@@ -421,9 +476,45 @@ reload.
 **Behavior after reload:**
 
 - New workstreams pick up updated values immediately (via `session_factory`)
-- Existing sessions keep their frozen configuration (settings are captured at
-  workstream creation time, not read on every turn)
+- Most workstream/session settings remain the snapshot captured at creation or
+  resume. Component docs call out deliberate live-read exceptions; for
+  example, Smart Approval settings and the human approval timeout are
+  snapshotted at the start of each approval batch.
 - Settings marked `restart_required=True` need a server restart to take effect
+
+### Model-definition reloads
+
+The Models tab has a separate live-reload contract from ordinary ConfigStore
+settings. Existing sessions remember the concrete registry generation that
+supplied their active alias and re-resolve that alias at the start of the next
+send. Endpoint, provider, backend model ID, capabilities, extra parameters, and
+backend-auth configuration are replaced as one immutable binding. In-flight
+turns, judges, and task agents finish or cancel against the binding they
+started with; an admin edit never tears one request across two definitions.
+The alias's admission gate is retained and resized in place, so a concurrency
+edit preserves in-flight accounting and does not reset cached judges or the
+output-guard rate limiter.
+
+The Reranker role is resolved from one coherent ConfigStore snapshot for each
+retrieval batch, so existing sessions observe alias or instruction changes
+without reconstruction. A relevant model-definition edit retires the old
+reranker transport and lets active requests drain on their immutable lanes;
+cap-only and unrelated edits keep the pooled transport warm.
+
+Sampling and other saved workstream configuration remain workstream state. A
+model-definition edit does not silently rewrite a live workstream's chosen
+temperature, reasoning effort, max tokens, skill, or persona. Use
+`/model <alias>` (or create/fork a workstream) when an explicit session-level
+model switch is intended.
+
+If a live workstream's alias is deleted, its next send first attempts the
+configured fallback chain. Without a usable fallback, the operator-facing
+error names the removed alias and points interactive users to `/model`; adding
+the alias back causes the next send to rebind without a process restart. If a
+replacement client cannot be constructed, Turnstone logs one
+`session.model_refresh_client_construction_failed` warning per registry
+generation and retries only after another model reload, avoiding a rebuild
+storm on every send.
 
 ---
 

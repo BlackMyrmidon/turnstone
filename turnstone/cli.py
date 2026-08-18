@@ -158,11 +158,20 @@ class TerminalUI(SessionUI):
         sys.stdout.write("\n")
         sys.stdout.flush()
 
+    @staticmethod
+    def _approval_was_cancelled(items: list[dict[str, Any]]) -> bool:
+        """Whether a close/Stop retired the operation owning this gate."""
+        return any(
+            bool(getattr(item.get("_approval_cancel_witness"), "aborted", False)) for item in items
+        )
+
     def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
         """Display tool previews and prompt for batch approval.
 
         Returns (approved: bool, feedback: str | None).
         """
+        if self._approval_was_cancelled(items):
+            return False, "Cancelled by user"
         pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
         # Evaluate admin tool policies (deny/allow/ask) before prompting.
@@ -194,6 +203,12 @@ class TerminalUI(SessionUI):
                         ]
             except Exception:
                 logging.getLogger(__name__).debug("Policy evaluation unavailable", exc_info=True)
+
+        # Policy lookup is the one potentially blocking step before the prompt.
+        # Recheck ownership so a close that landed during storage I/O cannot
+        # paint or solicit approval for a retired tool batch.
+        if self._approval_was_cancelled(items):
+            return False, "Cancelled by user"
 
         with self._print_lock:
             # Print all headers, previews, and heuristic verdicts
@@ -445,6 +460,25 @@ class WorkstreamTerminalUI(TerminalUI):
             return
         self.manager.set_state(self.ws_id, ws_state)
 
+    def on_state_change_deferred(
+        self,
+        state: str,
+        *,
+        deferred_persistence: list[Callable[[], None]],
+        owner_valid: Callable[[], bool],
+    ) -> None:
+        """Keep CLI state storage outside ChatSession's generation lock."""
+        try:
+            ws_state = WorkstreamState(state)
+        except ValueError:
+            return
+        self.manager.set_state_deferred(
+            self.ws_id,
+            ws_state,
+            deferred_persistence=deferred_persistence,
+            owner_valid=owner_valid,
+        )
+
     # -- output buffering when in background --------------------------------
 
     def on_thinking_start(self) -> None:
@@ -523,7 +557,14 @@ class WorkstreamTerminalUI(TerminalUI):
             )
             if tool_names:
                 self._buffer("info", f"{YELLOW}Waiting for approval: {tool_names}{RESET}")
-            self._fg_event.wait()
+            # Foreground state is persistent, so close must not set this event
+            # merely to wake us: a later durability refusal would leave a live
+            # background workstream acting foregrounded. Poll the gate's
+            # monotonic cancellation witness instead; the bounded interval is
+            # comfortably inside soft-close's structural grace period.
+            while not self._fg_event.wait(timeout=0.05):
+                if self._approval_was_cancelled(items):
+                    return False, "Cancelled by user"
         return super().approve_tools(items)
 
     def flush_buffer(self) -> None:
@@ -976,6 +1017,16 @@ def _close_all_sessions(manager: SessionManager) -> None:
         print(dim("  (interrupted — background shells already signalled)"))
 
 
+def _judge_parallel_evaluations_arg(value: str) -> int:
+    """Argparse adapter for the registry's strict bounded integer contract."""
+    from turnstone.core.settings_registry import validate_value
+
+    try:
+        return int(validate_value("judge.parallel_evaluations", value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Interactive CLI for OpenAI-compatible models with tool calling.",
@@ -1168,6 +1219,14 @@ def main() -> None:
         help="LLM judge timeout in seconds (default: 120)",
     )
     judge_group.add_argument(
+        "--judge-parallel-evaluations",
+        dest="judge_parallel_evaluations",
+        type=_judge_parallel_evaluations_arg,
+        default=1,
+        metavar="N",
+        help="Concurrent LLM evaluations within one judge batch, 1-16 (default: 1)",
+    )
+    judge_group.add_argument(
         "--judge-confidence",
         dest="judge_confidence",
         type=float,
@@ -1297,6 +1356,7 @@ def main() -> None:
         model=args.judge_model,
         confidence_threshold=args.judge_confidence,
         timeout=args.judge_timeout,
+        parallel_evaluations=args.judge_parallel_evaluations,
     )
 
     # ChatSession factory — captures shared config for creating workstreams
@@ -1315,17 +1375,28 @@ def main() -> None:
         # no project surface, so the value is discarded.
         project_id: str = "",
         persona_snapshot: PersonaSnapshot | None = None,
+        fork_reservation_token: str = "",
     ) -> ChatSession:
         assert ui is not None, "session_factory requires a non-None UI"
         del project_id
         from turnstone.core.model_turn import (
             resolve_effort_setting,
+            resolve_model_binding,
             resolve_temperature_setting,
         )
 
-        # The generation comes back from resolve()'s own lock hold, exactly
-        # paired with the client it vouches for; hand it to the constructor.
-        r_client, r_model, r_cfg, registry_generation = registry.resolve(model_alias)
+        # Resolve every stable model facet under one registry lock hold.  Passing
+        # the same immutable binding through to ChatSession prevents a reload in
+        # the construction window from pairing an old client/config with a new
+        # provider.
+        effective_alias = model_alias or registry.default
+        model_binding = resolve_model_binding(registry, effective_alias)
+        r_client = model_binding.lane.client
+        r_model = model_binding.lane.model
+        r_cfg = model_binding.config
+        if r_cfg is None:
+            raise RuntimeError(f"model binding for alias {effective_alias!r} has no config")
+        registry_generation = model_binding.registry_generation
         # An explicit CLI flag is the user speaking; otherwise the knobs
         # ride the shared assignment scheme (the CLI has no ConfigStore,
         # so the rungs are the model config, then unset = wire omission).
@@ -1352,7 +1423,8 @@ def main() -> None:
             mcp_client=mcp_client,
             registry=registry,
             registry_generation=registry_generation,
-            model_alias=model_alias or registry.default,
+            model_alias=effective_alias,
+            model_binding=model_binding,
             tool_search=args.tool_search,
             tool_search_threshold=args.tool_search_threshold,
             tool_search_max_results=args.tool_search_max_results,
@@ -1362,6 +1434,7 @@ def main() -> None:
             kind=kind,
             parent_ws_id=parent_ws_id,
             persona_snapshot=persona_snapshot,
+            fork_reservation_token=fork_reservation_token,
         )
 
     # Create session manager and initial workstream. The InteractiveAdapter
@@ -1383,6 +1456,10 @@ def main() -> None:
         max_active=50,
     )
     cli_adapter.attach(manager)
+    # CLI has no background maintenance lifespan. Recover crash-abandoned
+    # hidden creates once per launch after the manager is fully wired and
+    # before a new caller-visible id can collide with durable residue.
+    manager.reap_stale_creating_reservations()
 
     # Resolve the persona stamp BEFORE constructing the session — the four
     # levers apply inside ``ChatSession.__init__``, so resolution can't wait.

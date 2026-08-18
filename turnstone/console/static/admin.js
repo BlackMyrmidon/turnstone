@@ -240,7 +240,10 @@ function switchAdminTab(tab) {
     _populateAuditUserFilter();
     loadGovAudit();
   }
-  if (tab === "memories") loadAdminMemories();
+  if (tab === "memories") {
+    loadAdminMemories();
+    loadMemoryIndexHealth();
+  }
   if (tab === "models") loadAdminModels();
   if (tab === "node-metadata") loadAdminNodeMetadata();
   if (tab === "settings") loadSettings();
@@ -3887,24 +3890,31 @@ function loadTlsCerts() {
 
         const colActions = document.createElement("span");
         colActions.className = "admin-col admin-col-actions";
-        const kebab = _kebabMenuEl([
-          {
+        const actions = [];
+        if (c.renewable) {
+          actions.push({
             label: "Renew",
             attrs: {
               "data-tls-renew": c.domain,
               "aria-label": "Renew certificate for " + c.domain,
             },
-          },
-          {
+          });
+        }
+        if (c.deletable) {
+          actions.push({
             label: "Delete",
             kind: "danger",
             attrs: {
               "data-tls-delete": c.domain,
               "aria-label": "Delete certificate for " + c.domain,
             },
-          },
-        ]);
-        colActions.appendChild(kebab);
+          });
+        }
+        if (actions.length > 0) {
+          colActions.appendChild(_kebabMenuEl(actions));
+        } else {
+          colActions.textContent = "Managed by node";
+        }
 
         row.appendChild(colDomain);
         row.appendChild(colSans);
@@ -6735,7 +6745,7 @@ const MODEL_ROLES = [
   {
     label: "Reranker",
     description:
-      "Reranks web_search results. Point at a model whose base_url is a Cohere/Jina-compatible /rerank endpoint and whose capabilities include supports_rerank. Empty disables reranking. Enabling a reranker sends web_search results AND BM25 retrieval candidates (tool/skill descriptions and memory content) to this endpoint; self-hosted endpoints keep it on your infrastructure.",
+      "Reranks web_search results. Point at a model whose base_url is a Cohere/Jina-compatible /rerank endpoint and whose capabilities include supports_rerank. Empty disables reranking. Enabling a reranker sends web_search results and BM25 candidate metadata (tool/skill descriptions plus memory names/descriptions, never memory bodies) to this endpoint; self-hosted endpoints keep it on your infrastructure.",
     aliasKey: "tools.reranker_alias",
     fallbackKind: "disabled",
     disabledLabel: "(disabled — reranking off)",
@@ -7525,8 +7535,9 @@ function _renderModels(items) {
       colAlias.appendChild(document.createTextNode(" "));
       colAlias.appendChild(defBadge);
     }
-    // Per-model sampling override indicators
+    // Non-default per-model setting indicators
     const overrides = [];
+    if (m.max_concurrency > 0) overrides.push("limit=" + m.max_concurrency);
     if (m.temperature != null) overrides.push("temp=" + m.temperature);
     if (m.max_tokens != null) overrides.push("max_tok=" + m.max_tokens);
     if (m.reasoning_effort != null)
@@ -7569,10 +7580,10 @@ function _renderModels(items) {
       const ovrSpan = document.createElement("span");
       ovrSpan.className = "model-overrides-hint";
       ovrSpan.textContent = overrides.join(", ");
-      ovrSpan.title = "Per-model overrides (override global defaults)";
+      ovrSpan.title = "Per-model settings";
       ovrSpan.setAttribute(
         "aria-label",
-        "Per-model overrides: " + overrides.join(", "),
+        "Per-model settings: " + overrides.join(", "),
       );
       colAlias.appendChild(document.createElement("br"));
       colAlias.appendChild(ovrSpan);
@@ -7746,6 +7757,7 @@ function showCreateModelModal() {
   document.getElementById("model-api-key").value = "";
   document.getElementById("model-api-key").placeholder = "sk-...";
   document.getElementById("model-ctx-window").value = "0";
+  document.getElementById("model-max-concurrency").value = "0";
   document.getElementById("model-temperature").value = "";
   document.getElementById("model-max-tokens").value = "";
   document.getElementById("model-reasoning-effort").value = "";
@@ -7855,6 +7867,8 @@ function showEditModelModal(definitionId) {
         "\u2022\u2022\u2022 (leave blank to keep existing)";
       document.getElementById("model-ctx-window").value =
         m.context_window != null ? m.context_window : 0;
+      document.getElementById("model-max-concurrency").value =
+        m.max_concurrency != null ? m.max_concurrency : 0;
       document.getElementById("model-temperature").value =
         m.temperature != null ? m.temperature : "";
       document.getElementById("model-max-tokens").value =
@@ -8141,6 +8155,24 @@ function submitCreateModel() {
     capabilities: caps,
     enabled: document.getElementById("model-enabled").checked,
   };
+
+  // Per-alias admission. Empty and zero are the canonical unlimited value;
+  // every other spelling must be an exact non-negative integer.
+  const concurrencyText = document
+    .getElementById("model-max-concurrency")
+    .value.trim();
+  const maxConcurrency = concurrencyText === "" ? 0 : Number(concurrencyText);
+  if (
+    !Number.isInteger(maxConcurrency) ||
+    maxConcurrency < 0 ||
+    maxConcurrency > 2147483647
+  ) {
+    _showModelError(
+      "Max concurrent generations must be a whole number from 0 to 2147483647",
+    );
+    return;
+  }
+  form.max_concurrency = maxConcurrency;
 
   // Per-model sampling overrides — null when empty (use global default)
   const tempVal = document.getElementById("model-temperature").value.trim();

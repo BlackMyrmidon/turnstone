@@ -30,7 +30,12 @@ from tests._parity_832 import (
     run_scenario,
     write_fixture,
 )
-from tests._session_helpers import RecordingUI, make_session, scripted_provider
+from tests._session_helpers import (
+    RecordingUI,
+    make_registered_session,
+    replace_session_lane,
+    scripted_provider,
+)
 from turnstone.core.providers._protocol import StreamChunk, UsageInfo
 from turnstone.core.trajectory import Turn
 
@@ -97,7 +102,7 @@ def _apply_ruled_deltas(name: str, baseline: dict[str, Any]) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize("name", sorted(SCENARIOS))
-def test_parity(name: str) -> None:
+def test_parity(name: str, tmp_db: str) -> None:
     record = run_scenario(name)
     if UPDATE:
         write_fixture(name, record)
@@ -127,9 +132,9 @@ class TestDisplayCommitMirror:
 
     def _mirror(self, chunks: list[StreamChunk]) -> tuple[str, str]:
         ui = RecordingUI()
-        session = make_session(ui=ui)
+        session = make_registered_session(ui=ui)
         session._RETRY_BASE_DELAY = 0
-        session._provider = scripted_provider(chunks)
+        replace_session_lane(session, provider=scripted_provider(chunks))
         session.messages.append(Turn.user("hi"))
         result = session._stream_response(0)
         displayed = "".join(d for k, d in ui.events if k == "content")
@@ -249,7 +254,7 @@ class TestDisplayCommitMirror:
             ),
         ],
     )
-    def test_mirror(self, name: str, chunks: list[StreamChunk]) -> None:
+    def test_mirror(self, name: str, chunks: list[StreamChunk], tmp_db: str) -> None:
         stamped = [*chunks]
         # Ride usage on the finish chunk so the strict gate passes.
         for i, c in enumerate(stamped):

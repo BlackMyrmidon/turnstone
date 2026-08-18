@@ -1,4 +1,8 @@
-import type { ClusterOverviewResponse, ClusterSnapshotNode } from "./types.js";
+import type {
+  ClusterOverviewResponse,
+  ClusterSnapshotNode,
+  ConversationPersistenceState,
+} from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Server SSE events
@@ -35,6 +39,37 @@ export interface HistoryEvent {
   messages: Array<Record<string, unknown>>;
 }
 
+/**
+ * The REST history rendered by the caller no longer names the live accepted
+ * row prefix. Stop this stream, refetch and render history, then open a new
+ * stream with its cursor and one-shot token. The SDK does not do this
+ * automatically.
+ */
+export interface HistoryResyncEvent {
+  type: "history_resync";
+  /** Present on registration-time handoff mismatches; implied by a scoped stream. */
+  ws_id?: string;
+  reason: string;
+}
+
+/** One accepted user row, projected live to every workstream consumer. */
+export interface UserTurnEvent {
+  type: "user_turn";
+  ws_id?: string;
+  content: string;
+  attachments?: Array<{
+    attachment_id: string;
+    kind: string;
+    filename: string;
+    mime_type: string;
+  }>;
+  sender?: string;
+  source?: string;
+  /** Optimistic-browser correlation only; not delivery idempotency. */
+  client_send_ids: string[];
+  _event_id?: number;
+}
+
 export interface ThinkingStartEvent {
   type: "thinking_start";
 }
@@ -63,6 +98,17 @@ export interface InProgressSnapshotEvent {
   type: "in_progress_snapshot";
   content: string;
   reasoning: string;
+}
+
+/** Latest prompt usage for one running task agent. Fresh/truncated streams
+ *  replay one reading per active parent through this same event shape. A
+ *  ToolResultEvent with a matching call_id is the terminal signal. */
+export interface AgentContextEvent {
+  type: "agent_context";
+  ws_id?: string;
+  parent_call_id: string;
+  prompt_tokens: number;
+  context_window: number;
 }
 
 export interface StateChangeEvent {
@@ -112,6 +158,12 @@ export interface ToolResultEvent {
   name: string;
   output: string;
   is_error?: boolean;
+  preview?: Record<string, unknown>;
+  /** True only for the final guarded row accepted into conversation history. */
+  accepted?: boolean;
+  effect_status?: string;
+  /** Monotonic accepted-row identity; present for projection-capable clients. */
+  _event_id?: number;
 }
 
 export interface ToolOutputChunkEvent {
@@ -162,13 +214,19 @@ export interface CancelledEvent {
  * auto adds `where` + `pct`); `progress` carries chunked-summarization
  * `part`/`total`/`depth` (or `retry_in`/`error` for a retry wait); `end`
  * carries `ok` plus either `before_tokens`/`after_tokens`/`summary` or the
- * failure `reason`/`message`. The successful end's summary also replays from
- * `/history` as a `role: "system"`, `source: "compaction"` entry.
+ * failure `reason`/`message`. `target: "workstream"` owns the transcript and
+ * durable marker. `target: "task_agent"` carries `parent_call_id`, is
+ * transient nested progress, and omits its private `summary` on success.
+ * Events without a target are workstream events because that was the only
+ * compaction scope before targeted events existed.
  */
 export interface CompactionEvent {
   type: "compaction";
   phase: "start" | "progress" | "end";
-  /** Correlates every event of one compaction run (0 from legacy emitters). */
+  target?: "workstream" | "task_agent";
+  /** Present when target is `task_agent`; keys the nested task card. */
+  parent_call_id?: string;
+  /** Correlates every event of one compaction attempt. */
   compaction_id?: number;
   /**
    * End events only: true marks a force-abandoned compaction retiring
@@ -178,8 +236,8 @@ export interface CompactionEvent {
   superseded?: boolean;
   /**
    * Failed ends only: the emitter-computed display verdict — show
-   * `message` only when true, instead of re-deriving suppression from
-   * reason/trigger/superseded client-side.
+   * `message` only when true. Workstream errors use their paired typed error;
+   * task-agent errors use this targeted notice instead.
    */
   notice?: boolean;
   /** Present on start and on every end (ok or failed). */
@@ -210,6 +268,8 @@ export interface WsStateEvent {
   context_ratio: number;
   activity: string;
   activity_state: string;
+  /** Defaults to `healthy` when omitted by an older node. */
+  persistence_state?: ConversationPersistenceState;
   /** Full assistant response text — populated on idle transitions only. */
   content?: string;
 }
@@ -237,12 +297,15 @@ export interface WsClosedEvent {
 export type ServerEvent =
   | ConnectedEvent
   | HistoryEvent
+  | HistoryResyncEvent
+  | UserTurnEvent
   | ThinkingStartEvent
   | ThinkingStopEvent
   | ContentEvent
   | ReasoningEvent
   | StreamEndEvent
   | InProgressSnapshotEvent
+  | AgentContextEvent
   | StateChangeEvent
   | ToolInfoEvent
   | ApproveRequestEvent
@@ -284,6 +347,8 @@ export interface ClusterStateEvent {
   context_ratio: number;
   activity: string;
   activity_state: string;
+  /** Defaults to `healthy` when omitted by an older node. */
+  persistence_state?: ConversationPersistenceState;
 }
 
 export interface ClusterWsCreatedEvent {
@@ -291,6 +356,8 @@ export interface ClusterWsCreatedEvent {
   ws_id: string;
   node_id: string;
   name: string;
+  /** Defaults to `healthy` when omitted by an older node. */
+  persistence_state?: ConversationPersistenceState;
 }
 
 export interface ClusterWsClosedEvent {
@@ -347,6 +414,10 @@ export function isInProgressSnapshotEvent(
   return e.type === "in_progress_snapshot";
 }
 
+export function isAgentContextEvent(e: ServerEvent): e is AgentContextEvent {
+  return e.type === "agent_context";
+}
+
 export function isStateChangeEvent(e: ServerEvent): e is StateChangeEvent {
   return e.type === "state_change";
 }
@@ -373,4 +444,14 @@ export function isApprovalResolvedEvent(
 
 export function isCancelledEvent(e: ServerEvent): e is CancelledEvent {
   return e.type === "cancelled";
+}
+
+export function isHistoryResyncEvent(
+  e: ServerEvent,
+): e is HistoryResyncEvent {
+  return e.type === "history_resync";
+}
+
+export function isUserTurnEvent(e: ServerEvent): e is UserTurnEvent {
+  return e.type === "user_turn";
 }

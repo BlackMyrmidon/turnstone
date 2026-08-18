@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "1.8.0a5",
+    "version": "1.8.0a7",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -55,7 +55,7 @@
         "tags": [
           "Workstreams"
         ],
-        "description": "Accepts two content types. Default is `application/json` with a `CreateWorkstreamRequest` body. Alternatively, `multipart/form-data` with one `meta` field (JSON-encoded `CreateWorkstreamRequest` shape) plus zero-or-more `file` parts saves each file as an attachment under the new workstream. When `initial_message` is also set, attachments are resolved onto that turn before the worker thread dispatches; otherwise they remain pending for a follow-up `POST /v1/api/workstreams/{ws_id}/send`.",
+        "description": "Accepts two content types. Default is `application/json` with a `CreateWorkstreamRequest` body. Alternatively, `multipart/form-data` with one `meta` field (JSON-encoded `CreateWorkstreamRequest` shape) plus zero-or-more `file` parts saves each file as an attachment under the new workstream. When `initial_message` is also set, attachments are resolved onto that turn before the worker thread dispatches; otherwise they remain pending for a follow-up `POST /v1/api/workstreams/{ws_id}/send`. Setting `resume_ws` atomically forks the visible source history, configuration, project, persona, and attachment references into a distinct destination; it does not reopen or mutate the source. Attachments and `resume_ws` cannot be combined. Creation stays unpublished until validation and the optional fork transaction complete.",
         "requestBody": {
           "required": true,
           "content": {
@@ -87,6 +87,26 @@
               }
             }
           },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Error 409",
             "content": {
@@ -106,6 +126,36 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Error 429",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -117,6 +167,7 @@
         "tags": [
           "Workstreams"
         ],
+        "description": "Unloads the live workstream while preserving storage. Returns 409 when any accepted live conversation row still requires persistence reconciliation; the workstream remains loaded and its history journal is retained. Returns 503 when cancellation cleanup has not yet finished; retrying close is safe.",
         "parameters": [
           {
             "name": "ws_id",
@@ -160,6 +211,26 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -335,13 +406,33 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StatusResponse"
+                  "$ref": "#/components/schemas/ApproveResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
             "content": {
               "application/json": {
                 "schema": {
@@ -442,7 +533,7 @@
           }
         ],
         "requestBody": {
-          "required": true,
+          "required": false,
           "content": {
             "application/json": {
               "schema": {
@@ -457,7 +548,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StatusResponse"
+                  "$ref": "#/components/schemas/CancelResponse"
                 }
               }
             }
@@ -492,6 +583,7 @@
         "tags": [
           "Chat"
         ],
+        "description": "Claims the workstream mutation slot, durably truncates the requested tail, then emits clear_ui. Concurrent sends are ordered after the cut; a storage failure returns 503 without changing live history.",
         "parameters": [
           {
             "name": "ws_id",
@@ -542,6 +634,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -553,6 +655,7 @@
         "tags": [
           "Chat"
         ],
+        "description": "Uses one workstream worker claim for the durable truncation and the replacement generation, so another send cannot enter between them. A storage failure returns 503 without changing live history.",
         "parameters": [
           {
             "name": "ws_id",
@@ -593,6 +696,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -604,7 +717,7 @@
         "tags": [
           "Streaming"
         ],
-        "description": "Opens a Server-Sent Events stream scoped to a single workstream. Returns text/event-stream. See API reference for event types.",
+        "description": "Opens a Server-Sent Events stream scoped to a single workstream. After rendering REST history, pass its opaque handoff_token once as ?history_token=; it names the exact accepted conversation-row prefix used for that render. A history_resync event closes this stream and requires a fresh history read; numeric event replay is not a substitute. Native Last-Event-ID reconnects take priority. Pass ?user_turn=1 to opt into typed accepted-user events; otherwise those rows become a backward-compatible strong-repair frame. Pass ?tool_turn=1 to receive the final accepted tool row as a typed tool_result with accepted=true; without it, accepted tool rows use the same pre-row strong-repair projection. Returns text/event-stream. See API reference for event types.",
         "parameters": [
           {
             "name": "ws_id",
@@ -613,6 +726,42 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "last_event_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Numeric per-workstream event cursor for manual reconnects."
+          },
+          {
+            "name": "history_token",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque one-shot token naming the accepted prefix rendered from REST history."
+          },
+          {
+            "name": "user_turn",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Set to 1 to receive typed user_turn events instead of history-repair frames."
+          },
+          {
+            "name": "tool_turn",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Set to 1 to receive final accepted tool_result projections."
           }
         ],
         "responses": {
@@ -912,7 +1061,7 @@
         "tags": [
           "Workstreams"
         ],
-        "description": "Returns the tail of the conversation in OpenAI-like message format. Persisted-but-not-loaded workstreams (closed / evicted) serve history without rehydrating. Lifted from the coord-only surface in the Stage 2 history/detail verb lift \u2014 interactive previously only exposed history through the SSE replay on ``/events``.",
+        "description": "Returns the tail of the conversation in OpenAI-like message format. Persisted-but-not-loaded workstreams (closed / evicted) are rehydrated before history is served so every successful response participates in the REST-to-SSE handoff. Lifted from the coord-only surface in the Stage 2 history/detail verb lift \u2014 interactive previously only exposed history through the SSE replay on ``/events``. Messages are the requested limit-bounded tail of one authoritative total accepted conversation-row prefix: user, assistant, tool, and system rows, including projected compaction checkpoints and cancellation markers. The opaque handoff_token names the exact prefix used for the render and is passed once on initial SSE registration. Admission of a later row changes the token; durable acknowledgement does not. If the durable prefix cannot be loaded, the endpoint returns 503 with `History temporarily unavailable`; that response is not authoritative and supplies no usable handoff token.",
         "parameters": [
           {
             "name": "ws_id",
@@ -1740,7 +1889,7 @@
     },
     "/v1/api/memories": {
       "get": {
-        "summary": "List structured memories",
+        "summary": "List structured memories. Without a scope, returns global plus the authenticated user's memories; workstream scope is owner-bound.",
         "operationId": "v1_api_memories_get",
         "tags": [
           "Memories"
@@ -1762,7 +1911,7 @@
             "schema": {
               "type": "string"
             },
-            "description": "Filter by scope"
+            "description": "Filter by public scope: global, workstream, or user"
           },
           {
             "name": "scope_id",
@@ -1794,6 +1943,46 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       },
@@ -1819,7 +2008,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/MemoryInfo"
+                  "$ref": "#/components/schemas/MemorySummary"
                 }
               }
             }
@@ -1833,13 +2022,43 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
     },
     "/v1/api/memories/search": {
       "post": {
-        "summary": "Search structured memories by query",
+        "summary": "Search structured memories by query. Without a scope, searches global plus the authenticated user's memories.",
         "operationId": "v1_api_memories_search_post",
         "tags": [
           "Memories"
@@ -1864,11 +2083,139 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
     },
     "/v1/api/memories/{name}": {
+      "get": {
+        "summary": "Fetch a structured memory body by exact name and scope",
+        "operationId": "v1_api_memories_{name}_get",
+        "tags": [
+          "Memories"
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Memory identifier. Raw aliases may contain supported Latin letters that fold to ASCII, ASCII digits, Unicode space separators, Unicode hyphens, and single underscores. The server normalizes them to a lowercase ASCII snake_case key of at most 256 characters. Other characters and leading, trailing, or repeated underscores are rejected."
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Scope (default: global)"
+          },
+          {
+            "name": "scope_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Scope identifier"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
       "delete": {
         "summary": "Delete a structured memory by name and scope",
         "operationId": "v1_api_memories_{name}_delete",
@@ -1882,7 +2229,8 @@
             "required": true,
             "schema": {
               "type": "string"
-            }
+            },
+            "description": "Memory identifier. Raw aliases may contain supported Latin letters that fold to ASCII, ASCII digits, Unicode space separators, Unicode hyphens, and single underscores. The server normalizes them to a lowercase ASCII snake_case key of at most 256 characters. Other characters and leading, trailing, or repeated underscores are rejected."
           },
           {
             "name": "scope",
@@ -1914,8 +2262,38 @@
               }
             }
           },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
             "content": {
               "application/json": {
                 "schema": {
@@ -2264,6 +2642,22 @@
             "title": "Message",
             "type": "string"
           },
+          "client_send_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9_-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Opaque browser correlation token echoed in the accepted `user_turn` event and history row. It is not an idempotency key; repeated sends with the same value remain distinct turns.",
+            "title": "Client Send Id"
+          },
           "attachment_ids": {
             "anyOf": [
               {
@@ -2388,14 +2782,40 @@
               }
             ],
             "default": null,
-            "description": "Optional denial reason",
+            "description": "Optional feedback forwarded under the initiating execution principal; authorized peer resolvers must omit it.",
             "title": "Feedback"
           },
           "always": {
             "default": false,
-            "description": "Auto-approve the tools in this batch going forward",
+            "description": "For a same-principal approval, auto-approve these tools for future calls executing as that principal. Authorized peers cannot set this.",
             "title": "Always",
             "type": "boolean"
+          },
+          "cycle_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Resolve this exact approval cycle",
+            "title": "Cycle Id"
+          },
+          "call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Resolve the approval cycle containing this tool call",
+            "title": "Call Id"
           }
         },
         "required": [
@@ -2404,10 +2824,35 @@
         "title": "ApproveRequest",
         "type": "object"
       },
+      "ApproveResponse": {
+        "properties": {
+          "status": {
+            "default": "ok",
+            "description": "Request outcome",
+            "title": "Status",
+            "type": "string"
+          },
+          "cycle_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Approval cycle that was resolved, or null when none was pending",
+            "title": "Cycle Id"
+          }
+        },
+        "title": "ApproveResponse",
+        "type": "object"
+      },
       "CommandRequest": {
         "properties": {
           "command": {
-            "description": "Slash command (e.g. /clear, /new, /resume)",
+            "description": "Workstream-local slash command (for example /clear or /instructions). Lifecycle commands such as /new and /resume are local-CLI-only; remote clients use the dedicated workstream endpoints.",
             "title": "Command",
             "type": "string"
           },
@@ -2434,6 +2879,24 @@
           }
         },
         "title": "CancelRequest",
+        "type": "object"
+      },
+      "CancelResponse": {
+        "properties": {
+          "status": {
+            "default": "ok",
+            "description": "Request outcome",
+            "title": "Status",
+            "type": "string"
+          },
+          "dropped": {
+            "additionalProperties": true,
+            "description": "Best-effort, credential-redacted snapshot of pending work affected by cancellation; keys are omitted when not observable",
+            "title": "Dropped",
+            "type": "object"
+          }
+        },
+        "title": "CancelResponse",
         "type": "object"
       },
       "RewindRequest": {
@@ -2465,15 +2928,43 @@
             "title": "Model",
             "type": "string"
           },
+          "judge_model": {
+            "default": "",
+            "description": "Optional judge model alias for this workstream. Empty uses the server's configured judge model.",
+            "title": "Judge Model",
+            "type": "string"
+          },
           "auto_approve": {
             "default": false,
             "description": "Auto-approve all tool calls",
             "title": "Auto Approve",
             "type": "boolean"
           },
+          "auto_approve_tools": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ],
+            "default": "",
+            "description": "Tool names to auto-approve even when auto_approve is false, accepted as either a comma-separated string or an array of strings.",
+            "title": "Auto Approve Tools"
+          },
+          "user_id": {
+            "default": "",
+            "description": "Optional workstream owner override. Honored only for trusted service identities (currently the console); ordinary callers remain bound to their authenticated user id.",
+            "title": "User Id",
+            "type": "string"
+          },
           "resume_ws": {
             "default": "",
-            "description": "Workstream ID to resume atomically during creation (empty = fresh start)",
+            "description": "Source workstream ID or alias to fork atomically into the new workstream (empty = fresh start)",
             "title": "Resume Ws",
             "type": "string"
           },
@@ -2510,7 +3001,7 @@
           },
           "client_type": {
             "default": "",
-            "description": "Client surface type (web, cli, chat). Defaults to web for server-created sessions.",
+            "description": "Client surface type (web, cli, chat, scheduled). Defaults to web for server-created sessions.",
             "title": "Client Type",
             "type": "string"
           },
@@ -2584,13 +3075,13 @@
           },
           "resumed": {
             "default": false,
-            "description": "Whether a previous workstream was resumed",
+            "description": "Whether the requested source was successfully forked",
             "title": "Resumed",
             "type": "boolean"
           },
           "message_count": {
             "default": 0,
-            "description": "Number of messages in the resumed workstream",
+            "description": "Number of messages cloned into the new workstream",
             "title": "Message Count",
             "type": "integer"
           },
@@ -2603,21 +3094,13 @@
             "type": "array"
           },
           "initial_message_status": {
-            "anyOf": [
-              {
-                "enum": [
-                  "queue_full",
-                  "refused_closed"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
             "description": "Present ONLY when the workstream was created but its initial_message could not be delivered: 'queue_full' (a raced live worker's interjection queue was at capacity \u2014 resend via /send; any uploads stay staged) or 'refused_closed' (the workstream was closed mid-create). Absent whenever the message was dispatched.",
-            "title": "Initial Message Status"
+            "enum": [
+              "queue_full",
+              "refused_closed"
+            ],
+            "title": "Initial Message Status",
+            "type": "string"
           }
         },
         "required": [
@@ -2711,6 +3194,18 @@
             ],
             "default": null,
             "title": "Project Id"
+          },
+          "persistence_state": {
+            "default": "healthy",
+            "description": "Sanitized durable-history status for the loaded workstream: healthy, pending its first save, retrying automatically, or blocked by a permanent commit conflict. Older servers and unloaded rows default to healthy.",
+            "enum": [
+              "healthy",
+              "pending",
+              "retrying",
+              "conflict"
+            ],
+            "title": "Persistence State",
+            "type": "string"
           }
         },
         "required": [
@@ -2743,6 +3238,18 @@
           "kind": {
             "$ref": "#/components/schemas/WorkstreamKind",
             "default": "interactive"
+          },
+          "persistence_state": {
+            "default": "healthy",
+            "description": "Sanitized durable-history status: healthy, pending its first save, retrying automatically, or blocked by a permanent commit conflict.",
+            "enum": [
+              "healthy",
+              "pending",
+              "retrying",
+              "conflict"
+            ],
+            "title": "Persistence State",
+            "type": "string"
           },
           "pending_approval": {
             "default": false,
@@ -2883,7 +3390,7 @@
             "type": "string"
           },
           "messages": {
-            "description": "Tail of the workstream's message history, projected to the canonical render shape (``role`` may be ``system`` for operator-context turns; flat tool_calls with verdict / output_assessment; top-level source / attachments / reasoning; derived denied / is_error / pending). Bounded by the ``limit`` query parameter (default 100, max 500).",
+            "description": "Requested limit-bounded tail of one authoritative total accepted conversation-row prefix, projected to the canonical render shape. Roles include ``user``, ``assistant``, ``tool``, and ``system``; compaction checkpoints project as ``role=system, source=compaction`` and cancellation-generated assistant/tool markers appear when present. The projection also carries flat tool_calls with verdict / output_assessment; top-level source / attachments / reasoning; and derived denied / is_error / pending. Bounded by the ``limit`` query parameter (default 100, max 500).",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -2903,6 +3410,19 @@
             "default": null,
             "description": "SSE resume cursor (a ``Last-Event-ID`` value). Non-null only when the trailing turn is an executing in-flight tool batch that the live ring buffer can replay: ``messages`` then omits that turn and the client opens its initial SSE with this cursor so the existing delta replay fast-forwards the in-flight turn (tool calls, results, prompts) instead of the lossy synthetic snapshot. Null on every other read \u2014 the client connects fresh.",
             "title": "Cursor"
+          },
+          "handoff_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Opaque token naming the exact accepted conversation-row prefix used for this render. Present only while the workstream is loaded. A client that renders this response passes the token once as the initial event stream's ``history_token`` query parameter; the server atomically validates it while registering the listener. Admission of a later row changes the token; durable acknowledgement does not. Clients must not inspect, persist, or reuse it for later reconnects.",
+            "title": "Handoff Token"
           }
         },
         "required": [
@@ -3059,6 +3579,18 @@
             ],
             "default": null,
             "title": "Project Id"
+          },
+          "persistence_state": {
+            "default": "healthy",
+            "description": "Sanitized durable-history status for this live row. Contains no storage error, commit key, retry count, or conversation content.",
+            "enum": [
+              "healthy",
+              "pending",
+              "retrying",
+              "conflict"
+            ],
+            "title": "Persistence State",
+            "type": "string"
           },
           "pending_approval_details": {
             "description": "Inline approval payload for the coordinator children-tree UI: EVERY live approval cycle, oldest first \u2014 parallel task agents gate concurrently, so a workstream can hold several prompts at once.  Each entry carries the cycle's items + per-call_id LLM verdict cache so a coord can render approve/deny buttons + judge pill without a separate per-child round-trip; resolve each with its ``cycle_id``.  Empty when no approval is pending.  Also surfaced (verbatim) on ``GET /v1/api/cluster/ws/live`` via the ``_CLUSTER_WS_LIVE_KEYS`` projection.  Replaces 1.6's ``pending_approval_detail`` single-object field (breaking, 1.7).",
@@ -3570,33 +4102,43 @@
       "SaveMemoryRequest": {
         "properties": {
           "name": {
-            "description": "Memory identifier (normalized to snake_case)",
+            "description": "Memory identifier. Raw aliases may contain supported Latin letters that fold to ASCII, ASCII digits, Unicode space separators, Unicode hyphens, and single underscores. The server normalizes them to a lowercase ASCII snake_case key of at most 256 characters. Other characters and leading, trailing, or repeated underscores are rejected.",
+            "minLength": 1,
             "title": "Name",
             "type": "string"
           },
           "content": {
             "description": "Memory content",
             "maxLength": 65536,
+            "minLength": 1,
             "title": "Content",
             "type": "string"
           },
           "description": {
-            "default": "",
-            "description": "Short description for relevance matching",
+            "description": "Required authored one-line memory-index hook",
+            "maxLength": 512,
+            "minLength": 1,
             "title": "Description",
             "type": "string"
           },
           "type": {
-            "default": "general",
-            "description": "Memory type",
-            "enum": [
-              "user",
-              "general",
-              "feedback",
-              "reference"
+            "anyOf": [
+              {
+                "enum": [
+                  "user",
+                  "general",
+                  "feedback",
+                  "reference"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Type",
-            "type": "string"
+            "default": null,
+            "description": "Memory type; omission preserves it on update and defaults on insert",
+            "title": "Type"
           },
           "scope": {
             "default": "global",
@@ -3618,7 +4160,8 @@
         },
         "required": [
           "name",
-          "content"
+          "content",
+          "description"
         ],
         "title": "SaveMemoryRequest",
         "type": "object"
@@ -3662,16 +4205,26 @@
             "title": "Scope Id",
             "type": "string"
           },
-          "content": {
-            "title": "Content",
-            "type": "string"
-          },
           "created": {
             "title": "Created",
             "type": "string"
           },
           "updated": {
             "title": "Updated",
+            "type": "string"
+          },
+          "last_accessed": {
+            "default": "",
+            "title": "Last Accessed",
+            "type": "string"
+          },
+          "access_count": {
+            "default": 0,
+            "title": "Access Count",
+            "type": "integer"
+          },
+          "content": {
+            "title": "Content",
             "type": "string"
           }
         },
@@ -3680,9 +4233,9 @@
           "name",
           "type",
           "scope",
-          "content",
           "created",
-          "updated"
+          "updated",
+          "content"
         ],
         "title": "MemoryInfo",
         "type": "object"
@@ -3691,7 +4244,7 @@
         "properties": {
           "memories": {
             "items": {
-              "$ref": "#/components/schemas/MemoryInfo"
+              "$ref": "#/components/schemas/MemorySummary"
             },
             "title": "Memories",
             "type": "array"
@@ -3708,10 +4261,80 @@
         "title": "ListMemoriesResponse",
         "type": "object"
       },
+      "MemorySummary": {
+        "properties": {
+          "memory_id": {
+            "title": "Memory Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "user",
+              "general",
+              "feedback",
+              "reference"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "global",
+              "workstream",
+              "user"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "scope_id": {
+            "default": "",
+            "title": "Scope Id",
+            "type": "string"
+          },
+          "created": {
+            "title": "Created",
+            "type": "string"
+          },
+          "updated": {
+            "title": "Updated",
+            "type": "string"
+          },
+          "last_accessed": {
+            "default": "",
+            "title": "Last Accessed",
+            "type": "string"
+          },
+          "access_count": {
+            "default": 0,
+            "title": "Access Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "memory_id",
+          "name",
+          "type",
+          "scope",
+          "created",
+          "updated"
+        ],
+        "title": "MemorySummary",
+        "type": "object"
+      },
       "SearchMemoriesRequest": {
         "properties": {
           "query": {
             "description": "Search query text",
+            "minLength": 1,
             "title": "Query",
             "type": "string"
           },
@@ -3967,6 +4590,25 @@
           }
         },
         "title": "ListAvailableModelsResponse",
+        "type": "object"
+      },
+      "AuthWhoamiResponse": {
+        "description": "GET /v1/api/auth/whoami response.",
+        "properties": {
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          },
+          "permissions": {
+            "default": "",
+            "title": "Permissions",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ],
+        "title": "AuthWhoamiResponse",
         "type": "object"
       }
     }

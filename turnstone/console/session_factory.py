@@ -23,7 +23,11 @@ from typing import TYPE_CHECKING
 
 from turnstone.console.coordinator_alias import resolve_coordinator_alias
 from turnstone.core.log import get_logger
-from turnstone.core.model_turn import resolve_effort_setting, resolve_temperature_setting
+from turnstone.core.model_turn import (
+    resolve_effort_setting,
+    resolve_model_binding,
+    resolve_temperature_setting,
+)
 from turnstone.core.session import ChatSession
 from turnstone.core.workstream import WorkstreamKind
 from turnstone.prompts import ClientType
@@ -66,7 +70,6 @@ def build_console_session_factory(
     constructing a malformed session.
     """
     from turnstone.core.judge import JudgeConfig
-    from turnstone.core.memory_relevance import MemoryConfig
 
     def _build_judge_config() -> JudgeConfig:
         return JudgeConfig(
@@ -76,6 +79,7 @@ def build_console_session_factory(
             confidence_threshold=config_store.get("judge.confidence_threshold"),
             max_context_ratio=config_store.get("judge.max_context_ratio"),
             timeout=config_store.get("judge.timeout"),
+            parallel_evaluations=config_store.get("judge.parallel_evaluations", 1),
             read_only_tools=config_store.get("judge.read_only_tools"),
             output_guard=config_store.get("judge.output_guard"),
             output_guard_budget_seconds=config_store.get("judge.output_guard_budget_seconds"),
@@ -83,15 +87,6 @@ def build_console_session_factory(
             output_guard_model=config_store.get("judge.output_guard_model"),
             output_guard_llm_timeout=config_store.get("judge.output_guard_llm_timeout"),
             redact_secrets=config_store.get("judge.redact_secrets"),
-        )
-
-    def _build_memory_config() -> MemoryConfig:
-        return MemoryConfig(
-            relevance_k=config_store.get("memory.relevance_k"),
-            fetch_limit=config_store.get("memory.fetch_limit"),
-            max_content=config_store.get("memory.max_content"),
-            nudge_cooldown=config_store.get("memory.nudge_cooldown"),
-            nudges=config_store.get("memory.nudges"),
         )
 
     def factory(
@@ -106,6 +101,7 @@ def build_console_session_factory(
         project_id: str = "",
         judge_model: str | None = None,
         persona_snapshot: PersonaSnapshot | None = None,
+        fork_reservation_token: str = "",
     ) -> ChatSession:
         assert ui is not None, "console session_factory requires a non-None UI"
         if kind != WorkstreamKind.COORDINATOR:
@@ -127,9 +123,21 @@ def build_console_session_factory(
             registry=registry,
         )
 
-        # The generation comes back from resolve()'s own lock hold, exactly
-        # paired with the client it vouches for; hand it to the constructor.
-        r_client, r_model, r_cfg, registry_generation = registry.resolve(effective_alias)
+        # Resolve every stable model facet under one registry lock hold.  Passing
+        # the same immutable binding through to ChatSession prevents a reload in
+        # the construction window from pairing an old client/config with a new
+        # provider.
+        model_binding = resolve_model_binding(
+            registry,
+            effective_alias,
+            config_store=config_store,
+        )
+        r_client = model_binding.lane.client
+        r_model = model_binding.lane.model
+        r_cfg = model_binding.config
+        if r_cfg is None:
+            raise RuntimeError(f"model binding for alias {effective_alias!r} has no config")
+        registry_generation = model_binding.registry_generation
 
         uid = getattr(ui, "_user_id", "") or ""
         _username = ""
@@ -145,7 +153,6 @@ def build_console_session_factory(
             except Exception:
                 log.debug("coord_factory.username_resolve_failed uid=%s", uid, exc_info=True)
 
-        live_memory_config = _build_memory_config()
         live_judge_config = _build_judge_config()
         # Coordinator MCP surface (#725): resolved per construction so the
         # session sees the CURRENT manager — the console ensure-helper can
@@ -218,6 +225,7 @@ def build_console_session_factory(
             registry=registry,
             model_alias=effective_alias,
             registry_generation=registry_generation,
+            model_binding=model_binding,
             health_registry=None,
             node_id=node_id,
             ws_id=ws_id,
@@ -228,7 +236,6 @@ def build_console_session_factory(
             skill=skill or None,
             judge_config=live_judge_config,
             user_id=uid,
-            memory_config=live_memory_config,
             config_store=config_store,
             client_type=ClientType(client_type)
             if client_type in {ct.value for ct in ClientType}
@@ -239,6 +246,7 @@ def build_console_session_factory(
             project_id=project_id,
             coord_client=coord_client,
             persona_snapshot=persona_snapshot,
+            fork_reservation_token=fork_reservation_token,
         )
 
     return factory
