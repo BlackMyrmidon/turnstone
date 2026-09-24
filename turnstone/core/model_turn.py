@@ -65,6 +65,12 @@ from turnstone.core.lowering import (
 # registry — so the provider package stays a plant-layer-only import.
 from turnstone.core.providers import create_provider as create_provider
 from turnstone.core.providers._protocol import (
+    REASONING_BEARING_BLOCK_TYPES,
+    drain_stream,
+    has_reasoning_bearing_block,
+    thinking_off_template_kwargs,
+)
+from turnstone.core.providers._protocol import (
     TRAILING_INFO_SEPARATOR as TRAILING_INFO_SEPARATOR,
 )
 
@@ -88,11 +94,6 @@ from turnstone.core.providers._protocol import (
     UsageInfo as UsageInfo,
 )
 from turnstone.core.providers._protocol import (
-    drain_stream,
-    has_reasoning_bearing_block,
-    thinking_off_template_kwargs,
-)
-from turnstone.core.providers._protocol import (
     folds_trailing_info as folds_trailing_info,
 )
 from turnstone.core.providers._protocol import (
@@ -108,6 +109,7 @@ from turnstone.core.storage._utils import (
 from turnstone.core.trajectory import (
     PROVENANCE_META_KEY,
     ProviderNative,
+    TextBlock,
     ToolCall,
     Turn,
     TurnProvenance,
@@ -151,6 +153,14 @@ class ModelAdmissionError(RuntimeError):
     Unlike ``prepare_wire``, this hook may durably bind request context before
     the serving lane's capacity lease. Its failure is still a local lifecycle
     fault, never evidence that the selected model backend is unhealthy.
+    """
+
+
+class ModelContextLimitError(RuntimeError):
+    """A fully prepared local request cannot fit the serving lane's context.
+
+    This is checked after attachment materialization but before the provider
+    capacity lease. It is a local request-shape outcome, not backend health.
     """
 
 
@@ -998,11 +1008,48 @@ class ModelTurnResult:
     producer: str = ""
     serving_model: str = ""
     tool_def_chars: int | None = None
+    # None means the adapter did not report its final request's tool posture.
+    native_tools_enabled: bool | None = None
 
     @property
     def content(self) -> str:
         """The assistant text — convenience mirror of ``turn.text``."""
         return self.turn.text
+
+
+def is_empty_completion(result: ModelTurnResult) -> bool:
+    """An ordinary stop with no answer, tool proposal, or other known output.
+
+    Reasoning alone cannot answer the user. Unknown native blocks are preserved
+    as output; this is a structural check, never a judgment of task completion.
+    """
+    if result.finish_reason != "stop" or result.tool_calls or result.turn.tool_calls:
+        return False
+    if any(not isinstance(block, TextBlock) or block.text.strip() for block in result.turn.content):
+        return False
+
+    def reasoning_or_text(block: Any) -> bool:
+        if not isinstance(block, dict):
+            return False
+        kind = block.get("type")
+        if not isinstance(kind, str):
+            return False
+        if kind in REASONING_BEARING_BLOCK_TYPES:
+            return True
+        # Known text blocks are replay copies of the canonical answer checked
+        # above. They still contain any inline thinking tags the drain parsed
+        # out; treating those raw bytes as an answer would bypass recovery.
+        return kind in ("text", "output_text") and isinstance(block.get("text"), str)
+
+    for block in result.turn.native.blocks if result.turn.native else ():
+        if reasoning_or_text(block):
+            continue
+        if isinstance(block, dict) and block.get("type") == "message":
+            parts = block.get("content")
+            if isinstance(parts, list) and all(reasoning_or_text(part) for part in parts):
+                continue
+        return False
+    return True
 
 
 def cap_tool_calls(result: ModelTurnResult, max_calls: int) -> tuple[list[dict[str, Any]], Turn]:
@@ -1148,6 +1195,7 @@ def model_turn(
     deferred_names: frozenset[str] | None = None,
     prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]] | None = None,
     admit_request: Callable[[ModelLane], None] | None = None,
+    validate_wire: Callable[[list[dict[str, Any]], ModelLane], None] | None = None,
     on_chunk: Callable[[StreamChunk], None] | None = None,
 ) -> ModelTurnResult:
     """Advance a trajectory by one model turn: lower, sample, re-ingest.
@@ -1182,6 +1230,10 @@ def model_turn(
     Keeping nested perception/audio work outside the outer alias's gate avoids
     self-deadlock at a limit of one. Turn IR itself never carries inline media
     bytes.
+
+    *validate_wire* is the final local context backstop. It sees the fully
+    materialized and caller-prepared wire immediately before capacity admission;
+    a failure propagates without touching backend health or transport state.
 
     *mint* rewrites each returned tool call's id (provider-original →
     caller-scoped) before the Turn is built; the native blocks keep the
@@ -1364,6 +1416,11 @@ def model_turn(
                 cfg=cfg,
             )
             _raise_if_aborted(cancel_ref, lane)
+        else:
+            dispatched_wire = served_wire
+        if validate_wire is not None:
+            validate_wire(dispatched_wire, lane)
+            _raise_if_aborted(cancel_ref, lane)
         lease = lane.admission.acquire(cancel_ref=cancel_ref) if lane.admission else None
         drain_error: Exception | None = None
         with lease if lease is not None else contextlib.nullcontext():
@@ -1376,8 +1433,6 @@ def model_turn(
                 cancel_ref=cancel_ref,
             )
             _raise_if_aborted(cancel_ref, lane)
-            if admit_request is None:
-                dispatched_wire = served_wire
             _raise_if_aborted(cancel_ref, lane)
             mark_dispatch = getattr(cancel_ref, "mark_dispatch", None)
             if callable(mark_dispatch):
@@ -1522,4 +1577,5 @@ def model_turn(
             if request_metrics
             else serialized_tool_chars(tools)
         ),
+        native_tools_enabled=request_metrics[-1].native_tools_enabled if request_metrics else None,
     )

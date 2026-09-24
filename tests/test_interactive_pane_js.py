@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._js_harness_helpers import FAKE_DOM, node_skip, run_node_source
 from tests._js_harness_helpers import extract_braced as _extract_braced
 from tests._js_harness_helpers import strip_js_comments as _strip_comments
 
@@ -607,26 +608,23 @@ def test_interactive_refetch_failure_preserves_the_pane() -> None:
 
 def test_per_token_hot_path_avoids_container_scans() -> None:
     """P1 (perf audit): per-token work must stay O(1) in transcript length.
-    The thinking indicator is an instance ref (the class-selector miss walked
-    the whole transcript on EVERY content/reasoning delta); near-bottom state
+    The reasoning activity controller owns its DOM references, so token deltas
+    never search the whole transcript for an indicator; near-bottom state
     comes from the passive scroll listener instead of a forced-layout
     geometry read per event; the scroll pin is rAF-coalesced; per-tool
     row/stream lookups resolve through the self-healing caches."""
     body = _INTERACTIVE.read_text(encoding="utf-8")
     stripped = _strip_comments(body)
-    assert 'querySelector(".thinking-indicator")' not in stripped, (
-        "thinking indicator must use the instance ref, not a container scan"
+    assert 'querySelector(".reasoning-activity-status")' not in stripped, (
+        "reasoning indicator must use owned references, not a container scan"
     )
-    assert "this._thinkingEl" in body
+    assert "this._reasoningActivity" in body
     near = body.index("isNearBottom() {")
-    assert "return this._nearBottom;" in body[near : near + 700]
-    assert "passive: true" in body
-    # The rAF pin re-checks the flag AT FIRE TIME (a user scroll landing in
-    # the schedule→rAF window must win over a stale pin), with force
-    # requests latched across the coalescing window; resizes re-derive the
-    # flag via ResizeObserver since they move the bottom without a scroll.
-    assert "this._scrollPinForce = false;" in body
-    assert "ResizeObserver" in body
+    assert "return this._scrollFollow.isFollowing();" in body[near : near + 700]
+    scroll = (_ROOT / "turnstone/shared_static/conversation_scroll.js").read_text()
+    assert "passive: true" in scroll
+    assert "requestAnimationFrame" in scroll
+    assert "ResizeObserver" in scroll
     for helper in ("_toolRow(callId) {", "_streamEl(callId) {"):
         assert helper in body, f"missing lookup-cache helper: {helper!r}"
 
@@ -887,8 +885,7 @@ def test_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None:
     assert "if (this.wsId !== wsId) this._truncatedFromCursor = null;" in load_seg, (
         "a ws switch must drop the old ws's truncation record"
     )
-    replay_fn = body.index("replayHistory(messages) {")
-    replay_head = body[replay_fn : replay_fn + 1200]
+    replay_head = _extract_braced(body, "replayHistory(messages) {")
     assert "this._truncatedFromCursor = null;" in replay_head, (
         "a successful full-history render must clear the truncation record"
     )
@@ -1437,6 +1434,109 @@ def test_accepted_tool_event_recorded_only_when_painted() -> None:
     assert gate < record
 
 
+def test_compact_presentation_live_replay_and_lifecycle_wiring() -> None:
+    """The interactive renderer owns settlement timing and late blockers.
+
+    Shared DOM tests cover the fold state machine itself; this pins the pane's
+    load-bearing call order so effect/error truth is present before settlement,
+    replay stays silent, and teardown releases the registered scroller.
+    """
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    for symbol in (
+        "canAutoFoldTranscriptBatch",
+        "clearConvVerdictPending",
+        "getTranscriptPresentation",
+        "preserveTranscriptBottomPin",
+        "registerTranscriptScroller",
+        "markConvRowResultSettled",
+        "createReasoningActivity",
+        "setConvBatchExpanded",
+    ):
+        assert symbol in body
+
+    live = _extract_braced(
+        body,
+        "  appendToolOutput(callId, name, output, isError, preview, opts = {}) {",
+    )
+    settle = live.index("markConvRowResultSettled(target")
+    assert live.index("clearConvVerdictPending(target)") < settle
+    assert live.index("setToolOutputReviewState(target, output)") < settle
+    assert live.index("target.dataset.effectStatus") < settle
+    assert live.index("this._markAgentStepExceptional(") < settle
+    assert live.index('parentBlock.classList.add("conv-batch--error")') < settle
+    assert "const allowAutoFold" in live
+    assert "canAutoFoldTranscriptBatch(" in live
+    assert "_batchLiesBelowViewport" not in body
+    assert settle < live.index('toolAnnounce("Completed: "')
+    assert "settlement.autoFolded" in live
+
+    replay = _extract_braced(body, "  replayHistory(messages) {")
+    replay_settle = replay.index("markConvRowResultSettled(resultTarget")
+    assert replay.index("setToolOutputReviewState(resultTarget, msg.content)") < replay_settle
+    assert replay.index("resultTarget.dataset.effectStatus") < replay_settle
+    assert replay.index('lastToolBlock.classList.add("conv-batch--error")') < replay_settle
+    assert replay.index("_buildOutputWarningEl(assessment.assessment)") < replay_settle
+    assert 'toolAnnounce("Completed: "' not in replay
+
+    upgrade = _extract_braced(
+        body,
+        "  showInlineToolBlock(items, autoApproved, judgePending, cycleId) {",
+    )
+    reset = upgrade.index("announced.replaceChildren()")
+    assert reset < upgrade.index("delete announced.dataset.resultsSettled")
+    assert reset < upgrade.index("delete announced.dataset.compactFolded")
+
+    warning = _extract_braced(body, "  showOutputWarning(evt) {")
+    assert warning.index("setConvBatchExpanded(") < warning.index("_buildOutputWarningEl(")
+    verdict = _extract_braced(body, "  updateVerdictBadge(verdict) {")
+    pin = verdict.index("preserveTranscriptBottomPin(")
+    assert pin < verdict.index("setConvBatchExpanded(") < verdict.index("badge.replaceWith(")
+    nested = _extract_braced(
+        body,
+        "  _routeAgentItems(items, mode, judgePending, cycleId) {",
+    )
+    assert nested.index("setConvBatchExpanded(") < nested.index("row.appendChild(actions)")
+    assert "this._markAgentStepExceptional(row" in nested
+
+    replay_agent = _extract_braced(body, "  _replayAgentCard(row, steps) {")
+    assert "const stepRow = buildToolDiv(" in replay_agent
+    assert "this._markAgentStepExceptional(stepRow" in replay_agent
+    assert "effectStatus: step.effect_status" in replay_agent
+    assert "exceptional: !!step.contains_exceptional" in replay_agent
+
+    marker = _extract_braced(body, "  _markAgentStepExceptional(row, details) {")
+    assert "!details.isError" in marker
+    assert "!details.denied" in marker
+    assert "!details.exceptional" in marker
+    assert 'effectStatus === "committed"' in marker
+    assert 'card.dataset.agentStepExceptional = "true";' in marker
+    assert "issue.hidden = false;" in marker
+    assert marker.index("setConvBatchExpanded(") < marker.index(
+        'card.dataset.agentStepExceptional = "true";'
+    )
+
+    resolution = _extract_braced(
+        body,
+        "  resolveApproval(approved, always, feedback, skipPost, cycleId) {",
+    )
+    marker_call = resolution.index("this._markAgentStepExceptional(")
+    assert marker_call < resolution.index("buildConvStatus(")
+
+    assert "this._unregisterTranscriptScroller = registerTranscriptScroller(" in body
+    cleanup = body.index("if (pane._unregisterTranscriptScroller) {")
+    assert cleanup < body.index("pane._unregisterTranscriptScroller();", cleanup)
+
+    reasoning_case = body[body.index('case "reasoning"') : body.index('case "content"')]
+    assert "this._reasoningActivity.attach(this.currentReasoningEl)" in reasoning_case
+    assert 'reasoningBody.className = "msg-body"' in reasoning_case
+    assert "reasoningBody.textContent += evt.text" in reasoning_case
+    assert "this.currentReasoningEl.textContent += evt.text" not in reasoning_case
+    content_case = body[body.index('case "content"') : body.index('case "stream_end"')]
+    assert "this._reasoningActivity.finish()" in content_case
+    stream_case = body[body.index('case "stream_end"') : body.index('case "in_progress_snapshot"')]
+    assert "this._reasoningActivity.finish()" in stream_case
+
+
 def test_task_agent_context_badge_is_keyed_idempotent_and_terminal_safe() -> None:
     """Live and synthetic readings share one keyed reducer.
 
@@ -1863,3 +1963,132 @@ def test_orphan_tool_result_does_not_mark_a_batch_failed() -> None:
     assert "!isOrphanResult" in body[guard:stamp], (
         "an orphan result can stamp conv-batch--error on a batch whose own calls all succeeded"
     )
+
+
+def test_status_bar_approval_chip_wired_to_the_cycle_chokepoint() -> None:
+    """The pending-approval chip is painted from ``_syncApprovalState`` — the
+    ONE place approval cycles register, resolve, prune and reset — so every
+    path that changes the count (peer-tab resolution, transcript rebuild,
+    orphan prune) repaints it for free.  It is a button (tabs, clicks) built
+    in ``_createDOM`` ahead of the turn cell, and its click reveals the SAME
+    cycle the keyboard shortcuts act on."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    assert 'this._sbApproval = document.createElement("button");' in body
+    assert 'this._sbApproval.className = "warn-chip ws-sb-approval";' in body, (
+        "the look is the shared .warn-chip; the surface class carries only geometry"
+    )
+    assert "this._sbApproval.hidden = true;" in body
+    assert "this.revealPendingApproval()," in body, (
+        "the chip click must route to revealPendingApproval"
+    )
+    dom = _strip_comments(body)
+    assert dom.index("this.statusBarEl.appendChild(this._sbApproval);") < dom.index(
+        "this.statusBarEl.appendChild(this._sbTurns);"
+    ), "the chip sits before the turn cell so a narrow pane clips the turn first"
+    sync = _extract_braced(body, "_syncApprovalState() {")
+    assert "StatusBar.paintApprovalChip(" in sync, (
+        "the chip must repaint from the approval-state chokepoint"
+    )
+    assert "this.approvalCycles.size," in sync
+    assert "focusFallbackEl: this.inputEl" in sync, (
+        "a chip hidden under keyboard focus must hand focus to the composer"
+    )
+    # The chip is a button INSIDE this.el, which carries the approval keydown
+    # handler: without a target guard, Enter on the focused chip approves the
+    # tool call (and preventDefault swallows the click that would reveal it).
+    assert "if (e.target === this._sbApproval) return;" in body, (
+        "the approval keydown handler must ignore keys originating on the chip"
+    )
+    reveal = _extract_braced(body, "revealPendingApproval() {")
+    assert "this._oldestCycleId()" in reveal, (
+        "click target must equal the keyboard target (the oldest live cycle)"
+    )
+    assert 'agentCard.dataset.collapsed = "false";' in reveal
+    assert "setConvBatchExpanded(batch, true, { blocker: true });" in reveal
+    assert "StatusBar.scrollToApprovalTarget(block);" in reveal
+    assert "fb.focus({ preventScroll: true });" in reveal
+
+
+@node_skip
+def test_reveal_pending_approval_unfolds_and_focuses_the_oldest_cycle() -> None:
+    """Run ``revealPendingApproval`` against the fake DOM: with two live
+    cycles it targets the oldest one whose block is still attached, re-opens
+    the agent card and batch that hold it, scrolls to the row, and focuses
+    its feedback field without a scroll jump."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    reveal = _extract_braced(body, "revealPendingApproval() {")
+    oldest = _extract_braced(body, "_oldestCycleId() {")
+    script = (
+        FAKE_DOM
+        + f"""
+const assert = (condition, message) => {{ if (!condition) throw new Error(message); }};
+const scrolled = [];
+const expanded = [];
+globalThis.StatusBar = {{ scrollToApprovalTarget: (el) => scrolled.push(el) }};
+globalThis.setConvBatchExpanded = (batch, open, opts) => expanded.push([batch, open, opts]);
+const proto = {{
+  {reveal},
+  {oldest},
+}};
+
+// Transcript: a parent batch holding a task-agent card, collapsed by the
+// user, with a nested pending row (oldest cycle) — plus a later top-level
+// pending batch (newer cycle).
+const messages = new FakeElement("div");
+html.appendChild(messages);
+const parentBatch = new FakeElement("div");
+parentBatch.className = "conv-batch";
+messages.appendChild(parentBatch);
+const agentCard = new FakeElement("div");
+agentCard.className = "conv-agent";
+agentCard.dataset.collapsed = "true";
+parentBatch.appendChild(agentCard);
+const toggle = new FakeElement("button");
+toggle.className = "conv-agent-toggle";
+toggle.setAttribute("aria-expanded", "false");
+agentCard.appendChild(toggle);
+const nestedRow = new FakeElement("div");
+nestedRow.className = "conv-row";
+agentCard.appendChild(nestedRow);
+const nestedFeedback = new FakeElement("input");
+nestedFeedback.className = "conv-feedback";
+let focusOpts = null;
+nestedFeedback.focus = (opts) => {{ focusOpts = opts; document.activeElement = nestedFeedback; }};
+nestedRow.appendChild(nestedFeedback);
+const laterBatch = new FakeElement("div");
+laterBatch.className = "conv-batch";
+messages.appendChild(laterBatch);
+
+const pane = Object.assign({{ approvalCycles: new Map() }}, proto);
+pane.approvalCycles.set("cycle-old", {{ blockEls: [nestedRow], callIds: ["c1"] }});
+pane.approvalCycles.set("cycle-new", {{ blockEls: [laterBatch], callIds: ["c2"] }});
+
+pane.revealPendingApproval();
+assert(scrolled.length === 1 && scrolled[0] === nestedRow, "must scroll to the OLDEST cycle's row");
+assert(agentCard.dataset.collapsed === "false", "the collapsed agent card must reopen");
+assert(toggle.getAttribute("aria-expanded") === "true", "toggle aria must follow the reopen");
+assert(expanded.length === 1 && expanded[0][0] === parentBatch && expanded[0][1] === true
+  && expanded[0][2].blocker === true, "the enclosing batch must unfold as a blocker");
+assert(document.activeElement === nestedFeedback, "the feedback field must take focus");
+assert(focusOpts && focusOpts.preventScroll === true, "focus must not cut the scroll short");
+
+// The oldest cycle resolves: the next reveal targets the newer top-level batch.
+pane.approvalCycles.delete("cycle-old");
+pane.revealPendingApproval();
+assert(scrolled.length === 2 && scrolled[1] === laterBatch, "must fall through to the next cycle");
+assert(expanded[1][0] === laterBatch, "a top-level batch unfolds itself");
+
+// A cycle whose only block was detached (wiped transcript) reveals nothing.
+laterBatch.remove();
+pane.revealPendingApproval();
+assert(scrolled.length === 2, "a detached block must not be scrolled to");
+
+// No cycles at all is a no-op.
+pane.approvalCycles.clear();
+pane.revealPendingApproval();
+assert(scrolled.length === 2, "no cycles: nothing to reveal");
+console.log("reveal OK");
+"""
+    )
+    proc = run_node_source(script)
+    assert proc.returncode == 0, f"reveal harness failed:\n{proc.stderr}\n{proc.stdout}"

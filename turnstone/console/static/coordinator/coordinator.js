@@ -42,9 +42,26 @@ import {
   buildConvResult,
   buildPreviewChip,
   batchKicker,
+  clearConvVerdictPending,
+  convBatchSummaryText,
   indexLabel,
+  isConvVerdictCompactBlocker,
+  markConvRowResultSettled,
+  createReasoningActivity,
+  setConvBatchExpanded,
+  focusConvBatchHead,
+  focusTemporarily,
+  setToolOutputReviewState,
 } from "/shared/conversation.js";
+import {
+  canAutoFoldTranscriptBatch,
+  getTranscriptPresentation,
+  mountTranscriptPresentationToggle,
+  preserveTranscriptBottomPin,
+  registerTranscriptScroller,
+} from "/shared/transcript_presentation.js";
 import { redactCredentials } from "/shared/redact_credentials.js";
+import { mountConversationScroll } from "/shared/conversation_scroll.js";
 import { tryParseMcpError, buildMcpErrorEmbed } from "/shared/mcp_error.js";
 import {
   acceptUserTurnEvent,
@@ -272,6 +289,16 @@ function buildCoordChrome(root, opts) {
         "aria-label": "Tool calls this turn",
         text: "0 tools",
       }),
+      // Pending-approval chip — sticky count of the human gates open in
+      // this transcript, painted by _syncApprovalChip and hidden at zero.
+      // A button: the click brings the batch the keyboard shortcuts act
+      // on into view.  Mirrors the interactive pane's chip.
+      el("button", {
+        id: "coord-sb-approval",
+        class: "warn-chip ws-sb-approval",
+        type: "button",
+        hidden: "",
+      }),
       el("span", {
         id: "coord-sb-turns",
         class: "ws-sb-turns",
@@ -309,11 +336,24 @@ function buildCoordChrome(root, opts) {
     refreshId,
     refreshLabel,
     bodyId,
+    pendingId,
   ) {
     return el("div", { id: wrapId, class: "side-section" }, [
       el("div", { class: "coord-sidebar-head" }, [
         el("h2", { id: headingId, class: "side-label", text: heading }),
         el("span", { id: countId, class: "side-count" }),
+        // Children only: the "N pending" count as a clickable warn chip
+        // (the status-bar approval chip's sibling) that scrolls the tree
+        // to the first child waiting on an approval.  Painted by
+        // _refreshChildrenCount, hidden at zero.
+        pendingId
+          ? el("button", {
+              id: pendingId,
+              class: "warn-chip side-count-pending",
+              type: "button",
+              hidden: "",
+            })
+          : null,
         el("button", {
           type: "button",
           class: "ghost",
@@ -365,6 +405,7 @@ function buildCoordChrome(root, opts) {
         "coord-children-refresh",
         "Refresh children",
         "coord-children-tree",
+        "coord-children-pending",
       ),
       sideSection(
         "coord-tasks-wrap",
@@ -378,6 +419,15 @@ function buildCoordChrome(root, opts) {
     ],
   );
 
+  if (opts.standalone) {
+    root.append(
+      el("div", {
+        id: "coord-standalone-toolbar",
+        role: "toolbar",
+        "aria-label": "Viewer controls",
+      }),
+    );
+  }
   root.append(el("div", { id: "coord-body" }, [main, sidebar]));
   if (opts.standalone) {
     root.append(
@@ -397,6 +447,17 @@ function createCoordinatorPane(root, wsId, opts) {
   }
   buildCoordChrome(root, opts);
 
+  let unmountTranscriptPresentation = null;
+  if (opts && opts.standalone) {
+    const toolbar = root.querySelector("#coord-standalone-toolbar");
+    if (toolbar) {
+      unmountTranscriptPresentation = mountTranscriptPresentationToggle(
+        toolbar,
+        { className: "ghost" },
+      );
+    }
+  }
+
   if (opts && opts.standalone) {
     // Rail-less page: mount the pending-consent chip in the status bar —
     // the persistent signal the L-shell gets from the rail badge (#874).
@@ -415,6 +476,11 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   const messagesEl = root.querySelector("#coord-messages");
+  const scrollFollow = mountConversationScroll(messagesEl);
+  const unregisterTranscriptScroller = registerTranscriptScroller(messagesEl, {
+    isFollowing: scrollFollow.isFollowing,
+    scrollToBottom: scrollFollow.schedule,
+  });
   const coordMain = root.querySelector("#coord-main");
   const composerMount = root.querySelector("#coord-composer-mount");
   const composer = new Composer(composerMount, {
@@ -452,6 +518,7 @@ function createCoordinatorPane(root, wsId, opts) {
   });
   const queue = createQueueController({
     messagesEl: messagesEl,
+    scroll: () => _scheduleScroll(),
     getWsId: function () {
       return wsId;
     },
@@ -509,6 +576,12 @@ function createCoordinatorPane(root, wsId, opts) {
   const nameEl = root.querySelector("#coord-name");
   const childrenTreeEl = root.querySelector("#coord-children-tree");
   const childrenCountEl = root.querySelector("#coord-children-count");
+  const childrenPendingEl = root.querySelector("#coord-children-pending");
+  if (childrenPendingEl) {
+    childrenPendingEl.addEventListener("click", function () {
+      _revealPendingChild();
+    });
+  }
   const childrenRefreshBtn = root.querySelector("#coord-children-refresh");
   const tasksEl = root.querySelector("#coord-tasks");
   const tasksCountEl = root.querySelector("#coord-tasks-count");
@@ -554,6 +627,10 @@ function createCoordinatorPane(root, wsId, opts) {
         ae.isContentEditable)
     )
       return;
+    // The status-bar chip is a button inside root: Enter on it must reach
+    // its own click (reveal), never the approve arm below — and the
+    // preventDefault there would swallow that click outright.
+    if (ae && ae === sbApprovalEl) return;
     // Ignore browser/OS accelerators (Cmd+D bookmark, Ctrl+D, Alt+D) — only bare
     // keys + Shift+A resolve, else a stray accelerator silently denies the batch.
     if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -623,6 +700,12 @@ function createCoordinatorPane(root, wsId, opts) {
   const sbTokensEl = root.querySelector("#coord-sb-tokens");
   const sbToolsEl = root.querySelector("#coord-sb-tools");
   const sbTurnsEl = root.querySelector("#coord-sb-turns");
+  const sbApprovalEl = root.querySelector("#coord-sb-approval");
+  if (sbApprovalEl) {
+    sbApprovalEl.addEventListener("click", function () {
+      _revealPendingApproval();
+    });
+  }
   let coordModel = "";
   let coordModelAlias = "";
   let coordEffort = "";
@@ -1007,19 +1090,8 @@ function createCoordinatorPane(root, wsId, opts) {
   // Message append helpers
   // ------------------------------------------------------------------
 
-  // Coalesce scrollTop writes through requestAnimationFrame so the
-  // bulk history-replay loop doesn't fire one synchronous reflow per
-  // appended message — for histories with hundreds of turns the
-  // un-coalesced version visibly stalls the page.  Live SSE streaming
-  // also benefits: token-rate scrolls collapse into one paint.
-  let _scrollPending = false;
   function _scheduleScroll() {
-    if (_scrollPending) return;
-    _scrollPending = true;
-    requestAnimationFrame(() => {
-      _scrollPending = false;
-      messagesEl.scrollTop = messagesEl.scrollHeight;
-    });
+    scrollFollow.schedule();
   }
 
   // Map raw role → .msg variant (DS primitives/message.css).  "error"
@@ -1586,6 +1658,7 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function appendToolResult(name, callId, output, isError, opts) {
+    const atBottom = scrollFollow.isFollowing();
     if (callId && toolRows.has(callId)) {
       const entry = toolRows.get(callId);
       const prior = toolResultNodes.get(callId);
@@ -1601,6 +1674,20 @@ function createCoordinatorPane(root, wsId, opts) {
       // state.  Per-row check (not a counter) keeps the logic
       // resilient to out-of-order replay + late SSE deliveries.
       _unsetBatchRunningIfAllResults(entry.batch);
+      const allowAutoFold =
+        getTranscriptPresentation() !== "compact" ||
+        canAutoFoldTranscriptBatch(messagesEl, entry.batch, { atBottom });
+      const settlement =
+        opts && opts.accepted
+          ? markConvRowResultSettled(entry.row, { autoFold: allowAutoFold })
+          : null;
+      if (
+        getTranscriptPresentation() === "compact" &&
+        settlement &&
+        settlement.autoFolded
+      ) {
+        _announcePolite("Completed: " + convBatchSummaryText(entry.batch));
+      }
       // Result blocks grow scrollHeight; without this the user pinned
       // at the bottom loses their pin when the row inflates.  appendMsg
       // already routes through _scheduleScroll on the legacy path; this
@@ -1748,7 +1835,8 @@ function createCoordinatorPane(root, wsId, opts) {
       if (!tierEl) {
         tierEl = document.createElement("span");
         tierEl.className = "conv-batch-tier";
-        head.appendChild(tierEl);
+        const disclosure = head.querySelector(".conv-batch-disclosure");
+        head.insertBefore(tierEl, disclosure || null);
       }
       if (tierEl.textContent !== label) tierEl.textContent = label;
     } else if (tierEl) {
@@ -1770,6 +1858,10 @@ function createCoordinatorPane(root, wsId, opts) {
   // reflect execution outcome, not the static item payload.
   function _refreshRowStatus(row, item) {
     if (!row || !item) return;
+    if (item.error && !item.needs_approval) {
+      const batch = row.closest(".conv-batch");
+      if (batch) setConvBatchExpanded(batch, true, { blocker: true });
+    }
     const callLine = row.querySelector(".conv-row-call");
     if (callLine) {
       callLine.querySelectorAll(".conv-row-status").forEach((p) => p.remove());
@@ -1839,6 +1931,8 @@ function createCoordinatorPane(root, wsId, opts) {
     // The chip's risk / flags / redaction / tier / reasoning are all built by
     // the shared buildConvWarning (reasoning is now inline, not a <details>).
     if (!row || !oa) return;
+    const batch = row.closest(".conv-batch");
+    if (batch) setConvBatchExpanded(batch, true, { blocker: true });
     const existing = row.querySelector(".conv-warning");
     const chip = buildConvWarning(oa);
     if (existing) existing.replaceWith(chip);
@@ -1880,49 +1974,66 @@ function createCoordinatorPane(root, wsId, opts) {
     if (verdict && row.dataset.verdictSig === sig) {
       return row.querySelector(".conv-verdict");
     }
-    row.dataset.verdictSig = sig;
+    const renderVerdict = () => {
+      if (verdict && isConvVerdictCompactBlocker(verdict)) {
+        const batch = row.closest(".conv-batch");
+        if (batch) setConvBatchExpanded(batch, true, { blocker: true });
+      }
+      row.dataset.verdictSig = sig;
 
-    // Drop any prior verdict badge + its detail sibling before rebuilding.
-    const prevBadge = row.querySelector(".conv-verdict");
-    if (prevBadge) {
-      const prevDetail = prevBadge.nextElementSibling;
-      if (prevDetail && prevDetail.classList.contains("conv-verdict-detail")) {
-        prevDetail.remove();
+      // Drop any prior verdict badge + its detail sibling before rebuilding.
+      const prevBadge = row.querySelector(".conv-verdict");
+      if (prevBadge) {
+        const prevDetail = prevBadge.nextElementSibling;
+        if (
+          prevDetail &&
+          prevDetail.classList.contains("conv-verdict-detail")
+        ) {
+          prevDetail.remove();
+        }
+        prevBadge.remove();
       }
-      prevBadge.remove();
-    }
-    if (verdict) {
-      const frag = buildConvVerdict(verdict);
-      const callEl = row.querySelector(".conv-row-call");
-      if (callEl && callEl.nextSibling) {
-        row.insertBefore(frag, callEl.nextSibling);
-      } else {
-        row.appendChild(frag);
+      if (verdict) {
+        const frag = buildConvVerdict(verdict);
+        const callEl = row.querySelector(".conv-row-call");
+        if (callEl && callEl.nextSibling) {
+          row.insertBefore(frag, callEl.nextSibling);
+        } else {
+          row.appendChild(frag);
+        }
       }
-    }
-    // Persist the verdict's tier on the row so the batch's header
-    // tier badge can escalate from ⚙ heuristic → ⚖ llm when a later
-    // intent_verdict lands an LLM verdict.  Default to "heuristic"
-    // when tier is absent — heuristic verdicts ship without an
-    // explicit tier marker on every server emitter.
-    if (verdict) {
-      row.dataset.verdictTier = verdict.tier || "heuristic";
-      if (verdict.judge_model) {
-        row.dataset.verdictModel = verdict.judge_model;
+      // Persist the verdict's tier on the row so the batch's header
+      // tier badge can escalate from ⚙ heuristic → ⚖ llm when a later
+      // intent_verdict lands an LLM verdict.  Default to "heuristic"
+      // when tier is absent — heuristic verdicts ship without an
+      // explicit tier marker on every server emitter.
+      if (verdict) {
+        row.dataset.verdictTier = verdict.tier || "heuristic";
+        if (verdict.judge_model) {
+          row.dataset.verdictModel = verdict.judge_model;
+        } else {
+          delete row.dataset.verdictModel;
+        }
       } else {
+        delete row.dataset.verdictTier;
         delete row.dataset.verdictModel;
       }
-    } else {
-      delete row.dataset.verdictTier;
-      delete row.dataset.verdictModel;
-    }
-    _refreshBatchTier(row.closest(".conv-batch"));
-    return row.querySelector(".conv-verdict");
+      _refreshBatchTier(row.closest(".conv-batch"));
+      return row.querySelector(".conv-verdict");
+    };
+    // History and initial batch construction render detached rows.  Their
+    // eventual append already participates in _scheduleScroll(); measuring the
+    // live scroller here would force layout and enqueue one rAF per verdict.
+    return row.isConnected
+      ? preserveTranscriptBottomPin(messagesEl, renderVerdict)
+      : renderVerdict();
   }
 
   function _appendJudgePendingLineTo(row) {
     // Clear any prior verdict, then render the spinner-only badge (neutral
     // stripe -- risk isn't known until the judge lands).
+    const batch = row.closest(".conv-batch");
+    if (batch) setConvBatchExpanded(batch, true, { blocker: true });
     _appendVerdictLineTo(row, null);
     const frag = buildConvVerdict(null, { judgePending: true });
     const callEl = row.querySelector(".conv-row-call");
@@ -1935,10 +2046,21 @@ function createCoordinatorPane(root, wsId, opts) {
 
   function _appendResultToRow(row, output, isError, opts) {
     if (!row) return null;
+    const batch = row.closest(".conv-batch");
+    const exceptionalEffect =
+      opts &&
+      opts.accepted &&
+      opts.effectStatus &&
+      String(opts.effectStatus) !== "committed";
+    if ((isError || exceptionalEffect) && batch) {
+      setConvBatchExpanded(batch, true, { blocker: true });
+    }
     row
       .querySelectorAll(".conv-row-result")
       .forEach((existing) => existing.remove());
     if (opts && opts.accepted) {
+      clearConvVerdictPending(row);
+      setToolOutputReviewState(row, output);
       if (opts.effectStatus) {
         row.dataset.effectStatus = String(opts.effectStatus);
       } else {
@@ -1950,7 +2072,6 @@ function createCoordinatorPane(root, wsId, opts) {
       // Lift the row's error onto the enclosing batch so the left
       // stripe + status pill (--error) cue the operator at the batch
       // level too.  Idempotent — re-fires don't stack.
-      const batch = row.closest(".conv-batch");
       if (batch) batch.classList.add("conv-batch--error");
     }
     // Structured MCP error envelope (consent / re-consent / forbidden /
@@ -2085,12 +2206,17 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   // The tool-batch currently awaiting an approval decision (for the keyboard
-  // shortcuts): the last .conv-batch with a still-pending row whose actions
-  // aren't already disabled — i.e. not mid-resolve, so a key never double-fires.
+  // shortcuts and the status-bar chip): the last --pending .conv-batch with a
+  // still-pending row whose actions aren't already disabled — i.e. not
+  // mid-resolve, so a key never double-fires.  The class check matters: a
+  // resolved batch keeps its rows' data-needs-approval (only _refreshRowStatus
+  // clears it) and its status pill has no button, so without it a resolved
+  // batch outranked an older still-pending one and a key 409'd on a stale id.
   function _currentPendingBatch() {
     const batches = messagesEl.querySelectorAll(".conv-batch");
     for (let i = batches.length - 1; i >= 0; i--) {
       const b = batches[i];
+      if (!b.classList.contains("conv-batch--pending")) continue;
       if (!b.querySelector('.conv-row[data-needs-approval="1"][data-call-id]'))
         continue;
       const btn = b.querySelector(".conv-actions button");
@@ -2098,6 +2224,47 @@ function createCoordinatorPane(root, wsId, opts) {
       return b;
     }
     return null;
+  }
+
+  // Status-bar pending-approval chip.  The coord keeps no cycle map (the
+  // interactive pane's approvalCycles); pending state IS the DOM, so the
+  // count is derived from it: every --pending batch in THIS transcript
+  // (child workstreams' gates live in the children tree and the rail, not
+  // here).  Re-derived at the three places pending state changes —
+  // appendToolBatch (paint / replay / upgrade), _morphBatchResolved, and
+  // the refetchHistory wipe (a history render never paints a pending
+  // batch; SSE re-delivers approve_request, which repaints and recounts).
+  // A batch stays counted while its own click is mid-resolve: the server
+  // has not confirmed yet, and approval_resolved morphs it out.
+  function _syncApprovalChip() {
+    if (!sbApprovalEl) return;
+    const n = messagesEl.querySelectorAll(
+      ".conv-batch.conv-batch--pending",
+    ).length;
+    StatusBar.paintApprovalChip(
+      {
+        approvalEl: sbApprovalEl,
+        focusFallbackEl: composer && composer.inputEl,
+      },
+      n,
+    );
+  }
+
+  // Chip click: bring the batch the keyboard shortcuts act on into view and
+  // focus its HEAD, not its primary action — a "show me" click must never
+  // arm Space on Approve.  (The paint-time focus on the primary action stays
+  // where it is; that one follows a judge verdict the reviewer asked for.)
+  // Falls back to any --pending batch (all mid-resolve) so the click never
+  // lands on nothing while the chip is showing.  The head focus uses
+  // preventScroll internally, so the smooth scroll keeps the viewport.
+  function _revealPendingApproval() {
+    const batch =
+      _currentPendingBatch() ||
+      messagesEl.querySelector(".conv-batch.conv-batch--pending");
+    if (!batch) return;
+    setConvBatchExpanded(batch, true, { blocker: true });
+    StatusBar.scrollToApprovalTarget(batch);
+    focusConvBatchHead(batch);
   }
 
   // Build the resolved-state status pill.  Shared between the live
@@ -2110,6 +2277,7 @@ function createCoordinatorPane(root, wsId, opts) {
 
   function _setBatchRunning(batch) {
     if (!batch) return;
+    setConvBatchExpanded(batch, true, { blocker: true });
     batch.classList.add("conv-batch--running");
     const kicker = batch.querySelector(".conv-batch-kicker");
     if (kicker) {
@@ -2144,6 +2312,9 @@ function createCoordinatorPane(root, wsId, opts) {
 
   function _morphBatchResolved(batch, opts) {
     if (!batch) return;
+    if (!opts.approved) {
+      setConvBatchExpanded(batch, true, { blocker: true });
+    }
     batch.classList.remove("conv-batch--pending");
     batch.classList.add(
       opts.approved ? "conv-batch--approved" : "conv-batch--denied",
@@ -2155,6 +2326,7 @@ function createCoordinatorPane(root, wsId, opts) {
     const actions = batch.querySelector(".conv-actions");
     if (actions) actions.replaceWith(_buildStatusPill(opts));
     if (activeBatch === batch) activeBatch = null;
+    _syncApprovalChip();
   }
 
   function _focusBatchPrimary(batch, prefer) {
@@ -2251,6 +2423,7 @@ function createCoordinatorPane(root, wsId, opts) {
       //                            turn that was actually auto-
       //                            approved + in-flight at reload)
       if (opts.pending && !existing.classList.contains("conv-batch--pending")) {
+        setConvBatchExpanded(existing, true, { blocker: true });
         existing.classList.remove(
           "conv-batch--approved",
           "conv-batch--denied",
@@ -2324,6 +2497,11 @@ function createCoordinatorPane(root, wsId, opts) {
           _appendJudgePendingLineTo(entry.row);
         }
       });
+      // Only a pending paint can add --pending (the morph is the sole
+      // remover), so the recount is gated on it: a history render calls
+      // this once per tool batch, and an unconditional transcript scan
+      // there is quadratic in a long session.
+      if (opts.pending) _syncApprovalChip();
       return existing;
     }
 
@@ -2426,6 +2604,7 @@ function createCoordinatorPane(root, wsId, opts) {
 
     messagesEl.appendChild(batch);
     _scheduleScroll();
+    if (opts.pending) _syncApprovalChip();
     return batch;
   }
 
@@ -2437,8 +2616,10 @@ function createCoordinatorPane(root, wsId, opts) {
   let currentAssistantBuf = "";
   let currentReasoningEl = null;
   let currentReasoningBuf = "";
+  const reasoningActivity = createReasoningActivity();
 
   function appendContentToken(text) {
+    reasoningActivity.finish();
     if (!currentAssistantEl) {
       currentAssistantEl = appendMsg("assistant", "", { label: "assistant" });
       currentAssistantBuf = "";
@@ -2477,6 +2658,7 @@ function createCoordinatorPane(root, wsId, opts) {
       currentReasoningBuf = "";
       messagesEl.setAttribute("aria-live", "off");
     }
+    reasoningActivity.attach(currentReasoningEl);
     currentReasoningBuf += text;
     const body = currentReasoningEl.querySelector(".msg-body");
     if (body) body.textContent = currentReasoningBuf;
@@ -2501,12 +2683,14 @@ function createCoordinatorPane(root, wsId, opts) {
     }
     currentAssistantEl = null;
     currentAssistantBuf = "";
+    reasoningActivity.finish();
     currentReasoningEl = null;
     currentReasoningBuf = "";
     messagesEl.setAttribute("aria-live", "polite");
     // Move the retry affordance onto the just-completed last assistant turn
     // (#549). No-op when the turn ended tool-only (see _refreshRetryButton).
     _refreshRetryButton();
+    _scheduleScroll();
   }
 
   // ------------------------------------------------------------------
@@ -2572,6 +2756,11 @@ function createCoordinatorPane(root, wsId, opts) {
   // plus the cancel-timer cleanup wired via the onIdle hook above).
   function setBusy(b, source) {
     const next = !!b;
+    if (!next) {
+      reasoningActivity.finish();
+      currentReasoningEl = null;
+      currentReasoningBuf = "";
+    }
     // Who asserted busy: "server" (default — state events and every
     // existing/future writer) or "optimistic" (ONLY coordSend's pre-POST
     // flip). The deferred/queue_full settle arms may clear busy solely
@@ -2714,6 +2903,7 @@ function createCoordinatorPane(root, wsId, opts) {
         },
       );
     }
+    scrollFollow.jumpToLatest();
     composer.clear();
 
     // Bound the send POST with an AbortController + ~15s timeout (mirrors
@@ -3528,6 +3718,7 @@ function createCoordinatorPane(root, wsId, opts) {
     suspendStream();
     currentAssistantEl = null;
     currentAssistantBuf = "";
+    reasoningActivity.finish();
     currentReasoningEl = null;
     currentReasoningBuf = "";
     // Drop the live cursor for the reconnect: the full render below
@@ -3692,6 +3883,15 @@ function createCoordinatorPane(root, wsId, opts) {
 
   function handleEvent(ev) {
     switch (ev.type) {
+      case "thinking_start":
+        if (!compactionHolder.card) {
+          reasoningActivity.start(messagesEl);
+          _scheduleScroll();
+        }
+        break;
+      case "thinking_stop":
+        reasoningActivity.hideWaiting();
+        break;
       case "content":
         appendContentToken(ev.text || "");
         break;
@@ -3712,12 +3912,14 @@ function createCoordinatorPane(root, wsId, opts) {
             });
             messagesEl.setAttribute("aria-live", "off");
           }
+          reasoningActivity.attach(currentReasoningEl);
           currentReasoningBuf = ev.reasoning;
           var rbody = currentReasoningEl.querySelector(".msg-body");
           if (rbody) rbody.textContent = currentReasoningBuf;
           _scheduleScroll();
         }
         if (ev.content && ev.content.length > currentAssistantBuf.length) {
+          reasoningActivity.finish();
           if (!currentAssistantEl) {
             currentAssistantEl = appendMsg("assistant", "", {
               label: "assistant",
@@ -3969,6 +4171,8 @@ function createCoordinatorPane(root, wsId, opts) {
           onNotice: (msg) => appendText("info", msg, { label: "info" }),
           scroll: () => _scheduleScroll(),
         });
+        // Manual compaction's busy state can start reasoning before this card.
+        if (compactionHolder.card) reasoningActivity.finish();
         break;
       case "connected":
         // First yield from _coord_events_replay — populates the
@@ -4004,6 +4208,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // transitions we didn't initiate (cross-tab cancel, judge
         // reset, idle-after-error). Mirrors the interactive pane.
         if (ev.state === "idle" || ev.state === "error") {
+          reasoningActivity.finish();
           setBusy(false);
           // Deferred replay_truncated re-sync: the truncation arrived while a
           // turn was mid-stream (refetching then would have detached the live
@@ -4109,6 +4314,17 @@ function createCoordinatorPane(root, wsId, opts) {
           ev.state === "attention"
         ) {
           setBusy(true);
+          // Fresh state snapshots may precede the first reasoning token and
+          // carry no thinking_start event to recreate the waiting indicator.
+          if (
+            ev.state === "thinking" &&
+            !currentAssistantEl &&
+            !currentReasoningEl &&
+            !compactionHolder.card
+          ) {
+            reasoningActivity.start(messagesEl);
+            _scheduleScroll();
+          }
         }
         break;
       case "rename":
@@ -4153,6 +4369,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // Force Stop after 2s. state_change → idle is what actually
         // clears busy; the 10s safety timer covers the connection-drop
         // case.
+        reasoningActivity.finish();
         if (!busy) break;
         clearTimeout(cancelTimeoutId);
         clearTimeout(forceTimeoutId);
@@ -4287,6 +4504,7 @@ function createCoordinatorPane(root, wsId, opts) {
               label: "you",
               clientSendId: editClientSendId,
             });
+            scrollFollow.jumpToLatest();
             postAndSettleSend(
               queue,
               authFetch(
@@ -4507,6 +4725,10 @@ function createCoordinatorPane(root, wsId, opts) {
   const _mapSet = Map.prototype.set;
   const _mapDelete = Map.prototype.delete;
   const _mapClear = Map.prototype.clear;
+  // Every mutation repaints the Children-heading count: the pending set
+  // IS that chip's number, and the bulk live fetch (the path that first
+  // discovers a pending approval after load) reaches no render otherwise.
+  // Cheap per call — two sizes, one text write, one two-child lookup.
   function _liveBadgeCacheSet(id, entry) {
     _mapSet.call(liveBadgeCache, id, entry);
     if (entry && entry.live && entry.live.pending_approval) {
@@ -4514,15 +4736,25 @@ function createCoordinatorPane(root, wsId, opts) {
     } else {
       pendingApprovalIds.delete(id);
     }
+    _refreshChildrenCount();
   }
   function _liveBadgeCacheDelete(id) {
     _mapDelete.call(liveBadgeCache, id);
     pendingApprovalIds.delete(id);
+    _refreshChildrenCount();
   }
   function _liveBadgeCacheClear() {
     _mapClear.call(liveBadgeCache);
     pendingApprovalIds.clear();
+    _refreshChildrenCount();
   }
+  // The child row currently flashed by a reveal (the Children-heading
+  // chip).  Held by id, not element: a live-fetch or state tick can
+  // replace the row within the flash window, so renderChildRow re-applies
+  // the class from this and the timer strips it by id.
+  let _flashWsId = null;
+  let _flashTimer = null;
+  const FLASH_MS = 1200;
   // ws_ids currently visible in the viewport — only these trigger
   // live-fetch on SSE state changes.  Populated by an
   // IntersectionObserver attached to each rendered .ch-row so a
@@ -4598,6 +4830,7 @@ function createCoordinatorPane(root, wsId, opts) {
     row.setAttribute("role", "listitem");
     if (state === "closed" || state === "deleted") row.classList.add("closed");
     if (child.ws_id) row.dataset.wsId = child.ws_id;
+    if (child.ws_id && child.ws_id === _flashWsId) row.classList.add("highlight");
 
     const a = document.createElement("a");
     a.className = "ws-link";
@@ -5290,6 +5523,14 @@ function createCoordinatorPane(root, wsId, opts) {
     if (!active || !scopeEl || !scopeEl.contains(active)) return null;
     const row = active.closest(".ch-row");
     if (!row || !row.dataset.wsId) return null;
+    // The row and its approval region take temporary focus from the
+    // Children-heading chip's reveal.  Neither is a stable className
+    // (the row carries a transient flash class, the region a transient
+    // loading class), so they are captured as roles.
+    if (active === row) return { wsId: row.dataset.wsId, role: "row" };
+    if (active.classList && active.classList.contains("approval-block")) {
+      return { wsId: row.dataset.wsId, role: "approval" };
+    }
     return {
       wsId: row.dataset.wsId,
       marker: active.className || active.tagName,
@@ -5302,7 +5543,13 @@ function createCoordinatorPane(root, wsId, opts) {
     const row = scopeEl.matches(sel) ? scopeEl : scopeEl.querySelector(sel);
     if (!row) return;
     let target = null;
-    if (focusKey.marker) {
+    if (focusKey.role === "row") {
+      target = row;
+    } else if (focusKey.role === "approval") {
+      // The block is gone on the resolution swap: keep the caret in the
+      // list on the row rather than dropping it to the document.
+      target = row.querySelector(".approval-block") || row;
+    } else if (focusKey.marker) {
       // CSS.escape can't safely round-trip a class list with spaces,
       // so we walk focusables and string-compare. A future refactor
       // could swap to a stable ``data-focus-key`` attribute on each
@@ -5318,7 +5565,12 @@ function createCoordinatorPane(root, wsId, opts) {
         }
       }
     }
-    if (target) target.focus({ preventScroll: true });
+    if (!target) return;
+    // A role target is a plain div on the fresh row: a raw focus() is a
+    // silent no-op there, so it takes the same temporary tabindex the
+    // reveal gave the original.  Marker targets are natively focusable.
+    if (focusKey.role) focusTemporarily(target);
+    else target.focus({ preventScroll: true });
   }
 
   function _renderChildrenNow() {
@@ -5400,9 +5652,70 @@ function createCoordinatorPane(root, wsId, opts) {
   function _refreshChildrenCount() {
     const total = childrenState.size;
     const pending = pendingApprovalIds.size;
-    childrenCountEl.textContent = total
-      ? "(" + total + (pending > 0 ? " · " + pending + " pending" : "") + ")"
-      : "";
+    childrenCountEl.textContent = total ? "(" + total + ")" : "";
+    // The pending part of the old "(N · x pending)" annotation is now a
+    // warn chip: same words, but coloured and clickable — the click
+    // scrolls the tree to the first child waiting on an approval.
+    StatusBar.paintWarnChip(
+      {
+        chipEl: childrenPendingEl,
+        focusFallbackEl: composer && composer.inputEl,
+      },
+      pending,
+      {
+        label: pending + " approval" + (pending === 1 ? "" : "s"),
+        title:
+          "Show the " +
+          (pending === 1 ? "child" : "first child") +
+          " waiting for approval",
+      },
+    );
+  }
+
+  // Children-heading chip click: the first child row (tree order) whose
+  // approval is pending.  Rows lazy-load their approval block on
+  // visibility, so the row is the reliable target; the block, when
+  // already painted, is the better landing (a labelled region).  Focus is
+  // temporary on the region or the row — never the child's link (Enter
+  // would open it) and never an Approve button (Space would fire it).
+  // No sidebar expand: a collapsed sidebar hides the whole children
+  // section, this chip included, so the click cannot happen there.
+  function _revealPendingChild() {
+    if (!pendingApprovalIds.size) return;
+    const rows = childrenTreeEl.querySelectorAll(".ch-row");
+    let row = null;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].dataset.wsId && pendingApprovalIds.has(rows[i].dataset.wsId)) {
+        row = rows[i];
+        break;
+      }
+    }
+    if (!row) return;
+    StatusBar.scrollToApprovalTarget(row);
+    _flashChildRow(row.dataset.wsId);
+    focusTemporarily(row.querySelector(".approval-block") || row);
+  }
+
+  function _flashChildRow(wsId) {
+    if (_flashTimer) clearTimeout(_flashTimer);
+    if (_flashWsId && _flashWsId !== wsId) _unflashChildRow(_flashWsId);
+    _flashWsId = wsId;
+    const row = childrenTreeEl.querySelector(
+      '.ch-row[data-ws-id="' + cssEscape(wsId) + '"]',
+    );
+    if (row) row.classList.add("highlight");
+    _flashTimer = setTimeout(() => {
+      _flashTimer = null;
+      _flashWsId = null;
+      _unflashChildRow(wsId);
+    }, FLASH_MS);
+  }
+
+  function _unflashChildRow(wsId) {
+    const row = childrenTreeEl.querySelector(
+      '.ch-row[data-ws-id="' + cssEscape(wsId) + '"]',
+    );
+    if (row) row.classList.remove("highlight");
   }
 
   function renderTaskRow(task) {
@@ -5638,16 +5951,16 @@ function createCoordinatorPane(root, wsId, opts) {
           permanent: wasDenied,
           sseUpdatedAt: prev ? prev.sseUpdatedAt || 0 : 0,
         });
+        // Through _updateChildRow for its focus capture/restore, observer
+        // rebind and count repaint — the reveal's own scroll brings a row
+        // into view and lands here within the flash window, and a bare
+        // replaceWith dropped the focus it had just placed.  The guard
+        // keeps an absent row a silent skip rather than the full render
+        // _updateChildRow falls back to.
         const row = childrenTreeEl.querySelector(
           '.ch-row[data-ws-id="' + cssEscape(id) + '"]',
         );
-        if (row) {
-          const entry = childrenState.get(id);
-          if (entry) {
-            const replacement = renderChildRow(entry);
-            row.replaceWith(replacement);
-          }
-        }
+        if (row && childrenState.get(id)) _updateChildRow(id);
       });
     } catch (e) {
       // 403 = caller lacks admin.cluster.inspect → mark every pending
@@ -5945,6 +6258,14 @@ function createCoordinatorPane(root, wsId, opts) {
     details.push(detail);
     cachedLive.pending_approval = true;
     cachedLive.pending_approval_details = details;
+    // An approve_request can precede the child's first state tick (and
+    // the /children load).  Seed the entry as handleChildState does so
+    // the Children-heading chip never counts a gate with no row to
+    // reveal; the tick fills in state and node when it lands.
+    if (!childrenState.has(childId)) {
+      childrenState.set(childId, { ws_id: childId, name: "" });
+      _touchChild(childId);
+    }
     _liveBadgeCacheSet(childId, {
       live: cachedLive,
       fetched: cached ? cached.fetched : 0,
@@ -6514,7 +6835,9 @@ function createCoordinatorPane(root, wsId, opts) {
         evtSource.readyState !== EventSource.OPEN)
     )
       return;
+    const scrollTop = messagesEl.scrollTop;
     messagesEl.replaceChildren();
+    _syncApprovalChip();
     // A full committed-history render repairs any recorded truncation gap —
     // whether this render came from the truncated resync itself or from an
     // unrelated clear_ui rebuild — so it supersedes ALL pending repair
@@ -6796,6 +7119,7 @@ function createCoordinatorPane(root, wsId, opts) {
             });
           }
           _unsetBatchRunningIfAllResults(occurrence.row.closest(".conv-batch"));
+          markConvRowResultSettled(occurrence.row, { autoFold: true });
         } else {
           appendToolResult(
             toolName,
@@ -6925,6 +7249,8 @@ function createCoordinatorPane(root, wsId, opts) {
           ? hist.handoff_token
           : null;
     }
+    messagesEl.scrollTop = scrollTop;
+    _scheduleScroll();
     // The outcome tells the repair settle whether a TOKENLESS response was a
     // completed render (the server's deliberate cold storage-only read —
     // downgrade to the tokenless bootstrap) or a failure (fail closed).
@@ -6946,6 +7272,7 @@ function createCoordinatorPane(root, wsId, opts) {
   // per-instance pane must release the stream + every timer/observer or a
   // backgrounded pane keeps an SSE open and fires renders into detached DOM.
   function destroy() {
+    reasoningActivity.finish();
     // Stream + the retry timers (reconnect backoff, degraded catch-up,
     // truncated resync).
     closeStreamTransport();
@@ -6989,6 +7316,12 @@ function createCoordinatorPane(root, wsId, opts) {
     removeVisibilityHandler();
     if (_childObserver && _childObserver.disconnect)
       _childObserver.disconnect();
+    unregisterTranscriptScroller();
+    scrollFollow.destroy();
+    if (unmountTranscriptPresentation) {
+      unmountTranscriptPresentation();
+      unmountTranscriptPresentation = null;
+    }
   }
 
   // Reconnect a DEAD stream NOW (reset backoff), leaving a live one alone —

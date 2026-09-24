@@ -34,6 +34,7 @@ import { authFetch } from "./auth.js";
 // would 404 and abort the whole shell module.
 import { createInteractivePane } from "./interactive.js";
 import { createPreviewPane } from "./preview.js";
+import { mountTranscriptPresentationToggle } from "./transcript_presentation.js";
 
 function make(tag, className, text) {
   const node = document.createElement(tag);
@@ -103,11 +104,8 @@ function buildShell(caps) {
   burger.setAttribute("aria-label", "Open navigation");
   burger.setAttribute("aria-controls", "shell-rail");
   burger.setAttribute("aria-expanded", "false");
-  // The tab strip is its OWN element so PaneManager's role="tablist" wraps
-  // ONLY the tabs — the burger and the [+] tail are non-tab focusables and
-  // don't belong inside a tablist's accessibility tree.  It is also the
-  // horizontal scroller on mobile, so burger + [+] stay pinned while tabs
-  // scroll.
+  // Tabs and their dismiss buttons share a horizontal scroller, keeping the
+  // burger and [+] pinned.  PaneManager owns the tablist accessibility tree.
   const tabstrip = make("div", "tabstrip");
   const tail = make("div", "tabbar-right"); // right-floated tab-bar chrome (the [+])
   tabbar.append(burger, tabstrip, tail);
@@ -515,11 +513,13 @@ async function mountShell() {
     shell.connSlot.replaceWith(statusBarEl);
   }
 
-  // Relocate ONLY the theme toggle into the rail footer (id + onclick
-  // preserved), then retire the now-empty header.  The Admin button is dropped
+  // Mount the viewer-local transcript toggle, then relocate ONLY the legacy
+  // theme control into the rail footer (id + onclick preserved) and retire the
+  // now-empty header.  The Admin button is dropped
   // — Manage already surfaces every admin tab, so a separate footer button is
   // redundant.  Logout moves into the user menu (the #logout-btn stays in the
   // hidden header for its wired onclick + auth.js race-guards; the menu clicks it).
+  mountTranscriptPresentationToggle(shell.foot, { className: "ico-btn" });
   const themeBtn = document.getElementById("theme-toggle");
   if (themeBtn) shell.foot.append(themeBtn);
 
@@ -549,9 +549,7 @@ async function mountShell() {
   };
 
   // ----- PaneManager: one new spine -----
-  // It owns the tabstrip (role=tablist), NOT the whole tab bar: the burger and
-  // the [+] tail live outside the strip so the tablist holds only tabs.  No
-  // tailEl — the strip has no non-tab chrome to anchor before.
+  // It owns the tabstrip; the burger and [+] stay in the surrounding tab bar.
   const pm = new PaneManager({
     tabbarEl: shell.tabstrip,
     panesEl: shell.panes,
@@ -849,11 +847,12 @@ async function mountShell() {
     // offer a one-click retry — re-clicking the tab won't re-fire onActivate
     // (PaneManager fires it only on a pane CHANGE), so without this a transient
     // failure would strand the pane until the user closed + reopened it.
-    const showResolveError = (msg, forceResolve) => {
+    const showResolveError = (result, forceResolve) => {
       const el = pane._statusEl;
       if (!el) return;
       el.className = "pane-status pane-status--retry msg error";
-      el.textContent = msg || "Could not connect to this session.";
+      el.textContent =
+        (result && result.error) || "Could not connect to this session.";
       el.title = "Click to retry";
       el.onclick = () => {
         if (pane._ctl || pane._resolving) return;
@@ -863,6 +862,21 @@ async function mountShell() {
         el.textContent = "Connecting…";
         beginConnect(forceResolve);
       };
+      const app = window.TS_APP;
+      if (
+        result &&
+        result.canContinue &&
+        app &&
+        app.continueInteractiveElsewhere
+      ) {
+        const button = make("button", "sh-btn", "Continue elsewhere…");
+        button.type = "button";
+        button.onclick = (event) => {
+          event.stopPropagation();
+          app.continueInteractiveElsewhere(id, result.requiredNodeId);
+        };
+        el.append(button);
+      }
     };
     // First-activate connect.  A LIVE session (Tier-1 already names its node, so
     // it is loaded there) connects DIRECTLY — no /open round-trip; this is the
@@ -888,7 +902,7 @@ async function mountShell() {
         pane._resolving = false;
         if (pane._closed) return; // closed mid-resolve — don't build into a detached body
         if (!res || res.error) {
-          showResolveError(res && res.error, forceResolve);
+          showResolveError(res, forceResolve);
           return;
         }
         buildController(res.nodeId);

@@ -320,14 +320,53 @@ Search file contents for a regex pattern.
 
 ### web_fetch
 
-Fetch a URL and extract specific information from it.
+Fetch a web page or PDF and extract specific information from it.
 
 | Parameter  | Type   | Required | Description |
 |------------|--------|----------|-------------|
 | `url`      | string | yes      | The URL to fetch (must start with `http://` or `https://`). |
-| `question` | string | yes      | What to extract or answer from the page content. |
+| `question` | string | yes      | What to extract or answer from the page or PDF. |
 
-- **What it does**: Fetches the URL, strips HTML to plain text, and uses the LLM to extract the answer to the question from the page content. Every redirect hop is SSRF-screened before it is requested. Private/internal addresses are refused by default; enable `tools.allow_private_network` (console Settings → Tools) to make them approvable for self-hosted setups whose services live on the local network — the approval prompt marks such requests, and a public site redirecting into private space is refused regardless. Cloud metadata endpoints and link-local, multicast and reserved addresses are refused even with the opt-in enabled, including as a redirect target from a private address you approved. An address is judged by what it actually reaches, so an IPv6 transition address (NAT64, 6to4, Teredo) wrapping an internal IPv4 is treated exactly as that IPv4 would be.
+- **What it does**: Fetches the URL and uses the LLM to answer the question from
+  the fetched content. HTML is stripped to plain text. A response whose bytes
+  begin with PDF magic uses the attachment PDF ladder: native document input
+  when the active model supports it, ordered page images for a vision model,
+  configured perception, then local text extraction. If none can read the PDF,
+  the tool returns an explicit error instead of asking the model to infer from
+  an empty document. Local PDF rendering and text extraction run in a one-shot
+  child under memory, CPU, wall-time, and output limits; exceeding that shared
+  attachment safety envelope fails the fetch explicitly. Decoded HTML/plain
+  text and locally extracted PDF text use at most half the active model lane's
+  calibrated context after prompt, response, and safety reserves; the final
+  request is checked again before provider I/O. If no document allowance
+  remains, the tool returns an error instead of invoking extraction without
+  source content. The fixed worker output envelope is an additional PDF-only
+  host-safety ceiling. Rasterization supplies at most ten pages and explicitly
+  tells the model when later pages were omitted; that notice survives the
+  perception cache. Fetched PDFs are request-local and are not added to
+  conversation history or attachment storage. Every redirect hop is
+  SSRF-screened before it is requested.
+  Private/internal addresses are refused by default; enable
+  `tools.allow_private_network` (console Settings → Tools)
+  to make them approvable for self-hosted setups whose services live on the
+  local network. The approval prompt marks such requests, and a public site
+  redirecting into private space is refused regardless. Cloud metadata
+  endpoints and link-local, multicast and reserved addresses are refused even
+  with the opt-in enabled, including as a redirect target from a private address
+  you approved. An address is judged by what it actually reaches, so an IPv6
+  transition address (NAT64, 6to4, Teredo) wrapping an internal IPv4 is treated
+  exactly as that IPv4 would be.
+- **Deployment requirements for local PDF processing**: The bounded PDF worker
+  needs a writable temporary directory (`/tmp`, or the directory selected by
+  `TMPDIR`) and permission to create one child process and lower its own resource
+  limits. A hardened container with `readOnlyRootFilesystem: true` should mount
+  a writable `emptyDir` at `/tmp`; a custom seccomp policy must permit the
+  process/limit syscalls used for fork/exec, `setsid`, `setrlimit`, and
+  `prlimit64`. The worker intentionally ignores Python environment variables,
+  so venv, system-site, and ordinary default user-site dependencies work, but
+  dependencies reachable only through a custom `PYTHONUSERBASE` do not. Install
+  Turnstone and its PDF dependencies into the same venv or a standard site
+  directory instead. Models receiving PDFs natively do not start this worker.
 - **Auto-approve**: No -- requires user confirmation (makes network requests).
 - **Agent availability**: `task_agent`.
 
@@ -407,20 +446,21 @@ Show the user rich content in a preview pane beside the conversation.
 | `kind`    | string | no       | Rendering override: `web`, `pdf`, `image`, `table`, `text`, or `markdown`. Detected from the content when omitted. |
 | `title`   | string | no       | Pane header title. Defaults to the page title, filename, or URL. |
 
-- **What it does**: Resolves the target to bytes (URLs fetch through the same
-  SSRF-guarded path as `web_fetch`, screened per redirect hop, honoring the
-  same `tools.allow_private_network` opt-in), classifies the
-  content, stores it content-addressed against the workstream, and opens the
-  frontend preview pane beside the conversation: web pages render in a fully
-  sandboxed iframe (no scripts, opaque origin), PDFs in the browser viewer,
-  images inline, CSV/TSV/JSON as a sortable table, text/markdown rendered. A
-  previewed web page loads none of its remote images or styles by default, so
-  opening it never reveals the viewer to the page's site; a toggle in the pane
-  header turns remote content back on for that preview. The
-  model receives only a one-line confirmation — to reason about content, use
-  `web_fetch` / `read_file` instead. Preview content is size-capped per kind
-  (pages 4 MB, PDFs 32 MB, images 4 MB, tables 2 MB, text 512 KB) and GC'd
-  with the workstream.
+- **What it does**: Resolves the target to bytes (URLs fetch through the same SSRF-guarded path as
+  `web_fetch`, screened per redirect hop, honoring the same `tools.allow_private_network` opt-in),
+  classifies the content, stores it content-addressed against the workstream, and opens the frontend
+  preview pane beside the conversation: web pages render in a fully sandboxed iframe (no scripts,
+  opaque origin), PDFs in the browser viewer, images inline, CSV/TSV/JSON as a sortable table,
+  text/markdown rendered. A previewed web page loads none of its remote images or styles by default,
+  so opening it never reveals the viewer to the page's site; a toggle in the pane header turns
+  remote content back on for that preview. **Download** saves the stored preview file, including the
+  complete CSV/TSV/JSON when the table display is capped or sorted. Text downloads use the preview's
+  UTF-8 encoding; fetched HTML includes its base URL for relative links and assets. Newly stored
+  previews derive their filename from the source where available, independently of the pane title.
+  Downloads reuse that stored name with an ASCII-safe fallback. The model receives only a one-line
+  confirmation — to reason about content, use `web_fetch` / `read_file` instead. Preview content is
+  size-capped per kind (pages 4 MB, PDFs 32 MB, images 4 MB, tables 2 MB, text 512 KB) and GC'd with
+  the workstream.
 - **Auto-approve**: URL targets require confirmation (network access); file
   paths and `attachment:` targets run unprompted (local reads).
 - **Agent availability**: interactive sessions only (not `task_agent`, not
@@ -520,7 +560,7 @@ Send a notification to a user or channel on an external platform.
 
 | Parameter      | Type   | Required | Description |
 |----------------|--------|----------|-------------|
-| `message`      | string | yes      | Notification content (plain text, max 2000 chars). |
+| `message`      | string | yes      | Notification content (max 2000 chars; Discord mentions supported). |
 | `username`     | string | no       | Turnstone username — sends to all linked channels. |
 | `channel_type` | string | no       | Platform for direct targeting (`discord`). |
 | `channel_id`   | string | no       | Platform-specific channel or user ID for direct targeting. |
@@ -528,6 +568,10 @@ Send a notification to a user or channel on an external platform.
 
 Provide either `username` for user-based targeting or `channel_type` +
 `channel_id` for direct targeting. Do not combine both.
+
+Discord notifications support `<@USER_ID>`, `<@&ROLE_ID>`, `@everyone`, and `@here`, subject to Discord's
+permissions and the recipient's notification settings. For a DM, pass the user's Discord ID as
+`channel_id`; a separate server channel ID is not required.
 
 - **What it does**: Sends a notification via the channel gateway's HTTP endpoint (`POST /v1/api/notify`). The server queries the `services` table for healthy channel gateways, authenticates with a service JWT (`aud: turnstone-channel`), and delivers to the first healthy gateway. On failure, retries up to 2 additional times with backoff (1s, 3s). Rate-limited to 5 notifications per turn (counter only increments on success).
 - **Auto-approve**: Yes — notifications are time-sensitive and auto-approved so the model can alert users urgently.
@@ -778,6 +822,15 @@ MCP-compatible service.
 5. **Dispatch**: When the LLM calls an MCP tool, `_prepare_mcp_tool()` builds a
    generic approval preview and `_exec_mcp_tool()` calls `MCPClientManager.call_tool_sync()`,
    which dispatches the call to the background asyncio event loop.
+
+   If the caller's timeout expires, turnstone cancels its local wait without changing
+   the server's circuit-breaker failure count. This also applies to resource reads,
+   prompt retrievals, and calls still waiting for a per-user session lock. Observed
+   transport failures still count. Static reconnection precedes the operation timeout;
+   per-user calls include token lookup, connection, and lock waiting in their budget.
+   A timeout does not confirm remote cancellation: the server may continue working,
+   and timed-out tool calls retain an unknown outcome. A connected server that never
+   answers can continue to consume each caller's timeout budget.
 
 ### Approval behavior
 

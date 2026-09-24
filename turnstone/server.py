@@ -2464,18 +2464,32 @@ def _deliver_notification(
     """POST to channel gateway /v1/api/notify with retry."""
     import httpx
 
+    from turnstone.core.session import _notify_delivery_statuses, _notify_log_url
+
+    log_fields = {
+        "ws_id": payload.get("ws_id", ""),
+        "auth_present": bool(auth_headers.get("Authorization")),
+    }
     for attempt in range(3):
         services = storage.list_services("channel", max_age_seconds=120)
         if not services:
             if attempt < 2:
+                log.warning("notify_completion.no_services", attempt=attempt + 1, **log_fields)
                 time.sleep(1.0 if attempt == 0 else 3.0)
                 continue
-            log.warning("notify_completion.no_services")
+            log.warning("notify_completion.no_services", attempt=attempt + 1, **log_fields)
             return
 
         for svc in services:
             url = svc["url"].rstrip("/") + "/v1/api/notify"
+            gateway_fields = {
+                **log_fields,
+                "gateway_id": svc.get("service_id", ""),
+                "gateway_url": _notify_log_url(url),
+                "attempt": attempt + 1,
+            }
             if not url.startswith(("http://", "https://")):
+                log.warning("notify_completion.invalid_url", **gateway_fields)
                 continue
             try:
                 resp = httpx.post(url, json=payload, timeout=10, headers=auth_headers)
@@ -2487,23 +2501,36 @@ def _deliver_notification(
                         if isinstance(results, list) and any(
                             isinstance(r, dict) and r.get("status") == "sent" for r in results
                         ):
-                            log.info("notify_completion.delivered", ws_id=payload.get("ws_id"))
+                            log.info("notify_completion.delivered", **gateway_fields)
                             return
                     except Exception:
-                        log.debug("notify_completion.response_parse_error", url=url, exc_info=True)
-                    log.warning("notify_completion.no_successful_delivery", url=url)
+                        log.warning(
+                            "notify_completion.response_parse_error",
+                            status=resp.status_code,
+                            **gateway_fields,
+                        )
+                        continue
+                    log.warning(
+                        "notify_completion.no_successful_delivery",
+                        delivery_statuses=_notify_delivery_statuses(results),
+                        **gateway_fields,
+                    )
                     continue
                 log.warning(
                     "notify_completion.failed",
                     status=resp.status_code,
-                    url=url,
+                    **gateway_fields,
                 )
-            except Exception:
-                log.exception("notify_completion.error", url=url)
+            except Exception as exc:
+                log.warning(
+                    "notify_completion.error", error_type=type(exc).__name__, **gateway_fields
+                )
                 continue
 
         if attempt < 2:
             time.sleep(1.0 if attempt == 0 else 3.0)
+
+    log.warning("notify_completion.delivery_failed", attempts=3, **log_fields)
 
 
 async def _interactive_create_validate_request(
@@ -2547,11 +2574,29 @@ async def _interactive_create_validate_request(
       canonicalized before the workstream reservation is created.
     """
     requested_ws_id = body.get("ws_id", "") or ""
+    from turnstone.core.node_affinity import (
+        NodeAffinityError,
+        requested_node_requirement,
+        require_execution_node,
+    )
+
+    try:
+        body["required_node_id"] = requested_node_requirement(
+            body.get("required_node_id"), body.get("target_node")
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    body.pop("_resume_required_node_id", None)
     if not isinstance(requested_ws_id, str):
         requested_ws_id = ""
     if requested_ws_id and not _VALID_WS_ID.match(requested_ws_id):
         return JSONResponse({"error": "invalid ws_id format"}, status_code=400)
     resume_ws_id = body.get("resume_ws", "") or ""
+    resume_ws_exact = body.get("resume_ws_exact", False)
+    if not isinstance(resume_ws_exact, bool):
+        return JSONResponse({"error": "resume_ws_exact must be a boolean"}, status_code=400)
+    if resume_ws_exact and (not isinstance(resume_ws_id, str) or not resume_ws_id):
+        return JSONResponse({"error": "resume_ws_exact requires resume_ws"}, status_code=400)
     if uploaded_files and resume_ws_id:
         return JSONResponse(
             {"error": "attachments cannot be combined with resume_ws"},
@@ -2629,15 +2674,16 @@ async def _interactive_create_validate_request(
         # through alias-first resolution: an unrelated row may legally carry
         # that 32-hex string as its alias, and a routing proxy has already
         # canonicalized saved aliases before forwarding the request.  Retain
-        # support for 32-hex aliases only when no exact row exists.
+        # support for 32-hex aliases only when no exact row exists and the
+        # caller has not required an exact identity (as channel recovery does).
         _exact_source = (
-            _rstorage.get_workstream(resume_ws_id) if _VALID_WS_ID.fullmatch(resume_ws_id) else None
+            _rstorage.get_workstream(resume_ws_id)
+            if resume_ws_exact or _VALID_WS_ID.fullmatch(resume_ws_id)
+            else None
         )
-        _canonical = (
-            resume_ws_id
-            if _exact_source is not None
-            else _rstorage.resolve_workstream(resume_ws_id)
-        )
+        _canonical = resume_ws_id if _exact_source is not None else None
+        if _canonical is None and not resume_ws_exact:
+            _canonical = _rstorage.resolve_workstream(resume_ws_id)
         _src_row = (
             _rstorage.ensure_workstream_incarnation_snapshot(_canonical) if _canonical else None
         )
@@ -2666,6 +2712,9 @@ async def _interactive_create_validate_request(
         # incarnation inside its transaction, so delete/recreate under the same
         # canonical id cannot inherit the earlier authorization decision.
         body["_resume_incarnation_token"] = str(_src_row.get("fork_reservation_token") or "")
+        body["_resume_required_node_id"] = _src_row.get("required_node_id")
+        if body["required_node_id"] is None:
+            body["required_node_id"] = _src_row.get("required_node_id")
         body["project_id"] = source_project
         resume_inherited_pid = bool(source_project)
     # Project attach gate (explicit or parent-inherited): a project requires
@@ -2712,6 +2761,10 @@ async def _interactive_create_validate_request(
     if tools_err:
         return JSONResponse({"error": tools_err}, status_code=400)
     body["auto_approve_tools"] = auto_approve_tools
+    try:
+        require_execution_node(body["required_node_id"], getattr(request.app.state, "node_id", ""))
+    except NodeAffinityError as exc:
+        return JSONResponse(exc.as_dict(), status_code=exc.status_code)
     return None
 
 
@@ -2756,6 +2809,7 @@ def _interactive_create_build_kwargs(
         "judge_model": body.get("judge_model", "") or None,
         "parent_ws_id": body.get("parent_ws_id") or None,
         "project_id": body.get("project_id") or None,
+        "required_node_id": body.get("required_node_id"),
     }
 
 
@@ -2791,6 +2845,7 @@ async def _interactive_create_pre_commit(
             source_ws_id,
             principal_id=uid,
             source_reservation_token=source_reservation_token,
+            source_required_node_id=body.get("_resume_required_node_id"),
             trusted_internal=False,
         )
         message_count = len(snapshot.turns)
@@ -3229,6 +3284,7 @@ def _audit_workstream_created(
 async def delete_workstream_endpoint(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/{ws_id}/delete — permanently delete a saved workstream."""
     from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
     from turnstone.core.log import get_logger
     from turnstone.core.storage._registry import get_storage
 
@@ -3254,6 +3310,14 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
     owner_uid, err = _require_ws_access(request, ws_id, resolved_row=row)
     if err:
         return err
+    # Authorize kind from the same snapshot that fences the deletion.
+    # Both saved tables route here, including coordinator deletions.
+    if row.get("kind") == WorkstreamKind.COORDINATOR:
+        err = require_permission(request, "admin.coordinator")
+        if err is not None:
+            return err
+    elif row.get("kind") != WorkstreamKind.INTERACTIVE:
+        return JSONResponse({"error": "Unsupported workstream kind"}, status_code=403)
     kind: str = ""
     parent_ws_id: str | None = None
     name: str = ""
@@ -4664,8 +4728,19 @@ def _apply_routing_overrides(registry: Any, cs: Any, app_state: Any) -> bool:
     return False
 
 
+# Serialises hot-reloads on this node. A reload may probe model endpoints for
+# several seconds; two overlapping console fan-outs would otherwise race to
+# install their snapshots and the older one could land last.
+_MODEL_RELOAD_LOCK = threading.Lock()
+
+
 def internal_model_reload(request: Request) -> JSONResponse:
     """POST /v1/api/_internal/model-reload — rebuild registry from DB + config."""
+    with _MODEL_RELOAD_LOCK:
+        return _internal_model_reload_locked(request)
+
+
+def _internal_model_reload_locked(request: Request) -> JSONResponse:
     from turnstone.core.model_registry import (
         DynamicAuthKeyError,
         ModelAuthConfigError,
@@ -4675,19 +4750,24 @@ def internal_model_reload(request: Request) -> JSONResponse:
     from turnstone.core.storage._registry import get_storage
 
     registry = getattr(request.app.state, "registry", None)
-    cli_args = getattr(request.app.state, "cli_model_args", None)
-    if registry is None or cli_args is None:
+    if registry is None:
         return JSONResponse({"status": "error", "reason": "no registry"}, status_code=503)
 
     storage = get_storage()
     try:
         new_registry = load_model_registry(
-            base_url=cli_args["base_url"],
-            api_key=cli_args["api_key"],
-            model=cli_args["model"],
-            context_window=cli_args["context_window"],
-            provider=cli_args["provider"],
             storage=storage,
+            # Deleting the last definition is a legitimate reload: the node
+            # keeps serving an empty registry until one is added.
+            allow_empty=True,
+            # A storage read failure must surface here, not degrade to a
+            # config-only (or empty) registry that then replaces every live
+            # alias — the same posture as the console's refresh.
+            strict=True,
+            detect_context_windows=True,
+            # A definition the running registry already resolved keeps its
+            # window; only new or changed definitions are probed.
+            prior=registry.models,
         )
     except (ModelAuthConfigError, ModelConcurrencyConfigError) as exc:
         # A row whose auth or concurrency fields violate registry validation,
@@ -4697,6 +4777,17 @@ def internal_model_reload(request: Request) -> JSONResponse:
         # refresh path catches the same row. Same structured 422 contract as
         # the bad-arguments arm below: the reason names the row and field.
         return JSONResponse({"status": "error", "reason": str(exc)}, status_code=422)
+    except Exception as exc:  # noqa: BLE001 - keep the running registry on any load failure
+        # Type name only: a storage error can carry the SQL, host or file
+        # path, and this reply is relayed to the console as-is.
+        log.warning("Model reload skipped, keeping the running registry", exc_info=True)
+        return JSONResponse(
+            {
+                "status": "error",
+                "reason": f"registry load failed: {type(exc).__name__} (see the node log)",
+            },
+            status_code=503,
+        )
     cs = getattr(request.app.state, "config_store", None)
     if cs is not None:
         cs.reload()  # Ensure latest settings from DB
@@ -5946,21 +6037,13 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
-              turnstone-server                            # auto-detect model, serve on :8080
+              turnstone-server                            # serve on :8080
               turnstone-server --port 3000                # custom port
-              turnstone-server --model kappa_20b_131k     # explicit model
               turnstone-server --skip-permissions          # auto-approve all tools
+
+            Models come from the console Models tab (database) and from
+            [models.*] entries in config.toml; each carries its own endpoint.
         """),
-    )
-    parser.add_argument(
-        "--base-url",
-        default="http://localhost:8000/v1",
-        help="OpenAI-compatible API base URL (default: http://localhost:8000/v1)",
-    )
-    parser.add_argument(
-        "--model",
-        default=None,
-        help="Model name (default: auto-detect from server)",
     )
     parser.add_argument(
         "--skill",
@@ -5968,21 +6051,10 @@ def main() -> None:
         help="Skill name (replaces default skills)",
     )
     parser.add_argument(
-        "--provider",
-        default="openai",
-        choices=["openai", "anthropic"],
-        help="LLM provider for the default model (default: openai)",
-    )
-    parser.add_argument(
         "--resume",
         default=None,
         metavar="WS",
         help="Resume a previous workstream by alias or ws_id",
-    )
-    parser.add_argument(
-        "--api-key",
-        default=None,
-        help="API key (default: $OPENAI_API_KEY, or 'dummy' for local servers)",
     )
     parser.add_argument(
         "--host",
@@ -6015,7 +6087,7 @@ def main() -> None:
     add_config_arg(parser)
     # Only load bootstrap sections from config.toml — all other settings
     # are managed by ConfigStore (database-backed) after storage init.
-    apply_config(parser, ["api", "server", "database"])
+    apply_config(parser, ["server", "database"])
     args = parser.parse_args()
 
     from turnstone.core.log import configure_logging_from_args
@@ -6082,57 +6154,20 @@ def main() -> None:
 
     prune_workstreams(retention_days=config_store.get("session.retention_days"), log_fn=print)
 
-    # Create client and detect model
-    provider_name = args.provider
-    api_key = (
-        args.api_key
-        or os.environ.get("ANTHROPIC_API_KEY" if provider_name == "anthropic" else "OPENAI_API_KEY")
-        or "dummy"
-    )
-    base_url = args.base_url
-    if provider_name == "anthropic" and base_url == "http://localhost:8000/v1":
-        base_url = "https://api.anthropic.com"
-    from turnstone.core.providers import create_client
-
-    client = create_client(provider_name, base_url=base_url, api_key=api_key)
-
-    cli_model = args.model
-    effective_model = cli_model or None
-    if effective_model:
-        model = effective_model
-        detected_ctx = None
-    else:
-        from turnstone.core.model_registry import detect_model
-
-        model, detected_ctx = detect_model(client, provider=provider_name, fatal=False)
-        if model is None:
-            # LLM backend unreachable — no CLI model specified.
-            # Set empty so load_model_registry skips the CLI "default"
-            # entry and relies on DB / config.toml models instead.
-            model = ""
-
-    # Use detected context window, fall back to 32768
-    if detected_ctx:
-        context_window = detected_ctx
-        log.info("Context window: %s (detected from backend)", f"{context_window:,}")
-    else:
-        context_window = 32768
-
-    # Build model registry (reads [models.*] + database model definitions)
+    # Build the model registry from the database model definitions and
+    # config.toml [models.*]. The server has no bootstrap endpoint of its own:
+    # every definition carries its endpoint, and one whose context_window is
+    # 0 is auto-detected against that endpoint here and again on hot-reload.
     from turnstone.core.model_registry import load_model_registry
     from turnstone.core.storage._registry import get_storage as _get_storage
 
     registry = load_model_registry(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-        context_window=context_window,
-        provider=provider_name,
         storage=_get_storage(),
         # A node boots even with no models configured yet: it registers and
         # shows in the console, and models added in the admin panel hot-reload
         # in (internal_model_reload). Requests fail cleanly until then.
         allow_empty=True,
+        detect_context_windows=True,
     )
 
     # Apply runtime overrides from ConfigStore for default alias plus the
@@ -6222,10 +6257,11 @@ def main() -> None:
         )
 
     judge_config = _build_judge_config()
+    default_model_id = registry.get_config(registry.default).model if registry.default else ""
     if judge_config.enabled:
         log.info(
             "Judge: enabled (model=%s, threshold=%.2f)",
-            judge_config.model or model,
+            judge_config.model or default_model_id,
             judge_config.confidence_threshold,
         )
 
@@ -6569,6 +6605,7 @@ def main() -> None:
     # on demand via POST /v1/api/workstreams.
     if args.resume:
         from turnstone.core.memory import resolve_workstream
+        from turnstone.core.node_affinity import NodeAffinityError
 
         target_id = resolve_workstream(args.resume)
         if not target_id:
@@ -6591,9 +6628,19 @@ def main() -> None:
             raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
         if args.skip_permissions or config_store.get("tools.skip_permissions"):
             ws.ui.auto_approve = True
-        assert ws.session is not None
-        if not ws.session.resume(target_id):
+        if ws.session is None:
+            manager.close(ws.id)
+            log.error("No session available for resume: %s", target_id)
+            sys.exit(1)
+        try:
+            resumed = ws.session.resume(target_id)
+        except NodeAffinityError as exc:
+            manager.close(ws.id)
+            log.error("Cannot resume %s: %s", target_id, exc)
+            sys.exit(1)
+        if not resumed:
             log.error("Workstream '%s' has no messages.", args.resume)
+            manager.close(ws.id)
             sys.exit(1)
         # AFTER the successful resume (mirroring the restore fn's order),
         # so the registration keys on the adopted ``target_id`` — the id
@@ -6604,8 +6651,8 @@ def main() -> None:
         ws.session.set_watch_runner(_watch_runner, wake_fn=_watch_fire_wake_fn(ws))
         log.info("Resumed workstream %s (%d messages)", target_id, len(ws.session.messages))
 
-    # Record detected model and judge status in metrics
-    _metrics.model = model
+    # Record the default model and judge status in metrics
+    _metrics.model = default_model_id
     _metrics.set_judge_enabled(judge_config.enabled if judge_config else False)
 
     # Auth config
@@ -6658,18 +6705,8 @@ def main() -> None:
     # Wire app ref so health callbacks can access app.state for metrics
     _app_ref[0] = app
 
-    # Store CLI model args for hot-reload (internal_model_reload reads these)
-    app.state.cli_model_args = {
-        "base_url": base_url,
-        "api_key": api_key,
-        "model": model,
-        "context_window": context_window,
-        "provider": provider_name,
-        "_user_specified_model": bool(effective_model),
-    }
-
     log.info("Server starting on http://%s:%s", args.host, args.port)
-    log.info("Model: %s", model)
+    log.info("Default model: %s", registry.default or "(none configured)")
     if registry.count > 1:
         others = [a for a in registry.list_aliases() if a != registry.default]
         log.info("Models: %s (default), %s", registry.default, ", ".join(others))

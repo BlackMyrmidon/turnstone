@@ -920,27 +920,49 @@ stale lanes, and close its transport after active calls drain; cap-only reloads
 resize the stable alias admission gate without discarding the pool. Calibration
 remains an isolated one-shot client and always closes it after the probe.
 
-**OpenAIProvider** (`_openai.py`): passes messages through unchanged (they are
-already in OpenAI format), including multi-part content blocks (text + images)
-in tool results. Model capability lookup covers GPT-5 through GPT-5.6,
-O-series, and search models (`gpt-5-search-api`) — all with `supports_vision`.
-For search models, injects `web_search_options` and removes the `web_search`
-function tool (the model always searches). Citations from `url_citation`
-annotations are formatted as footnotes. Pre-5.6 GPT-5 models request extended
-prompt-cache retention (`prompt_cache_retention: "24h"`); GPT-5.6 uses
-`prompt_cache_options.ttl: "30m"`. Cache reads and writes are extracted from
-`cached_tokens` and `cache_write_tokens`. Unknown models get permissive
-defaults with `supports_vision=False` and use SearxNG for web search. The
-`openai-compatible` lane never consults this table at all — on either API
-surface (the responses pin is served by a compat-mode
-`OpenAIResponsesProvider`, mirroring `AnthropicProvider(compat=True)`): a
-local server serves whatever the operator named it (vLLM
-`--served-model-name` is a free string), so a prefix collision with a cloud
-model id must not inherit that model's sampling/effort contract — every
-local model gets the plain defaults, commercial prompt-cache controls are not
-injected by model-name prefix, and anything beyond those defaults is declared
-on the model definition (capabilities JSON + `server_compat`), matching the
-`anthropic-compatible` lane.
+**OpenAIResponsesProvider** (`_openai_responses.py`): the commercial `openai` lane always uses
+`/v1/responses`, translating the neutral message projection into Responses input items. The
+capability table covers GPT-5.4, GPT-5.5, GPT-5.6, GPT-6 Astra, search models, and audio roles.
+Captured reasoning items can be replayed when the operator enables reasoning replay. Native
+search replaces a visible client `web_search` tool on search-capable models; citations from
+`url_citation` annotations are formatted as footnotes. Pre-5.6 GPT-5 models request extended
+prompt-cache retention (`prompt_cache_retention: "24h"`); GPT-5.6 and Astra use
+`prompt_cache_options.ttl: "30m"`. Cache reads and writes are extracted from `cached_tokens` and
+`cache_write_tokens`. Unknown models get generic defaults with `supports_vision=False` and use
+client-side web search.
+
+Responses replay preserves native assistant message boundaries, `commentary` / `final_answer`
+phases, and their order among tool calls. Phase preservation does not depend on reasoning replay;
+when reasoning replay is enabled, those items retain their native positions too. The provider
+matches stored message text and call IDs against the lowered canonical history before restoring
+that layout; repaired call arguments come from canonical fields. Generated citation footers remain
+attached once to the last message. If edits make the layout ambiguous, replay uses current text
+without guessing a phase. Explicitly foreign producer metadata is excluded; legacy untagged blocks
+remain readable. See the [Responses input schema][responses-input-schema].
+
+[responses-input-schema]: https://developers.openai.com/api/reference/python/resources/responses/methods/create
+
+GPT-6 Astra (`gpt-6-astra`) has a 1,050,000-token context window, 128,000-token output limit, and
+reasoning levels `low`, `medium`, `high`, `xhigh`, and `max`. Temperature is always omitted.
+An unset effort leaves the server default in charge; the shared effort policy omits unsupported
+`none` and snaps `minimal` to `low`. Vision, native PDF input, tool search, reasoning replay,
+verbosity, and pro mode use the existing Responses paths. Astra also enables
+`supports_mid_conversation_system`: leading system/developer messages become `instructions`, while
+later messages keep their role and position in `input`. The canonical Turn IR is unchanged. Async
+tool execution, WebSocket steering, and `configuration_update` reasoning changes are not enabled.
+See the [OpenAI model guide](https://developers.openai.com/api/docs/guides/latest-model) and
+[model card](https://developers.openai.com/api/docs/models/gpt-6-astra).
+
+The `openai-compatible` lane never consults the commercial table on either API surface. Chat
+Completions uses `OpenAIChatCompletionsProvider`; the Responses pin uses
+`OpenAIResponsesProvider(compat=True)`. A local server serves whatever the operator named it, so a
+prefix collision with a cloud model ID must not inherit its sampling/effort contract. Every local
+model gets plain defaults, commercial prompt-cache controls are not injected by model-name prefix,
+and additional capabilities come from the model definition (`capabilities` JSON + `server_compat`),
+matching the `anthropic-compatible` lane.
+Native mid-conversation system messages remain disabled by default for compatible servers: a
+server's chat template may require system messages at the beginning even when it exposes the
+Responses API. These lanes keep using the existing folded operator reminders.
 
 **AnthropicProvider** (`_anthropic.py`): converts OpenAI-format messages to
 Anthropic content blocks, maps `system`/`developer` roles to the `system`
@@ -1109,7 +1131,7 @@ Three reasoning paths are recognised:
 | Path | Provider | Capture | Persist | Replay |
 |------|----------|---------|---------|--------|
 | 1 | Anthropic Messages API | `thinking_delta` | `provider_blocks` (`type="thinking"`) | Verbatim via `_provider_content` |
-| 2 | OpenAI Responses (gpt-5*, o-series) | `response.reasoning_text.delta` events | `provider_blocks` (`type="reasoning"`) — only when `include=["reasoning.encrypted_content"]` | `ResponseReasoningItemParam` input items |
+| 2 | OpenAI Responses (GPT-5+, o-series) | `response.reasoning_text.delta` events | `provider_blocks` (`type="reasoning"`) — only when `include=["reasoning.encrypted_content"]` | `ResponseReasoningItemParam` input items |
 | 3 | OpenAI Chat Completions (vLLM, llama.cpp, Gemini-compat) | `delta.reasoning_content` Pydantic extras | Synthetic `{type: "reasoning_text", text, source}` block stamped at end-of-stream | None — no API surface for replay on Chat Completions |
 
 Cross-provider safety is enforced by `ANTHROPIC_VALID_BLOCK_TYPES` (a
@@ -1173,11 +1195,11 @@ provider = "anthropic-compatible"
 base_url = "http://localhost:8000"   # no /v1 — the SDK appends /v1/messages
 api_key = "dummy"
 model = "deepseek-ai/DeepSeek-V4-Flash"
+context_window = 131072              # or 0 to ask the server at startup
 
 [models.vllm-claude.capabilities]
 supports_vision = true                    # multimodal checkpoints only
 supports_mid_conversation_system = true   # template-dependent
-context_window = 131072
 thinking_mode = "manual"                  # session effort knob drives the template toggle
 thinking_param = "enable_thinking"        # Qwen/Gemma key; "thinking" for Granite/DeepSeek
 ```
@@ -1301,8 +1323,14 @@ rows are never modified).
 
 **Lifecycle:**
 1. `load_model_registry()` loads DB model definitions (if storage available),
-   then overlays `[models.*]` from config.toml, then builds a `"default"` entry
-   from CLI `--base-url`/`--model`/`--api-key` args
+   then overlays `[models.*]` from config.toml. The CLI additionally builds a
+   `"default"` entry from its `--base-url`/`--model`/`--api-key` args when
+   nothing else defines a model; the server has no bootstrap endpoint. A
+   definition whose `context_window` is `0` is auto-detected per definition:
+   from the provider's capability table, or by asking the definition's own
+   endpoint (vLLM `max_model_len`, llama.cpp `n_ctx_train`, a gateway's
+   `context_length`), with `32768` and
+   a startup warning as the last resort
 2. The registry is passed to the session factory closure in both `cli.py` and
    `server.py`; each workstream resolves its model on creation
 3. `ModelRegistry.get_client()` lazily creates SDK client instances via
@@ -1324,20 +1352,136 @@ which can override the model before workstream creation.
 
 ### Tool Output Truncation
 
-Tool execution results (bash, read_file, search) are truncated by
-`_truncate_output()` when they exceed `tool_truncation` characters. Truncation
-preserves the first half and last half of the output, with a message in
-between:
+`turnstone.core.truncation` provides the policy-free truncation primitive used
+across tool results, judge projections, compaction blocks, task-agent/recall
+clips, skill guidance, web extraction/search snippets, reasoning display, and
+watch output. It returns both the bounded text and explicit source-coverage
+metadata (`original_chars`, `retained_chars`, `omitted_chars`); callers never
+infer loss by comparing rendered string lengths. Every positive cap includes
+the omission marker itself, and even a one-character cap emits an ellipsis
+instead of failing open through a `[-0:]` tail slice.
+
+The main tool-result path uses a head-and-tail projection bounded by
+`tool_truncation`:
 
 ```
 ... [N chars truncated — output exceeded LIMIT char limit] ...
 ```
 
-The default limit is 50% of the context window in characters (computed as
-`context_window * chars_per_token * 0.5`). For a 131K context window this is
-~262K characters. Override with `--tool-truncation <chars>`.
+When the limit could have held the output but its producer retained less than
+the whole, the marker says `M of O chars retained` instead of blaming a limit
+that was never exceeded.
 
-This truncation message is visible to the model, so it knows output was cut.
+In automatic mode every tool result uses at most 20% of the result batch's
+remaining model-input allowance: a batch of results must leave room for its
+siblings and for the model's own turn, and a result also travels the event
+stream as one server-sent event whose consumers bound event size. A tool whose
+formatter owns a degradation ladder (`search`, `inspect_workstream`) is handed
+an estimate of that cap up front, so the ladder degrades to a tier the fold
+admits whole instead of the fold head/tail-clipping what the formatter kept on
+purpose. The estimate is made before siblings in the batch and a mid-turn
+compaction can move the cap, so it sizes what an executor produces and never
+replaces the fold's own decision; inside a task agent it is the agent's own
+clip, and an estimate too small to carry a counted marker predicts compaction,
+so a ladder keeps its own budget there. A `bash_output` read is bounded the
+same way: it returns whole lines up to the estimate and leaves the rest unread
+for the next call, so a delta the fold has to cut, consuming its elided middle,
+is the exception rather than the rule, and an exhausted estimate reads at most
+one line. A filtered read scans a bounded span of the delta, at most eight
+times what it can return, so each call is bounded and still advances the
+cursor. A `bash_output` result the fold must admit at an exhausted allowance
+takes the guaranteed floor rather than the drop notice, because its delta was
+consumed in producing it and could never be re-read. When a `bash_output`
+delta is cut nonetheless, by the fold or by a task agent's clip, its marker
+also says that the consumed output cannot be re-read, unless the cap is too
+tight to carry both the notice and some source text. The allowance is measured
+after the existing prompt, response reserve, and safety margin; parallel
+siblings share one snapshot, then the running aggregate budget is debited after
+each result. An allowance too small to carry a counted marker (128 characters)
+takes the zero-budget doors instead of rendering a bare fragment that reads as
+complete: small results pass verbatim through the per-batch grace pool and the
+rest get the drop notice. A positive
+`--tool-truncation <chars>` override replaces the percentage default with one
+fixed cap, while the running remaining-context budget remains authoritative.
+Every automatic cap is also bounded by the session ceiling of 20% of the
+context window, and every cap, automatic or manual, by the `tools.truncation`
+maximum (16 Mi characters).
+
+The fold is the only place a main-session result is cut. Executors hand it
+their complete result, so the marker's omitted count is the producer's real
+size rather than the size of an earlier projection. The provisional copy an
+executor passes to `on_tool_result` is capped separately for display and never
+becomes model context.
+
+Executor streaming and `on_tool_result` are provisional display channels, not
+model context. The result fold applies context sizing and output guarding once,
+then uses one final scalar for the in-memory TOOL turn, the accepted live event,
+and the durable TOOL `content` column. Resume reconstructs that stored scalar
+without re-truncating it, so a model never receives a longer live bash result
+and a shorter impersonation of the same result after rehydration. A later
+compaction may replace the whole turn with an explicitly labeled summary; that
+is a different evidence transformation, not replay of the TOOL row.
+
+Streaming producers do not allocate their complete output before applying this
+policy. Foreground `bash` and `diff_file` retain half the session cap at each
+edge, and never less than a task agent's guard window, in a bounded
+prefix/suffix buffer, so the fold still cuts once at every size while a capture
+never holds more than a fold on that session could show: below the retention
+the executor hands over the
+complete output, and above it the retained edges together with the true
+character count, from which the fold renders once, so its marker reports
+omission against the real output rather than against an earlier rendering. The
+shell drains read both pipes in 64K-character chunks. Foreground bash captures
+stdout and stderr separately and presents stdout followed by the stderr lines,
+each prefixed once with `[stderr]`, joining the two captures as edges rather
+than as rendered text; one arrival-ordered capture would let a stderr record
+land inside an unfinished stdout line. A background shell bounds each logical
+line at half its buffer with a single-line marker, so a record stays one line
+for the cursor, the filter, and the `[stderr]` prefix and survives the lines
+that follow it; the fold's marker then counts against that bounded record. The
+truncation marker is visible to the
+model, so omitted content cannot impersonate complete evidence.
+
+Two more rules keep the cap honest end to end. Secret redaction can lengthen a
+cut result past its cap, so such a result is cut again at the drain's limit
+before folding: the guarded rendering is split at the drain's marker and its
+two edges re-render as edges, so the second cut never runs into the first
+marker, and the omitted count still includes the middle the drain removed. A
+result the guard left alone, one the drain admitted whole, or one whose text no
+longer locates the marker exactly once passes as the guard left it: what the
+guard produced is what the model sees, and the pre-send hard-compaction guard
+remains the backstop for a batch that grew past its allowance. The drain keeps
+only its renderings across the guard, so an executor's complete result is
+released once rendered rather than held across the guard's judge round trips.
+The output guard scans a bounded window of a task-agent child result that
+reaches past the child's clip, so a credential straddling the clip boundary is
+seen whole and redacted while a tool server never controls how much text the
+guard scans; a capture's window is rendered from its source in the head mode
+the clip uses, so the guard scans exactly the text the agent will receive. The
+window is itself clipped
+with the result's true size before the guard runs, so a redaction that shrinks
+it below the clip still leaves the result marked as cut, and the recall
+projection of the step carries that same size. Provider tool names are
+normalized before any of these policies are looked up.
+
+#### Surface-specific policies
+
+The renderer is shared where the operation is syntactic; the selection policy
+is not forced into one shape where doing so would discard semantics:
+
+| Surface | Policy | Why |
+|---|---|---|
+| tool results, including `bash`, `bash_output`, and `diff_file` | shared exact-cap head + tail; 20% of the batch's remaining input allowance in automatic mode | preserves setup and terminal disposition without letting one result crowd out its siblings or the model's turn; a result also rides the event stream as one bounded server-sent event |
+| task-agent/recall clips, skill guidance, watch/reasoning display | shared exact-cap head; a task agent's cut `bash_output` delta carries the consumed notice | these consumers operate on an ordered prefix and need an honest cutoff; watch polls compare by their head at the cap, so consecutive polls with the same head compare equal whatever the marker says |
+| judge argument fields | head of the budget plus a counted note that is extra to the budget | one budget is divided across many fields, so budgets smaller than the note are routine, and a field shown empty would read to the judge as an edit that replaces nothing |
+| compaction blocks | shared exact-cap 2/3 head + 1/3 tail | preserves more opening context while retaining the conclusion |
+| `search`, `inspect_workstream` | bespoke degradation ladder sized to the fold's cap, then the fold's cut as a backstop | generic head/tail would silently drop middle files or middle messages the formatter deliberately kept |
+| `web_search` snippets and `web_fetch` text | shared exact-cap head within surface-specific result/document budgets | search snippets and top-heavy pages are ordered prefixes; the web document share still scales with the pinned lane |
+| PDF extraction | context/capability document budget plus byte/page/worker limits; the isolated worker reports the true size and hands over its bounded prefix, and the parent renders the marker with the shared primitive (a zero allowance still returns the marker as a receipt of what was dropped) | the worker runs under `-E -P` with a deliberately minimal import path, so rendering in the parent keeps one copy of the primitive instead of a worker-side twin |
+| provider/transport streams | protocol token/byte/timeout limits | byte and token boundaries cannot be represented honestly as a character-slice policy |
+
+Thus “standardized truncation” means one exact-cap rendering and metadata
+contract, not one content-selection algorithm for unrelated evidence types.
 
 During the send loop the limit is additionally capped by the remaining
 context budget, and three guarantees apply when that budget reaches zero
@@ -1346,7 +1490,9 @@ context budget, and three guarantees apply when that budget reaches zero
 - **Structural floor** — orchestration handles (`spawn_workstream`,
   `spawn_batch`, `wait_for_workstream`, `tasks`) and error results are
   always admitted up to a guaranteed floor (2048 chars, head+tail beyond
-  it), because a lost `ws_id` or a masked failure wedges the session.
+  it), because a lost `ws_id` or a masked failure wedges the session; at
+  an exhausted allowance a `bash_output` delta takes the same floor because
+  it was consumed in producing it and could never be re-read.
 - **Small-result pass** — results at or under the floor pass verbatim,
   funded from a bounded per-batch grace pool (2× the floor) so a wide
   batch of small results cannot collectively bypass budget accounting;
@@ -1532,8 +1678,21 @@ and size its server pool for expected concurrent fork traffic.
 `ws_id` is the persistent conversation/lifecycle identity. There is no
 separate `session_id`: `workstreams` holds lifecycle, owner, kind, hierarchy,
 project, and display metadata, while `conversations` stores the append-only
-trajectory. `node_id` is an owning-service hint; rendezvous/service liveness,
-not that historical field alone, determines cluster routing and orphan safety.
+trajectory. `node_id` records creation origin and remains a maintenance hint.
+The nullable `required_node_id` column independently records execution
+eligibility. Console routing checks that requirement before cached placement
+overrides or rendezvous; manager create/open and core resume enforce it at the
+executor. The requirement survives residency changes and close. Ordinary
+operations cannot alter it in place; an explicitly targeted fork creates a new
+identity with its own requirement. Legacy rows remain unbound.
+
+Affinity does not establish exclusive live ownership. A future same-ID
+migration still needs a fenced ownership handoff; neither a registry heartbeat
+nor an affinity check supplies that lease. The router reads requirements from
+storage on every resolution, so future authorized changes need no permanent
+policy-cache invalidation. A handoff must report temporary unavailability to
+channel recovery, rather than a clean absent-workstream result that starts a
+new fork.
 
 `ChatSession.messages` is `list[Turn]`. Persistence serializes the neutral
 fields, opaque provider-native lane, attachment references, SSE cursor, and
@@ -1611,6 +1770,19 @@ runs, grace-gated).
 
 Every model call streams (#831); retry lives at two stacked layers:
 
+- **Empty completed responses** — interactive and coordinator conversations
+  share the mid-stream retry budget (at most 2 re-issues) for an ordinary
+  `stop` with no answer or tool call, including reasoning-only output.
+  Each re-issue resends the full context and can repeat its latency and cost;
+  the shared limit bounds attempts, not elapsed time.
+  Automatic recovery requires the prepared request to have no server-side
+  tools; otherwise the conversation enters error immediately. Each completed
+  attempt reports usage, including a same-generation Stop after completion.
+  Rejected usage also updates the existing token-budget checks; exhaustion
+  stops recovery and requires approval on the next send. Discarded reasoning
+  stays out of saved history, and retry exhaustion enters error instead of
+  silently becoming idle. Refusals, output limits, native activity, and
+  continuation signals are excluded.
 - **Caller ladders** — `ChatSession._model_turn_with_retry()` (chat
   loop, one ladder per lane) and the agent `_api_call()` (drained via
   `model_turn`) use the same pattern: 4 total attempts (1 initial + 3 retries,
@@ -1644,7 +1816,11 @@ Every model call streams (#831); retry lives at two stacked layers:
   Any partial tool calls are discarded (their JSON would be malformed),
   causing the `send()` loop to exit cleanly.
 - **`"content_filter"`**: warns via `ui.on_error()` that the response was
-  blocked.
+  blocked. Both intent and output-guard judges reject filtered or truncated
+  responses before parsing a verdict, so JSON quoted in refusal text cannot
+  become an approval. Non-empty Chat refusal text converts an ordinary `stop`
+  to this finish reason. An empty nullable Chat refusal field alone does not;
+  explicit filter finishes and Responses refusal events retain their meaning.
 
 Agent sub-sessions (`_run_agent()`) check `finish_reason` on each
 drained turn and stop the agent early on `"length"` or

@@ -28,6 +28,7 @@ import {
   resetCompactionHolder,
   buildSystemNudgeMarker,
   buildConvBatchShell,
+  buildConvBatchDisclosure,
   buildConvRow,
   buildConvCmd,
   buildConvVerdict,
@@ -38,9 +39,22 @@ import {
   formatAgentContextTokens,
   agentContextIsWarning,
   buildPreviewChip,
+  clearConvVerdictPending,
+  convBatchSummaryText,
+  isConvVerdictCompactBlocker,
+  markConvRowResultSettled,
+  createReasoningActivity,
+  setConvBatchExpanded,
+  setToolOutputReviewState,
   batchKicker,
   indexLabel,
 } from "./conversation.js";
+import {
+  canAutoFoldTranscriptBatch,
+  getTranscriptPresentation,
+  preserveTranscriptBottomPin,
+  registerTranscriptScroller,
+} from "./transcript_presentation.js";
 import { redactCredentials, tryPrettyJson } from "./redact_credentials.js";
 import { tryParseMcpError, buildMcpErrorEmbed } from "./mcp_error.js";
 import { authFetch } from "./auth.js";
@@ -62,6 +76,7 @@ import {
   viewerUserId,
 } from "./composer_queue.js";
 import { StatusBar } from "./status_bar.js";
+import { mountConversationScroll } from "./conversation_scroll.js";
 import { streamingRender, streamingRenderFinalize } from "./renderer.js";
 import {
   buildMsgCopyButton,
@@ -232,7 +247,6 @@ class Pane {
     // Provenance of the current busy=true (see setBusy): "server" |
     // "optimistic" | null when idle.
     this.busySource = null;
-    this.isThinking = false;
     // Acting user (turn initiator) of the in-flight turn, from state_change
     // events; drives the shared-workstream cross-user send gate. Carries the
     // owner id even single-user (the gate just no-ops — it equals this viewer);
@@ -300,7 +314,7 @@ class Pane {
       },
       placePrompt: (prompt) => {
         this.messagesEl.appendChild(prompt);
-        this.scrollToBottom(true);
+        this.scrollToBottom();
       },
     });
     // Monotonic STREAM-generation counter (#900), bumped only in
@@ -377,13 +391,9 @@ class Pane {
     // block.
     this._staleRetryTimer = null;
     // Hot-path caches — all invalidated by _clearAgentTracking/replayHistory.
-    // _nearBottom mirrors the scroller position via a passive scroll listener
-    // (no per-token geometry reads); the two Maps make per-event row/stream
-    // lookups O(1) instead of whole-transcript attribute-selector scans.
-    this._nearBottom = true;
-    this._scrollPinPending = false;
-    this._scrollPinForce = false;
-    this._thinkingEl = null;
+    // The Maps make per-event row/stream lookups O(1) instead of
+    // whole-transcript attribute-selector scans.
+    this._reasoningActivity = createReasoningActivity();
     // Compaction lifecycle holder for the shared reducer
     // (conversation.applyCompactionEvent); `card` is the in-progress card
     // between start and end, nulled wherever the transcript DOM is wiped.
@@ -412,7 +422,6 @@ class Pane {
     // compaction progress. Parallel task agents compact independently, so one
     // foreground holder cannot represent them.
     this._agentCompactions = new Map();
-    this._resizeObs = null;
     // Set when replay_truncated arrives mid-stream (refetching then would
     // detach the live bubble); consumed on the next idle edge.  Cleared by
     // _loadHistoryThenConnect at load start AND by replayHistory's
@@ -506,6 +515,7 @@ class Pane {
 
   reset() {
     this.currentAssistantEl = null;
+    this._reasoningActivity.finish();
     this.currentReasoningEl = null;
     this.contentBuffer = "";
     this.setBusy(false);
@@ -585,6 +595,7 @@ class Pane {
   // timer cleanup wired via the queue's onIdle hook).
   setBusy(b, source) {
     const next = !!b;
+    if (!next) this._reasoningActivity.finish();
     // Who asserted busy: "server" (default — state events, thinking_start,
     // every existing/future writer) or "optimistic" (ONLY the send flow's
     // pre-POST flip). The deferred/queue_full settle arms may clear busy
@@ -673,23 +684,9 @@ class Pane {
   }
 
   addThinkingIndicator() {
-    // Instance ref, not a container query: removeThinkingIndicator runs on
-    // EVERY content/reasoning delta, and a class-selector miss walks the
-    // whole transcript subtree — O(N) per streamed token at 5000 messages.
     if (this._compaction.card) return; // the compaction card owns the affordance
-    if (this._thinkingEl) return;
-    const el = document.createElement("div");
-    el.className = "thinking-indicator";
-    el.textContent = "Thinking";
-    this._thinkingEl = el;
-    this.messagesEl.appendChild(el);
+    this._reasoningActivity.start(this.messagesEl);
     this.scrollToBottom();
-  }
-
-  removeThinkingIndicator() {
-    if (!this._thinkingEl) return;
-    this._thinkingEl.remove();
-    this._thinkingEl = null;
   }
 
   addSystemNudgeMarker() {
@@ -717,19 +714,19 @@ class Pane {
     if (source === "compaction") {
       const card = buildCompactionCard(meta, content || "");
       this.messagesEl.appendChild(card);
-      this.scrollToBottom(true);
+      this.scrollToBottom();
       return card;
     }
     if (source === "watch_triggered" && meta && typeof meta === "object") {
       const card = buildWatchResultCard(meta, content || "");
       this.messagesEl.appendChild(card);
-      this.scrollToBottom(true);
+      this.scrollToBottom();
       return card;
     }
     if (source === "output_guard" && meta && typeof meta === "object") {
       const card = _buildGuardFindingBubble(meta);
       this.messagesEl.appendChild(card);
-      this.scrollToBottom(true);
+      this.scrollToBottom();
       return card;
     }
     // user_interjection renders as a "queued message" bubble showing the user's
@@ -758,7 +755,7 @@ class Pane {
     body.appendChild(textEl);
     el.appendChild(body);
     this.messagesEl.appendChild(el);
-    this.scrollToBottom(true);
+    this.scrollToBottom();
     return el;
   }
 
@@ -778,8 +775,10 @@ class Pane {
       container: this.messagesEl,
       renderedIds: this._renderedSystemEventIds,
       onNotice: (msg) => this.addInfoMessage(msg),
-      scroll: (force) => this.scrollToBottom(force),
+      scroll: () => this.scrollToBottom(),
     });
+    // Manual compaction's busy state can start reasoning before this card.
+    if (this._compaction.card) this._reasoningActivity.finish();
   }
 
   addCommandEcho(text) {
@@ -853,7 +852,7 @@ class Pane {
     }
     this._addUserMsgActions(el, text);
     this.messagesEl.appendChild(el);
-    this.scrollToBottom(true);
+    this.scrollToBottom();
     // Returned so the send flow can retro-convert the optimistic bubble
     // into a queued chip when the server answers queued+deferred.
     return el;
@@ -907,11 +906,44 @@ class Pane {
     this.approvalBlockEl = active ? active.blockEls[0] : null;
     this.inputEl.disabled = this.pendingApproval;
     this._reconcileSendDisabled();
+    StatusBar.paintApprovalChip(
+      { approvalEl: this._sbApproval, focusFallbackEl: this.inputEl },
+      this.approvalCycles.size,
+    );
   }
 
   _oldestCycleId() {
     const first = this.approvalCycles.keys().next();
     return first.done ? null : first.value;
+  }
+
+  // Status-bar chip click: bring the card the keyboard shortcuts act on
+  // (the OLDEST live cycle — see the keydown handler) into view and hand
+  // focus to its feedback field, exactly as a freshly painted first cycle
+  // does.  The card may have scrolled far away or, for a task-agent
+  // sub-batch, sit inside an agent card the user re-collapsed after the
+  // approve paint forced it open — unfold both layers first, otherwise
+  // scrollIntoView on a display:none row is a no-op.
+  revealPendingApproval() {
+    const id = this._oldestCycleId();
+    const entry = id ? this.approvalCycles.get(id) : null;
+    const block = entry
+      ? entry.blockEls.find((el) => el && el.isConnected)
+      : null;
+    if (!block) return;
+    const agentCard = block.closest(".conv-agent");
+    if (agentCard) {
+      agentCard.dataset.collapsed = "false";
+      const toggle = agentCard.querySelector(".conv-agent-toggle");
+      if (toggle) toggle.setAttribute("aria-expanded", "true");
+    }
+    const batch = block.closest(".conv-batch");
+    if (batch) setConvBatchExpanded(batch, true, { blocker: true });
+    StatusBar.scrollToApprovalTarget(block);
+    const fb = block.querySelector(".conv-feedback");
+    // preventScroll: the smooth scroll above owns the viewport; a focus
+    // jump would cut it short and land the card at the viewport edge.
+    if (fb) fb.focus({ preventScroll: true });
   }
 
   _registerApprovalCycle(cycleId, blockEls, items) {
@@ -939,10 +971,6 @@ class Pane {
     if (!chunk) return;
     const stripped = stripAnsi(chunk);
     if (!stripped) return;
-    // Capture pin before the chunk grows the stream block — see
-    // announceToolBlock.
-    const stick = this.isNearBottom();
-
     let el = this._streamEl(callId);
     if (!el) {
       let target = this._toolRow(callId);
@@ -987,13 +1015,17 @@ class Pane {
         el.scrollTop = el.scrollHeight;
       });
     }
-    this.scrollToBottom(stick);
+    this.scrollToBottom();
   }
 
   showOutputWarning(evt) {
     if (!evt.call_id || evt.risk_level === "none") return;
     const toolDiv = this._toolRow(evt.call_id);
     if (!toolDiv) return;
+    const warningBatch = toolDiv.closest(".conv-batch");
+    if (warningBatch) {
+      setConvBatchExpanded(warningBatch, true, { blocker: true });
+    }
     // Shared DOM-builder with replayHistory \u2014 single source of truth for
     // role / class / escape semantics.  Argument shape mirrors the
     // server-side output_assessment dict AND the replay payload built by
@@ -1029,33 +1061,36 @@ class Pane {
     // path keeps working.
     const vRow = this._toolRow(verdict.call_id);
     const vScope = (vRow && vRow.closest(".conv-batch")) || this.messagesEl;
-    const badge = vScope.querySelector(
-      '.conv-verdict[data-call-id="' + escapedId + '"]',
-    );
-    if (!badge) {
-      // Badge no longer in DOM (tool block replaced by output) — toast the
-      // late-arriving verdict so the user still sees it.
-      const conf = Math.round((verdict.confidence || 0) * 100);
-      const rec = verdict.recommendation || "review";
-      const func = verdict.func_name || "";
-      showToast(
-        "Judge verdict for " + func + ": " + rec + " (" + conf + "%)",
-        rec === "approve" ? "success" : rec === "deny" ? "error" : "warning",
+    const verdictBatch = vRow ? vRow.closest(".conv-batch") : null;
+    preserveTranscriptBottomPin(this.messagesEl, () => {
+      if (verdictBatch && isConvVerdictCompactBlocker(verdict)) {
+        setConvBatchExpanded(verdictBatch, true, { blocker: true });
+      }
+      const badge = vScope.querySelector(
+        '.conv-verdict[data-call-id="' + escapedId + '"]',
       );
-      return;
-    }
-    // Replace the badge (+ its detail sibling) with a freshly-built one so the
-    // landed LLM verdict, its risk stripe, and the detail all refresh at once.
-    const detail = badge.nextElementSibling;
-    if (detail && detail.classList.contains("conv-verdict-detail")) {
-      detail.remove();
-    }
-    badge.replaceWith(buildConvVerdict(verdict, { judgePending: false }));
+      if (!badge) {
+        // Badge no longer in DOM (tool block replaced by output) — toast the
+        // late-arriving verdict so the user still sees it.
+        const conf = Math.round((verdict.confidence || 0) * 100);
+        const rec = verdict.recommendation || "review";
+        const func = verdict.func_name || "";
+        showToast(
+          "Judge verdict for " + func + ": " + rec + " (" + conf + "%)",
+          rec === "approve" ? "success" : rec === "deny" ? "error" : "warning",
+        );
+        return;
+      }
+      // Replace the badge (+ its detail sibling) with a freshly-built one so the
+      // landed LLM verdict, its risk stripe, and the detail all refresh at once.
+      const detail = badge.nextElementSibling;
+      if (detail && detail.classList.contains("conv-verdict-detail")) {
+        detail.remove();
+      }
+      badge.replaceWith(buildConvVerdict(verdict, { judgePending: false }));
 
-    this.updateVerdictGlow(
-      verdict.recommendation,
-      vRow ? vRow.closest(".conv-batch") : null,
-    );
+      this.updateVerdictGlow(verdict.recommendation, verdictBatch);
+    });
   }
 
   updateVerdictGlow(recommendation, batchEl) {
@@ -1149,40 +1184,12 @@ class Pane {
   }
 
   isNearBottom() {
-    // Cached from the passive scroll listener (_createDOM) instead of read
-    // from geometry: the old scrollHeight/scrollTop/clientHeight triplet
-    // forced a synchronous layout of the whole transcript, and this runs on
-    // every streamed token and every tool chunk.  Content growth without a
-    // scroll leaves the cache untouched — which is the DESIRED semantics:
-    // "pinned" is a statement about where the user last scrolled to, not
-    // about the current pixel distance (the old post-append measurement is
-    // exactly what used to silently disengage auto-follow at tool time).
-    return this._nearBottom;
+    return this._scrollFollow.isFollowing();
   }
 
   scrollToBottom(force) {
-    if (force) this._scrollPinForce = true;
-    else if (!this._nearBottom) return;
-    // rAF-coalesced pin: at most one scrollHeight read + scrollTop write per
-    // frame no matter how many deltas arrived.  The pin re-checks
-    // _nearBottom AT FIRE TIME: a user wheel-scroll can land between the
-    // schedule (when the cached flag was still true) and the rAF — pinning
-    // anyway would yank them back to the bottom, and the programmatic
-    // scroll's own event would re-mark the flag true, trapping them there
-    // for the rest of the stream.  Scroll events fire before rAF callbacks
-    // within a frame, so the re-check sees the user's disengage.  Force
-    // requests latch across the coalescing window (a forced pin must win
-    // even if a non-forced schedule got there first).
-    if (this._scrollPinPending) return;
-    this._scrollPinPending = true;
-    requestAnimationFrame(() => {
-      this._scrollPinPending = false;
-      const forced = this._scrollPinForce;
-      this._scrollPinForce = false;
-      if (forced || this._nearBottom) {
-        this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
-      }
-    });
+    if (force) this._scrollFollow.jumpToLatest();
+    else this._scrollFollow.schedule();
   }
 
   _createDOM() {
@@ -1200,6 +1207,10 @@ class Pane {
     // keys type; elsewhere y|Enter approve, n|Esc deny, a = approve-all.
     this.el.addEventListener("keydown", (e) => {
       if (!this.pendingApproval || !this.approvalBlockEl) return;
+      // The status-bar chip is a button inside this.el: Enter on it must
+      // reach its own click (reveal), never the approve arm below — and
+      // preventDefault here would swallow that click outright.
+      if (e.target === this._sbApproval) return;
       // Keyboard acts on the OLDEST live cycle (the one approvalBlockEl
       // tracks); sibling cards from parallel task agents resolve by
       // their own buttons or become oldest in turn.  When the feedback
@@ -1309,36 +1320,15 @@ class Pane {
     this.messagesEl.setAttribute("role", "log");
     this.messagesEl.setAttribute("aria-live", "polite");
     this.messagesEl.setAttribute("aria-label", "Chat messages");
-    // Track "pinned to bottom" from actual scrolls (user or programmatic)
-    // instead of reading scroller geometry per event — see isNearBottom().
-    // Passive: never blocks the compositor thread.
-    this.messagesEl.addEventListener(
-      "scroll",
-      () => {
-        this._nearBottom =
-          this.messagesEl.scrollHeight -
-            this.messagesEl.scrollTop -
-            this.messagesEl.clientHeight <
-          80;
-      },
-      { passive: true },
-    );
-    // Layout changes that move the bottom WITHOUT a scroll event (window
-    // resize, split-drag, orientation change) would leave the cached flag
-    // stale — a user visually back at the bottom after growing the pane
-    // stayed disengaged until they nudged the scroller.  Resizes are rare,
-    // so the geometry read here is off the hot path by construction.
-    if (typeof ResizeObserver === "function") {
-      this._resizeObs = new ResizeObserver(() => {
-        this._nearBottom =
-          this.messagesEl.scrollHeight -
-            this.messagesEl.scrollTop -
-            this.messagesEl.clientHeight <
-          80;
-      });
-      this._resizeObs.observe(this.messagesEl);
-    }
     this.el.appendChild(this.messagesEl);
+    this._scrollFollow = mountConversationScroll(this.messagesEl);
+    this._unregisterTranscriptScroller = registerTranscriptScroller(
+      this.messagesEl,
+      {
+        isFollowing: () => this.isNearBottom(),
+        scrollToBottom: () => this.scrollToBottom(),
+      },
+    );
 
     // Per-workstream status bar (above input)
     this.statusBarEl = document.createElement("div");
@@ -1360,9 +1350,21 @@ class Pane {
     this._sbTurns.className = "ws-sb-turns";
     this._sbTurns.textContent = "turn 0";
     this._sbTurns.setAttribute("aria-label", "Conversation turn");
+    // Pending-approval chip: sticky count of the live human gates in this
+    // transcript, painted by _syncApprovalState (the one approval-state
+    // chokepoint) and hidden at zero.  A button, so it tabs and clicks:
+    // the click brings the card the keyboard shortcuts act on into view.
+    this._sbApproval = document.createElement("button");
+    this._sbApproval.type = "button";
+    this._sbApproval.className = "warn-chip ws-sb-approval";
+    this._sbApproval.hidden = true;
+    this._sbApproval.addEventListener("click", () =>
+      this.revealPendingApproval(),
+    );
 
     this.statusBarEl.appendChild(this._sbTokens);
     this.statusBarEl.appendChild(this._sbTools);
+    this.statusBarEl.appendChild(this._sbApproval);
     this.statusBarEl.appendChild(this._sbTurns);
     this.el.appendChild(this.statusBarEl);
 
@@ -1416,6 +1418,7 @@ class Pane {
     });
     this.queue = createQueueController({
       messagesEl: this.messagesEl,
+      scroll: () => this.scrollToBottom(),
       getWsId: () => {
         return this.wsId;
       },
@@ -2310,33 +2313,35 @@ class Pane {
     }
     switch (evt.type) {
       case "thinking_start":
-        this.isThinking = true;
         this.setBusy(true);
         this.removeEmptyState();
         this.addThinkingIndicator();
         break;
 
       case "thinking_stop":
-        this.isThinking = false;
-        this.removeThinkingIndicator();
+        this._reasoningActivity.hideWaiting();
         break;
 
       case "reasoning":
-        this.removeThinkingIndicator();
+        let reasoningBody = null;
         if (!this.currentReasoningEl) {
           this.currentReasoningEl = document.createElement("div");
           this.currentReasoningEl.className = "msg reasoning";
+          reasoningBody = document.createElement("div");
+          reasoningBody.className = "msg-body";
+          this.currentReasoningEl.appendChild(reasoningBody);
           this.messagesEl.appendChild(this.currentReasoningEl);
+        } else {
+          reasoningBody = this.currentReasoningEl.querySelector(".msg-body");
         }
-        this.currentReasoningEl.textContent += evt.text;
+        this._reasoningActivity.attach(this.currentReasoningEl);
+        if (reasoningBody) reasoningBody.textContent += evt.text;
         this.scrollToBottom();
         break;
 
       case "content":
-        this.removeThinkingIndicator();
-        if (this.currentReasoningEl) {
-          this.currentReasoningEl = null;
-        }
+        this._reasoningActivity.finish();
+        this.currentReasoningEl = null;
         if (!this.currentAssistantEl) {
           this._newAssistantBubble();
         }
@@ -2371,6 +2376,7 @@ class Pane {
         const doneBuffer = this.contentBuffer;
         this.currentAssistantBodyEl = null;
         this.currentAssistantEl = null;
+        this._reasoningActivity.finish();
         this.currentReasoningEl = null;
         this.contentBuffer = "";
         // Finalize the completed streaming segment's markdown.  This fires
@@ -2390,7 +2396,7 @@ class Pane {
             doneBodyEl.textContent = doneBuffer;
           }
         }
-        this.scrollToBottom(true);
+        this.scrollToBottom();
         break;
       }
 
@@ -2402,25 +2408,37 @@ class Pane {
         // skip overwrite when the current buffer is already at-or-past
         // the snapshot length, so a stale replay can't reset the live-
         // streamed view back to a shorter prefix.
-        this.removeThinkingIndicator();
+        if (evt.reasoning || evt.content) this._reasoningActivity.hideWaiting();
         if (evt.reasoning) {
+          let snapshotReasoningBody = null;
           if (!this.currentReasoningEl) {
             this.currentReasoningEl = document.createElement("div");
             this.currentReasoningEl.className = "msg reasoning";
+            snapshotReasoningBody = document.createElement("div");
+            snapshotReasoningBody.className = "msg-body";
+            this.currentReasoningEl.appendChild(snapshotReasoningBody);
             this.messagesEl.appendChild(this.currentReasoningEl);
+          } else {
+            snapshotReasoningBody =
+              this.currentReasoningEl.querySelector(".msg-body");
           }
-          const curReason = this.currentReasoningEl.textContent || "";
-          if (curReason.length < evt.reasoning.length) {
-            this.currentReasoningEl.textContent = evt.reasoning;
+          this._reasoningActivity.attach(this.currentReasoningEl);
+          const curReason = snapshotReasoningBody
+            ? snapshotReasoningBody.textContent || ""
+            : "";
+          if (
+            snapshotReasoningBody &&
+            curReason.length < evt.reasoning.length
+          ) {
+            snapshotReasoningBody.textContent = evt.reasoning;
           }
         }
         if (evt.content) {
+          this._reasoningActivity.finish();
           // Content snapshot supersedes any reasoning bubble — matches
           // the "case content" invariant of clearing currentReasoningEl
           // when content begins.
-          if (this.currentReasoningEl) {
-            this.currentReasoningEl = null;
-          }
+          this.currentReasoningEl = null;
           if (!this.currentAssistantEl) {
             this._newAssistantBubble();
           }
@@ -2443,6 +2461,7 @@ class Pane {
           this._actingUserId = evt.acting_user_id;
         }
         if (evt.state === "idle" || evt.state === "error") {
+          this._reasoningActivity.finish();
           this.setBusy(false);
           // A context event received while its call id still resolved to a
           // prior terminal row is retained briefly for a possible successor
@@ -2523,6 +2542,15 @@ class Pane {
           evt.state === "attention"
         ) {
           this.setBusy(true);
+          // A reconnect before the first token has only the current state,
+          // not the earlier thinking_start. Restore its waiting affordance.
+          if (
+            evt.state === "thinking" &&
+            !this.currentAssistantEl &&
+            !this.currentReasoningEl
+          ) {
+            this.addThinkingIndicator();
+          }
         }
         break;
 
@@ -2722,12 +2750,13 @@ class Pane {
         clearTimeout(this._cancelTimeout);
         clearTimeout(this._forceTimeout);
         this.currentAssistantEl = null;
+        this._reasoningActivity.finish();
         this.currentReasoningEl = null;
         this.contentBuffer = "";
         this.stopBtn.disabled = true;
         this.stopBtn.textContent = "Cancelling\u2026";
         this.stopBtn.setAttribute("aria-label", "Cancelling generation");
-        this.scrollToBottom(true);
+        this.scrollToBottom();
         // After 2s, offer "Force Stop" for a harder cancel that abandons
         // the stuck worker thread.  Safety timeout at 10s auto-recovers
         // if state_change never arrives (connection drop).
@@ -2902,6 +2931,7 @@ class Pane {
             const editEl = this.addUserMessage(editText, null, {
               clientSendId: editClientSendId,
             });
+            this.scrollToBottom(true);
             postAndSettleSend(
               this.queue,
               authFetch(
@@ -3656,6 +3686,7 @@ class Pane {
     // preserves the pane, and preserved DOM keeps valid refs.
     this.currentAssistantEl = null;
     this.currentAssistantBodyEl = null;
+    this._reasoningActivity.finish();
     this.currentReasoningEl = null;
     this.contentBuffer = "";
     // In-progress compaction card: the transcript wipe orphaned it; live
@@ -3666,11 +3697,11 @@ class Pane {
     this.approvalCycles = new Map();
     this.announcedBlocks = new Map();
     this._syncApprovalState();
-    this._thinkingEl = null;
     this._retryHolderEl = null;
   }
 
   replayHistory(messages) {
+    const scrollTop = this.messagesEl.scrollTop;
     this.messagesEl.replaceChildren();
     // A full committed-history render repairs any recorded truncation
     // gap — from the resync itself or an unrelated clear_ui rebuild — so
@@ -3977,6 +4008,9 @@ class Pane {
               );
             }
           }
+          if (resultTarget) {
+            setToolOutputReviewState(resultTarget, msg.content);
+          }
           if (msg.tool_call_id && resultTarget) {
             if (msg.effect_status) {
               resultTarget.dataset.effectStatus = String(msg.effect_status);
@@ -3997,6 +4031,11 @@ class Pane {
           if (resultAgentWrap) {
             resultAgentWrap.dataset.state = msg.is_error ? "error" : "done";
             this._syncAgentToggleLabel(resultAgentWrap);
+          }
+          if (resultTarget) {
+            // Replay is already historical: stage a fold even while Default is
+            // selected, but never announce completion from the replay loop.
+            markConvRowResultSettled(resultTarget, { autoFold: true });
           }
         }
         if (msg.event_id != null) {
@@ -4040,6 +4079,7 @@ class Pane {
       }
     }
     this._attachRetryToLastAssistant();
+    this.messagesEl.scrollTop = scrollTop;
     this.scrollToBottom();
     // Focus the input so keyboard users land on the next-action target
     // after replay finishes — but only when this is the focused pane,
@@ -4125,13 +4165,6 @@ class Pane {
   announceToolBlock(items) {
     const list = (items || []).filter(Boolean);
     if (!list.length) return;
-    // Re-pin to the bottom only if we were already there — captured BEFORE the
-    // block grows scrollHeight.  A tool batch is a tall one-shot append; if
-    // isNearBottom() were measured after appendChild (as scrollToBottom does on
-    // its own) the freshly-added height would read >80px from the new bottom,
-    // so auto-follow would silently disengage at exactly tool-call time.  Token
-    // streaming stays pinned without this because each append is sub-threshold.
-    const stick = this.isNearBottom();
     // Key the shell by its call_id set.  A re-announce of the SAME batch
     // replaces its own shell; shells of OTHER batches stay — parallel
     // task agents announce concurrently and must not discard each other.
@@ -4174,7 +4207,7 @@ class Pane {
     this.messagesEl.appendChild(block);
     this._indexToolRows(block);
     this._relinkAgentCards(list);
-    this.scrollToBottom(stick);
+    this.scrollToBottom();
     toolAnnounce(_toolAnnounceText(list));
   }
 
@@ -4201,14 +4234,15 @@ class Pane {
   }
 
   showInlineToolBlock(items, autoApproved, judgePending, cycleId) {
-    // Capture pin before _takeAnnouncedBlock/append change scrollHeight — see
-    // announceToolBlock for why post-append measurement breaks here.
-    const stick = this.isNearBottom();
     // Reuse the early-paint announce shell if it's for this batch (upgrade in
     // place); else build fresh.
     const announced = this._takeAnnouncedBlock(items);
     const block = announced || document.createElement("div");
-    if (announced) announced.replaceChildren();
+    if (announced) {
+      announced.replaceChildren();
+      delete announced.dataset.resultsSettled;
+      delete announced.dataset.compactFolded;
+    }
     block.removeAttribute("aria-busy");
     block.className =
       "conv-batch " +
@@ -4313,7 +4347,7 @@ class Pane {
       }
     }
     this._relinkAgentCards(items);
-    this.scrollToBottom(stick);
+    this.scrollToBottom();
   }
 
   resolveApproval(approved, always, feedback, skipPost, cycleId) {
@@ -4326,16 +4360,18 @@ class Pane {
     if (!entry) return; // already resolved (peer tab / server race) — idempotent
     this.approvalCycles.delete(id);
 
-    // Capture pin before the status badge reflows the block — see
-    // announceToolBlock.
-    const stick = this.isNearBottom();
-
     entry.blockEls.forEach((el) => {
       const actions = el.querySelector(".conv-actions");
       if (actions) actions.remove();
     });
     const statusHost = entry.blockEls[0];
     if (statusHost) {
+      if (!approved) {
+        this._markAgentStepExceptional(statusHost, {
+          denied: true,
+          effectStatus: "none",
+        });
+      }
       statusHost.appendChild(
         buildConvStatus({ approved, always, feedback: feedback || "" }),
       );
@@ -4372,7 +4408,7 @@ class Pane {
       });
     }
 
-    this.scrollToBottom(stick);
+    this.scrollToBottom();
   }
 
   // --- Task-agent card: nest a sub-agent's sub-tool steps under its row -----
@@ -4455,6 +4491,10 @@ class Pane {
     holder.pending = null;
     card.wrap.hidden = false;
     if (evt.phase === "start") {
+      const parentBatch = card.wrap.closest(".conv-batch");
+      if (parentBatch) {
+        setConvBatchExpanded(parentBatch, true, { blocker: true });
+      }
       const prior = card.wrap.querySelector(".conv-agent-compaction-notice");
       if (prior) prior.remove();
     }
@@ -4477,7 +4517,7 @@ class Pane {
         }
         notice.textContent = stripAnsi(message);
       },
-      scroll: (force) => this.scrollToBottom(force),
+      scroll: () => this.scrollToBottom(),
     });
   }
 
@@ -4507,6 +4547,10 @@ class Pane {
       return false; // parent row not painted yet — fall back top-level
     }
     if (mode === "approve") {
+      const parentBatch = card.wrap.closest(".conv-batch");
+      if (parentBatch) {
+        setConvBatchExpanded(parentBatch, true, { blocker: true });
+      }
       // Cards default to collapsed, but a pending approval is BLOCKING — it
       // can't hide behind the toggle or the turn stalls on a prompt the user
       // never sees.  Force the card open (sync aria with the data attribute).
@@ -4514,7 +4558,6 @@ class Pane {
       const toggle = card.wrap.querySelector(".conv-agent-toggle");
       if (toggle) toggle.setAttribute("aria-expanded", "true");
     }
-    const stick = this.isNearBottom();
     const approveRows = [];
     items.forEach((item) => {
       if (!item || !item.parent_call_id) return;
@@ -4526,6 +4569,11 @@ class Pane {
         row = buildToolDiv(item, "");
         card.body.appendChild(row);
       }
+      this._markAgentStepExceptional(row, {
+        isError: !!(item.is_error || item.error),
+        denied: !!item.denied,
+        effectStatus: item.effect_status,
+      });
       if (mode === "approve") {
         const verdict =
           item.judge_verdict || item.heuristic_verdict || item.verdict;
@@ -4573,7 +4621,7 @@ class Pane {
       this._registerApprovalCycle(cycleId, approveRows, items);
     }
     this._updateAgentLabel(card);
-    this.scrollToBottom(stick);
+    this.scrollToBottom();
     return true;
   }
 
@@ -4594,6 +4642,12 @@ class Pane {
         // Same-turn row rebuild: showInlineToolBlock's replaceChildren on the
         // pending->resolved upgrade detached our card.  Re-attach the SAME card
         // so its already-rendered steps survive the upgrade.
+        if (card.wrap.dataset.state === "running") {
+          const parentBatch = parentRow.closest(".conv-batch");
+          if (parentBatch) {
+            setConvBatchExpanded(parentBatch, true, { blocker: true });
+          }
+        }
         parentRow.appendChild(card.wrap);
         this._syncAgentContext(parentCallId, card);
         this._syncAgentCompaction(parentCallId, card);
@@ -4608,6 +4662,10 @@ class Pane {
     card = buildAgentCardBody();
     card.wrap.dataset.state = "running";
     if (contextOnly) card.wrap.dataset.contextOnly = "true";
+    const parentBatch = parentRow.closest(".conv-batch");
+    if (parentBatch) {
+      setConvBatchExpanded(parentBatch, true, { blocker: true });
+    }
     parentRow.appendChild(card.wrap);
     this._agentCards.set(parentCallId, card);
     this._syncAgentToggleLabel(card);
@@ -4616,13 +4674,43 @@ class Pane {
     return card;
   }
 
+  _markAgentStepExceptional(row, details) {
+    details = details || {};
+    const effectStatus =
+      details.effectStatus == null ? "" : String(details.effectStatus);
+    if (
+      !details.isError &&
+      !details.denied &&
+      !details.exceptional &&
+      (!effectStatus || effectStatus === "committed")
+    ) {
+      return false;
+    }
+    const card = row && row.closest ? row.closest(".conv-agent") : null;
+    if (!card) return false;
+    const parentBatch = card.closest(".conv-batch");
+    if (parentBatch) {
+      setConvBatchExpanded(parentBatch, true, { blocker: true });
+    }
+    const changed = card.dataset.agentStepExceptional !== "true";
+    card.dataset.agentStepExceptional = "true";
+    const issue = card.querySelector(".conv-agent-step-issue");
+    if (issue) issue.hidden = false;
+    this._syncAgentToggleLabel(card);
+    return changed;
+  }
+
   _syncAgentToggleLabel(card) {
     const wrap = card.wrap || card;
     const toggle = card.toggle || wrap.querySelector(".conv-agent-toggle");
     const label = card.label || wrap.querySelector(".conv-agent-label");
     const context = card.context || wrap.querySelector(".conv-agent-context");
+    const issue = card.issue || wrap.querySelector(".conv-agent-step-issue");
     if (!toggle || !label) return;
-    const parts = ["Show or hide sub-agent steps", label.textContent || "0 steps"];
+    const parts = [
+      "Show or hide sub-agent steps",
+      label.textContent || "0 steps",
+    ];
     const state = wrap.dataset.state;
     if (state === "running") parts.push("running");
     else if (state === "done") parts.push("done");
@@ -4633,6 +4721,9 @@ class Pane {
           ? "Warning: " + context.title
           : context.title,
       );
+    }
+    if (issue && !issue.hidden) {
+      parts.push("contains an exceptional child step");
     }
     toggle.setAttribute("aria-label", parts.join(". "));
   }
@@ -4814,7 +4905,14 @@ class Pane {
     // errors don't decide it (an agent can recover and synthesize fine).
     const card = buildAgentCardBody();
     steps.forEach((step) => {
-      card.body.appendChild(buildToolDiv(synthToolItem(step), ""));
+      const stepRow = buildToolDiv(synthToolItem(step), "");
+      card.body.appendChild(stepRow);
+      this._markAgentStepExceptional(stepRow, {
+        isError: !!step.is_error,
+        denied: !!step.denied,
+        exceptional: !!step.contains_exceptional,
+        effectStatus: step.effect_status,
+      });
       const out = stripAnsi(String(step.output || "")).trim();
       if (out) {
         card.body.appendChild(renderCollapsibleOutput(out, !!step.is_error));
@@ -4828,9 +4926,8 @@ class Pane {
 
   appendToolOutput(callId, name, output, isError, preview, opts = {}) {
     const accepted = opts.accepted === true;
-    // Capture pin before the streamEl removal + result insertion change
-    // scrollHeight — see announceToolBlock.  The result block is the other
-    // tall one-shot append in the tool flow (up to 10 lines before collapse).
+    // Folding uses the pre-mutation follow state; the deferred scroll also
+    // checks for a newer user scroll before it moves the viewport.
     const stick = this.isNearBottom();
     // A task_agent's OWN result completing flips its card running -> done/error
     // (child sub-tool results carry namespaced ids, never keys of _agentCards).
@@ -4878,23 +4975,39 @@ class Pane {
       if (!target && tools.length) target = tools[tools.length - 1];
     }
     if (!target) return false;
+    const parentBlock = target.closest(".conv-batch");
+    const stripped = stripAnsi(output || "").trim();
+    const isDenied =
+      target.classList.contains("conv-batch--denied") ||
+      (parentBlock && parentBlock.classList.contains("conv-batch--denied")) ||
+      /^Denied by user/.test(stripped) ||
+      /^Blocked/.test(stripped);
+    this._markAgentStepExceptional(target, {
+      isError: !!isError,
+      denied: isDenied,
+      effectStatus: opts.effectStatus,
+    });
 
     if (accepted) {
-      const targetBatch = target.closest(".conv-batch");
+      clearConvVerdictPending(target);
+      setToolOutputReviewState(target, output);
       // Stop can synthesize a final result after tool_pending but before the
       // authoritative tool_info/approval event consumes the early shell. Once
       // this exact shell owns an accepted row it is committed transcript DOM,
       // not replaceable early paint. Retire map ownership without removing it;
       // a later turn may legitimately reuse the same provider call id.
-      if (targetBatch && this.announcedBlocks) {
+      if (parentBlock && this.announcedBlocks) {
         for (const [key, announced] of this.announcedBlocks.entries()) {
-          if (announced === targetBatch) {
+          if (announced === parentBlock) {
             this.announcedBlocks.delete(key);
             break;
           }
         }
       }
       if (opts.effectStatus) {
+        if (opts.effectStatus !== "committed" && parentBlock) {
+          setConvBatchExpanded(parentBlock, true, { blocker: true });
+        }
         target.dataset.effectStatus = String(opts.effectStatus);
       } else {
         delete target.dataset.effectStatus;
@@ -4928,18 +5041,12 @@ class Pane {
       this._toolResultNodes.delete(callId);
     }
 
-    const stripped = stripAnsi(output || "").trim();
     // Skip rendering for denied/blocked tool results — the ✗ denied
     // badge from resolveApproval already shows the denial reason; the
     // SSE tool_result event would otherwise duplicate the text.  Mirror
     // the guard in the history-replay path (the live path used to be
     // safe because no tool_result event was ever emitted for denied
     // items, but we now emit one so _tool_error_flags gets set).
-    const parentBlock = target.closest(".conv-batch");
-    const isDenied =
-      (parentBlock && parentBlock.classList.contains("conv-batch--denied")) ||
-      /^Denied by user/.test(stripped) ||
-      /^Blocked/.test(stripped);
     const resultNodes = [];
     let insertCursor = target;
     const insertResult = (node) => {
@@ -4981,6 +5088,7 @@ class Pane {
       parentBlock &&
       !parentBlock.classList.contains("conv-batch--denied")
     ) {
+      setConvBatchExpanded(parentBlock, true, { blocker: true });
       parentBlock.classList.add("conv-batch--error");
       appendToolErrorBadge(parentBlock);
     }
@@ -4999,7 +5107,24 @@ class Pane {
     if (callId) {
       this._toolResultNodes.set(callId, { row: target, nodes: resultNodes });
     }
-    if (resultNodes.length) this.scrollToBottom(stick);
+    let settlement = null;
+    if (accepted) {
+      const compact = getTranscriptPresentation() === "compact";
+      const allowAutoFold =
+        !compact ||
+        canAutoFoldTranscriptBatch(this.messagesEl, parentBlock, {
+          atBottom: stick,
+        });
+      settlement = markConvRowResultSettled(target, {
+        autoFold: allowAutoFold,
+      });
+      if (compact && settlement.autoFolded) {
+        toolAnnounce("Completed: " + convBatchSummaryText(parentBlock));
+      }
+    }
+    if (resultNodes.length || (settlement && settlement.autoFolded)) {
+      this.scrollToBottom();
+    }
     return true;
   }
 
@@ -5143,6 +5268,7 @@ class Pane {
         clientSendId,
       });
     }
+    this.scrollToBottom(true);
     this.composer.clear();
 
     // Bound the send POST with an AbortController + ~15s timeout (mirrors
@@ -5611,6 +5737,7 @@ function _convApprovalHead(kickerText, items) {
   summary.textContent =
     items.length >= 2 ? first + " + " + (items.length - 1) + " more" : first;
   head.appendChild(summary);
+  head.appendChild(buildConvBatchDisclosure());
   return head;
 }
 
@@ -5821,6 +5948,7 @@ function createInteractivePane(root, wsId, opts) {
       clearTimeout(pane._staleRetryTimer);
       pane._staleRetryTimer = null;
     }
+    pane._reasoningActivity.finish();
     pane.disconnectSSE();
     // Detach the visibility handler and clear the hide-close marker: a dead
     // controller must NOT be resurrected by a tab-visibility change.  Without
@@ -5998,6 +6126,7 @@ function createInteractivePane(root, wsId, opts) {
         clearTimeout(pane._staleRetryTimer);
         pane._staleRetryTimer = null;
       }
+      pane._reasoningActivity.finish();
       pane.disconnectSSE();
       // The document-level visibilitychange listener holds a strong ref
       // to the pane — leaving it registered would both leak the pane and
@@ -6009,9 +6138,10 @@ function createInteractivePane(root, wsId, opts) {
       // card maps, and stop observing the detached scroller.
       pane._clearAgentTracking();
       pane._replayQueue = null;
-      if (pane._resizeObs) {
-        pane._resizeObs.disconnect();
-        pane._resizeObs = null;
+      pane._scrollFollow.destroy();
+      if (pane._unregisterTranscriptScroller) {
+        pane._unregisterTranscriptScroller();
+        pane._unregisterTranscriptScroller = null;
       }
       if (pane.el && pane.el.parentNode) {
         pane.el.parentNode.removeChild(pane.el);

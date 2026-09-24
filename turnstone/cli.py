@@ -1130,7 +1130,10 @@ def main() -> None:
         "--tool-truncation",
         type=int,
         default=0,
-        help="Tool output truncation limit in chars, 0 for auto (50%% of context window) (default: 0)",
+        help=(
+            "Tool output truncation limit in chars, 0 for auto "
+            "(20%% of the remaining input budget per result) (default: 0)"
+        ),
     )
     parser.add_argument(
         "--tool-search",
@@ -1425,6 +1428,7 @@ def main() -> None:
             registry_generation=registry_generation,
             model_alias=effective_alias,
             model_binding=model_binding,
+            ws_id=ws_id,
             tool_search=args.tool_search,
             tool_search_threshold=args.tool_search_threshold,
             tool_search_max_results=args.tool_search_max_results,
@@ -1481,11 +1485,21 @@ def main() -> None:
 
     # Handle --resume
     if resume_target:
+        from turnstone.core.node_affinity import NodeAffinityError
+
         if ws.session is None:
             print(red("No session available."))
+            manager.close(ws.id)
             sys.exit(1)
-        if not ws.session.resume(resume_target):
+        try:
+            resumed = ws.session.resume(resume_target)
+        except NodeAffinityError as exc:
+            manager.close(ws.id)
+            print(red(f"Cannot resume {resume_target}: {exc}"))
+            sys.exit(1)
+        if not resumed:
             print(red(f"Workstream '{args.resume}' has no messages."))
+            manager.close(ws.id)
             sys.exit(1)
         print(f"Resumed workstream {bold(resume_target)} ({len(ws.session.messages)} messages)")
 

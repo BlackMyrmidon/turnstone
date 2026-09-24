@@ -31,6 +31,46 @@
    element and let the caller append + scroll (pane- and transport-agnostic).
    ========================================================================== */
 
+/* A zero-height sibling anchors the control above the bottom of each log. */
+.conv-scroll-control {
+  position: relative;
+  flex: 0 0 0;
+  height: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+.conv-scroll-latest {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  max-width: calc(100% - 24px);
+  padding: 6px 12px;
+  border: 1px solid var(--hair);
+  border-radius: 18px;
+  background: var(--panel-2);
+  color: var(--ink);
+  box-shadow: var(--shadow-sm);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.conv-scroll-latest[hidden] {
+  display: none;
+}
+.conv-scroll-latest:hover {
+  border-color: var(--ink-3);
+}
+.conv-scroll-latest:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* ==========================================================================
    Card shell — pairs tool calls with their verdicts + results and embeds
    the approval gate.  One construct per dispatch turn:
@@ -143,6 +183,119 @@
      this carries the judge-tier provenance (the thin balance glyph). */
   color: var(--ink-3);
   font-size: 10px;
+}
+
+/* Compact transcript presentation.  Folding is explicit: structural
+   eligibility alone only reveals the disclosure; content hides only when JS
+   has also stamped data-compact-folded after an accepted terminal result or a
+   manual action.  Every ambiguous/actionable/exceptional descendant is a
+   fail-open exclusion. */
+.conv-batch-disclosure {
+  display: none;
+  min-height: 28px;
+  margin: -4px 0 -4px auto;
+  padding: 0 8px;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+  background: var(--panel);
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0;
+  text-transform: none;
+  cursor: pointer;
+}
+.conv-batch-tier + .conv-batch-disclosure {
+  margin-left: 0;
+}
+.conv-batch-disclosure:hover {
+  border-color: var(--accent-dim);
+  color: var(--ink);
+}
+.conv-batch-disclosure:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+:root[data-transcript-presentation="compact"]
+  [data-transcript-root]
+  .conv-batch:is(.conv-batch--approved, .conv-batch--auto)[data-results-settled="true"]:not(.conv-batch--pending):not(.conv-batch--running):not(.conv-batch--denied):not(.conv-batch--error):not([aria-busy="true"]):not(
+    :has(
+      .conv-actions,
+      .conv-verdict-spinner,
+      .conv-warning,
+      .conv-row.error,
+      .conv-row-result--error,
+      .conv-row-status--error,
+      .conv-status--error,
+      .conv-batch--pending,
+      .conv-batch--running,
+      .conv-row[data-tool-name="task_agent"],
+      .conv-agent[data-state="running"],
+      [data-agent-step-exceptional="true"],
+      .compaction-running,
+      .conv-agent-compaction-notice,
+      [data-output-review-incomplete="true"],
+      [aria-busy="true"],
+      .conv-verdict--high,
+      .conv-verdict--critical,
+      .conv-verdict-rec--deny,
+      .conv-verdict-rec--review,
+      > .conv-row[data-effect-status]:not([data-effect-status="committed"])
+    )
+  )
+  > .conv-batch-head
+  > .conv-batch-disclosure {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+:root[data-transcript-presentation="compact"]
+  [data-transcript-root]
+  .conv-batch:is(.conv-batch--approved, .conv-batch--auto)[data-results-settled="true"][data-compact-folded="true"]:not(.conv-batch--pending):not(.conv-batch--running):not(.conv-batch--denied):not(.conv-batch--error):not([aria-busy="true"]):not(
+    :has(
+      .conv-actions,
+      .conv-verdict-spinner,
+      .conv-warning,
+      .conv-row.error,
+      .conv-row-result--error,
+      .conv-row-status--error,
+      .conv-status--error,
+      .conv-batch--pending,
+      .conv-batch--running,
+      .conv-row[data-tool-name="task_agent"],
+      .conv-agent[data-state="running"],
+      [data-agent-step-exceptional="true"],
+      .compaction-running,
+      .conv-agent-compaction-notice,
+      [data-output-review-incomplete="true"],
+      [aria-busy="true"],
+      .conv-verdict--high,
+      .conv-verdict--critical,
+      .conv-verdict-rec--deny,
+      .conv-verdict-rec--review,
+      > .conv-row[data-effect-status]:not([data-effect-status="committed"])
+    )
+  )
+  > :not(.conv-batch-head) {
+  display: none;
+}
+
+:root[data-transcript-presentation="compact"]
+  [data-transcript-root]
+  .conv-batch {
+  margin-block: 2px;
+}
+:root[data-transcript-presentation="compact"]
+  [data-transcript-root]
+  .conv-batch-head {
+  padding: 4px 8px;
+}
+:root[data-transcript-presentation="compact"]
+  [data-transcript-root]
+  .conv-row {
+  padding-block: 6px;
 }
 
 /* Row container.  Parallel batches frame rows with a left rail so they
@@ -797,6 +950,21 @@
   border-width: 2px;
   color: var(--warn);
   font-weight: 800;
+}
+.conv-agent-step-issue {
+  margin-left: auto;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--warn) 55%, var(--hair-2));
+  border-radius: 999px;
+  color: var(--warn);
+  font-weight: 800;
+  letter-spacing: 0;
+  line-height: 1.4;
+  text-transform: none;
+  white-space: nowrap;
+}
+.conv-agent-step-issue[hidden] {
+  display: none;
 }
 /* Card-level liveness as a NON-colour cue (WCAG 1.4.1): a text suffix, not just
    a stripe — in a parallel batch the parent rail belongs to the whole group,

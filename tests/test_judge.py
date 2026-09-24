@@ -380,11 +380,12 @@ class TestErrorHandling:
         )
         assert result is None
 
-    def test_empty_content_length_stop_no_retry(self):
-        """When finish_reason is 'length', don't retry — return None immediately."""
+    @pytest.mark.parametrize("finish", ["length", "content_filter"])
+    def test_empty_content_nonrecoverable_stop_no_retry(self, finish):
+        """Output limits and safety filters stop the empty-response ladder."""
         provider = _make_mock_provider(response_content="")
         result_mock = _mock_result("", None)
-        result_mock.finish_reason = "length"
+        result_mock.finish_reason = finish
         provider.create_streaming.return_value = as_stream(result_mock)
 
         judge = _make_judge(provider)
@@ -396,6 +397,30 @@ class TestErrorHandling:
         )
         assert result is None
         # Should have been called exactly once — no retries
+        assert provider.create_streaming.call_count == 1
+
+    @pytest.mark.parametrize("finish", ["content_filter", "length"])
+    def test_rejected_response_cannot_execute_judge_tools(self, finish):
+        provider = _make_mock_provider()
+        response = _mock_result(
+            "",
+            [{"id": "read", "function": {"name": "read_file", "arguments": '{"path":"x"}'}}],
+        )
+        response.finish_reason = finish
+        provider.create_streaming.return_value = as_stream(response)
+        judge = _make_judge(provider)
+        execute = MagicMock()
+        judge._exec_read_only_tool = execute
+
+        result = judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "test"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+
+        assert result is None
+        execute.assert_not_called()
         assert provider.create_streaming.call_count == 1
 
 
@@ -1524,7 +1549,17 @@ class TestArgBudget:
 
         out = honest_truncate("A" * 5000, 1000)
         assert out.startswith("A" * 1000)
-        assert "4,000 of 5,000 chars omitted" in out
+        assert out.count("A") == 1000
+        assert out.endswith("…[4,000 of 5,000 chars omitted]")
+
+    def test_honest_truncate_keeps_the_count_at_budgets_below_the_note(self):
+        """Callers divide one budget across many fields, so a budget of a few
+        characters (or zero) is routine.  The counted note must survive it:
+        an empty field reads to the judge as an edit that replaces nothing."""
+        from turnstone.core.judge import honest_truncate
+
+        assert honest_truncate("A" * 50, 0) == "…[50 of 50 chars omitted]"
+        assert honest_truncate("A" * 50, 3) == "AAA…[47 of 50 chars omitted]"
 
     def test_arg_budget_scales_with_context_window_uncapped(self):
         """The judge-prompt budget scales with the real window and is NOT
@@ -1753,8 +1788,9 @@ class TestReadOnlyToolExecution:
         )
 
         assert requested == [32_769]
-        assert result[:32_768] == "x" * 32_768
-        assert result[32_768:].startswith("\n... (truncated")
+        assert len(result) <= 32_768
+        assert result.startswith("x")
+        assert "\n... (truncated" in result
 
     def test_list_directory_success(self, tmp_path):
         (tmp_path / "file_a.txt").touch()

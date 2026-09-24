@@ -41,9 +41,9 @@ Key components:
   creation via HTTP, stale route detection, and user identity resolution.
 - **channel_users table** — maps `(channel_type, channel_user_id)` to a
   turnstone `user_id`. Messages from unlinked users are silently dropped.
-- **channel_routes table** — persistent channel-to-workstream mappings.
-  Survives bot restarts. Stale routes (evicted workstreams) are detected
-  and refreshed on the next message.
+- **channel_routes table** — persistent channel-to-workstream mappings, including the Discord user
+  who started the conversation. The association and owner survive node and bot restarts. Recovery
+  runs on the next authorized message.
 
 ---
 
@@ -195,17 +195,37 @@ both and the gateway hosts both adapters in one process.
 - All subsequent messages in the thread are routed to the same workstream.
 - The bot streams responses via message edits, updated approximately every
   1.5 seconds.
-- If a persisted channel route is no longer active on its owning node, the
-  router asks the create endpoint to fork the old workstream into a new ID via
-  `resume_ws`. The saved source can still resolve normally; its
-  checkpoint-bounded history, configuration, persona, effective project, and
-  attachment references are cloned before the channel route is repointed. The
-  old route remains durable until the replacement (and any initial message)
-  succeeds. If the create endpoint returns the ordinary
-  source-not-found response *and* a fresh authoritative storage lookup confirms
-  that the source is gone, the router retries once without `resume_ws` and
-  starts a fresh conversation. Other access, conflict, routing, and storage
-  failures remain visible rather than silently discarding history.
+- If a persisted channel route is no longer active on its owning node, the router asks the create
+  endpoint to fork the old workstream into a new ID via `resume_ws`. The saved source can still
+  resolve normally; its checkpoint-bounded history, configuration, persona, effective project, and
+  attachment references are cloned before the channel route is repointed. The old route remains
+  durable until the replacement succeeds. The router swaps the mapping atomically, preserving its
+  owner; concurrent recovery cannot overwrite another replacement. Initial messages are sent only
+  after the route is claimed. If the create endpoint returns the ordinary source-not-found response
+  *and* a fresh authoritative storage lookup confirms that the source is gone, the router retries
+  once without `resume_ws` and starts a fresh conversation. Other access, conflict, routing, and
+  storage failures remain visible rather than silently discarding history.
+- Recovery uses the exact saved workstream ID; another conversation's alias cannot replace it.
+  A deleted ID also remains reserved while a channel route references it, preventing a new
+  workstream from receiving that channel's messages under the old identity.
+- A missing SSE session stops that subscription without deleting the conversation's route. Discord
+  thread replies, Slack thread replies, and Slack DMs all check the saved association before sending
+  the next message and restore their subscription. With a console, each SSE connection resolves the
+  current node address; console errors trigger retries rather than a fallback to the configured node.
+- Routes do not expire merely because a node is unavailable. An explicit close removes a route only
+  after the node confirms closure (or reports no loaded session), and only if the route still names
+  that workstream. A refused close or concurrent replacement retains the association and reports a
+  retryable failure.
+- Discord recovers uncached threads through the platform API. Missing or inaccessible threads retain
+  their saved routes. Only the original linked invoker may send follow-ups or close the workstream;
+  approval prompts also identify that invoker, including for bot-owned `/ask` threads.
+- Startup recovery subscribes only to already-live workstreams. Direct mode reads the active list
+  once; console mode limits both concurrent liveness probes and the total discovery time. Inactive
+  and temporarily unreachable conversations keep their associations for lazy recovery on a message.
+- `/close` acknowledges privately and archives the thread after confirmed closure.
+- Older Discord routes lack a saved invoker. The bot creates these threads, so Discord's platform
+  owner cannot identify the human who started them. Start a new conversation with `/ask` in the
+  parent channel. Linking an account does not grant ownership of an older thread.
 
 ### Slash Commands
 
@@ -288,8 +308,9 @@ See [Security: Database Schema](security.md#database-schema) for the
    `channel_routes` table.
 2. **Active** — messages are routed bidirectionally. The bot streams
    responses via message edits (updated every ~1.5 seconds).
-3. **Eviction** — the server evicts an idle workstream for capacity. Its saved
-   source row and channel route remain durable, and the thread stays open.
+3. **Unavailability** — a node restart or capacity eviction can unload a workstream. Its saved source
+   and channel association remain durable. An SSE 404 clears only the listener's transient state;
+   a connection error reconnects with backoff.
 4. **Reactivation** — the next message resolves the saved route and probes
    whether that workstream is live on its owning node. If it is not, the router
    creates a distinct workstream with the old `ws_id` as `resume_ws`. The
@@ -322,6 +343,11 @@ Two modes:
   the user has (e.g. Discord + Slack).
 - **Direct** — provide `channel_type` + `channel_id` to target a
   specific platform channel or user DM.
+
+Discord notifications support user mentions (`<@USER_ID>`), role mentions (`<@&ROLE_ID>`), `@everyone`,
+and `@here`. Mention syntax is preserved, and Discord's permissions and each recipient's notification
+settings determine whether a ping is delivered. To send a DM, use the user's Discord ID as `channel_id`;
+a separate server channel ID is not needed.
 
 ### Delivery Flow
 
@@ -388,22 +414,44 @@ The `services` table schema:
 
 ### Security
 
-- **Authentication** — the gateway's `POST /v1/api/notify` endpoint
-  requires authentication. Configure `TURNSTONE_JWT_SECRET` so the
-  server can mint JWTs with `aud: turnstone-channel` automatically.
-  If the secret is not set, the gateway fails closed and rejects all
-  requests with 401. Server JWTs (`aud: turnstone-server`) are
-  rejected.
+- **Authentication** — the gateway's `POST /v1/api/notify` endpoint requires authentication.
+  Configure the server's signing secret with `TURNSTONE_JWT_SECRET` or `[auth].jwt_secret` in
+  `config.toml`; the environment variable takes precedence. The gateway reads
+  `TURNSTONE_JWT_SECRET`, which must match the server's secret. The server automatically mints JWTs
+  with `aud: turnstone-channel`. If the gateway's secret is not set, it fails closed and rejects all
+  requests with 401. Server JWTs (`aud: turnstone-server`) are rejected.
 - **Rate limit** — maximum 5 notifications per turn. The counter only
   increments on successful delivery, so failures don't consume the
   budget.
-- **SSRF protection** — only `http://` and `https://` service URLs
-  are allowed. Other schemes are silently skipped.
-- **Mention sanitization** — `discord.utils.escape_mentions()` is
-  applied before sending, preventing `@everyone` / `@here` abuse.
+- **SSRF protection** — only `http://` and `https://` service URLs are allowed. Other schemes are
+  skipped with a warning.
+- **Discord mentions** — all bot messages allow user, role, `@everyone`, and `@here` mentions, subject
+  to Discord's permissions and the recipient's notification settings.
 - **Error redaction** — generic error messages are returned to the
   LLM. Internal details (service IDs, URLs, exception messages) are
   logged server-side only.
+
+### Troubleshooting notifications
+
+Check both the originating server and the channel gateway logs. Each `notify.gateway_failed` event
+identifies the gateway, its URL, the attempt, the workstream (`ws_id`), and the tool call (`call_id`).
+The event records whether an Authorization header was present, plus the HTTP status, request exception
+type, or delivery statuses such as `no_adapter`, `failed`, and `timeout`. Completion notifications log
+the same gateway and workstream details under `notify_completion.*`. Gateway URLs omit credentials,
+query parameters, and fragments; outbound diagnostics omit tokens, message content, and response
+bodies.
+
+A 401 from the gateway occurs before Discord or Slack delivery. `notify.auth_missing` on the server
+means it could not find notification credentials. On the gateway, `notify.auth_not_configured` means
+its signing secret is missing; `notify.auth_rejected` distinguishes a missing Authorization header,
+an invalid scheme or token format, and an invalid JWT. For `invalid_jwt`, check the shared secret, the
+`turnstone-channel` audience, token expiry, and host clocks. `notify.auth_insufficient_scope` indicates
+a valid JWT without the required `write` scope and returns 403.
+
+With debug logging enabled before credentials are first used, `notify.auth_configured` records the
+credential source without its value. A configured `TURNSTONE_CHANNEL_AUTH_TOKEN` overrides automatic
+JWT minting and must itself be a valid JWT for the channel audience with `write` scope. Working Discord
+or Slack conversations do not verify this outbound notification authentication path.
 
 ---
 

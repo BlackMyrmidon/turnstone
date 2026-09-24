@@ -1286,15 +1286,9 @@ def attachment_to_content_part(att: dict[str, Any]) -> dict[str, Any] | None:
         # base64 bytes (vs. a text doc's utf-8 ``data``).  Per-provider
         # translators branch on ``application/pdf`` (Phase 2); the client-side
         # fallback for non-PDF models lands in Phase 3.
-        b64 = base64.b64encode(raw).decode("ascii")
-        return {
-            "type": "document",
-            "document": {
-                "name": att.get("filename") or "",
-                "media_type": "application/pdf",
-                "data": b64,
-            },
-        }
+        from turnstone.core.media_materialization import native_pdf_part
+
+        return native_pdf_part(raw, att.get("filename") or "")
     if kind == "audio" and isinstance(raw, bytes):
         # OpenAI-style ``input_audio`` part — passes through the openai-compat
         # lane untouched (omni models); other lanes translate / fall back in
@@ -2744,6 +2738,7 @@ def clone_workstream_transaction(
     if expected_session is not None and (
         not expected_session.source_reservation_token
         or source_reservation_token != expected_session.source_reservation_token
+        or source.get("required_node_id") != expected_session.source_required_node_id
     ):
         # Preflight authorization was for a different durable incarnation.
         # Treat replacement exactly like disappearance so the fork surface is
@@ -2797,6 +2792,11 @@ def clone_workstream_transaction(
         raise ForkDestinationConflictError("fork destination is not available")
     if not trusted_internal and str(destination.get("user_id") or "") != principal_id:
         raise ForkDestinationConflictError("fork destination is not available")
+    required_node_id = destination.get("required_node_id") or source.get("required_node_id")
+    if expected_session is not None:
+        from turnstone.core.node_affinity import require_execution_node
+
+        require_execution_node(required_node_id, expected_session.node_id)
     # Preserve an existing private reservation even for compatibility callers
     # that do not supply a construction witness. Production HTTP forks also
     # compare it to ``expected_session`` below; preservation keeps later
@@ -3039,7 +3039,7 @@ def clone_workstream_transaction(
     updated = conn.execute(
         sa.update(workstreams)
         .where(workstreams.c.ws_id == destination_ws_id)
-        .values(project_id=effective_project_id, updated=now)
+        .values(project_id=effective_project_id, required_node_id=required_node_id, updated=now)
         .returning(workstreams.c.ws_id)
     ).fetchone()
     if updated is None:
@@ -3049,6 +3049,7 @@ def clone_workstream_transaction(
         turns=tuple(final_turns),
         config=dict(source_config),
         project_id=effective_project_id,
+        required_node_id=required_node_id,
     )
 
 

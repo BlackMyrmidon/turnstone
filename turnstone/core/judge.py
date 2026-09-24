@@ -39,6 +39,7 @@ from turnstone.core.model_turn import (
     same_model_lane_binding,
 )
 from turnstone.core.trajectory import Turn
+from turnstone.core.truncation import truncate_text
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1088,10 +1089,16 @@ def honest_truncate(text: str, budget: int) -> str:
     as complete.  Reason-neutral, since the same helper bounds both the judge
     prompt (fit the window) and the verdict record (the OH CRAP backstop).
     """
-    if budget < 0:
-        budget = 0
+
+    budget = max(0, budget)
     if len(text) <= budget:
         return text
+    # The note is deliberately extra to the budget rather than fitted inside
+    # it.  Callers divide one budget across many fields, so budgets smaller
+    # than the note are routine there, and fitting the note inside such a
+    # budget would leave a bare ellipsis or nothing at all: a judge shown an
+    # empty field rules on an edit that "replaces nothing".  The overshoot is
+    # bounded by the note's own length.
     omitted = len(text) - budget
     return f"{text[:budget]}…[{omitted:,} of {len(text):,} chars omitted]"
 
@@ -1828,6 +1835,12 @@ class IntentJudge:
                 elapsed=round(turn_elapsed, 1),
             )
 
+            # Refused or truncated responses cannot authorize a tool, even if
+            # their text happens to contain a complete verdict JSON object.
+            if result.finish_reason in ("content_filter", "length"):
+                log.info("judge.turn.stopped", finish_reason=result.finish_reason, turn=turn + 1)
+                return None
+
             # Reset empty-response counter after any non-empty response
             if result.content or result.tool_calls:
                 empty_retries = 0
@@ -1892,13 +1905,6 @@ class IntentJudge:
                 )
                 turn += 1
                 continue
-
-            # Empty response (0 chars, 0 tools).  If the model hit the
-            # output token limit the finish_reason will be "length" — retrying
-            # with the same prompt and max_tokens is pointless.
-            if result.finish_reason == "length":
-                log.info("judge.empty_response.length_stop", turn=turn + 1)
-                return None
 
             # Transient empty response — retry up to 3 times without
             # consuming the turn budget.
@@ -2108,7 +2114,16 @@ class IntentJudge:
                         size_note = f", {total_bytes} bytes total"
                     except OSError:
                         size_note = ""
-                    return content[:_JUDGE_READ_LIMIT] + f"\n... (truncated{size_note})"
+
+                    def _read_marker(_omitted: int, _original: int, _limit: int) -> str:
+                        return f"\n... (truncated{size_note})"
+
+                    return truncate_text(
+                        content,
+                        _JUDGE_READ_LIMIT,
+                        mode="head",
+                        marker_factory=_read_marker,
+                    ).text
                 return content
 
             if name == "list_directory":

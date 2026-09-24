@@ -415,6 +415,397 @@ export function indexLabel(idx, n) {
 // left indent (a real bug if a caller passes pre-indented text).
 // ===========================================================================
 
+const OUTPUT_REVIEW_INCOMPLETE_TEXT = "Output review did not complete";
+
+function _reasoningTrace(row) {
+  let trace = row.querySelector(".msg-body");
+  if (trace) return trace;
+  // Normalize the legacy/direct-text shape defensively.  Live callers create
+  // .msg-body themselves, but keeping the shared seam self-contained prevents
+  // a future renderer from putting token mutations back inside the status.
+  const text = row.textContent || "";
+  row.textContent = "";
+  trace = document.createElement("div");
+  trace.className = "msg-body";
+  trace.textContent = text;
+  row.appendChild(trace);
+  return trace;
+}
+
+// One per pane: the pre-token indicator moves into the reasoning row without
+// restarting its clock. The elapsed time describes this browser's observed
+// phase, not provider compute time; cold history has no invented duration.
+export function createReasoningActivity() {
+  let status = null;
+  let elapsed = null;
+  let startedAt = null;
+  let timer = null;
+  let row = null;
+  let trace = null;
+  let traceHidden = null;
+
+  function stopTimer() {
+    if (timer !== null) clearInterval(timer);
+    timer = null;
+  }
+
+  function releaseTrace() {
+    if (!row) return;
+    delete row.dataset.reasoningActive;
+    if (traceHidden === null) trace.removeAttribute("aria-hidden");
+    else trace.setAttribute("aria-hidden", traceHidden);
+    row = trace = null;
+    traceHidden = null;
+  }
+
+  function finish() {
+    stopTimer();
+    releaseTrace();
+    if (status) status.remove();
+    status = elapsed = startedAt = null;
+  }
+
+  function tick() {
+    if (!status.isConnected) {
+      finish();
+      return;
+    }
+    const seconds = Math.max(
+      0,
+      Math.floor((performance.now() - startedAt) / 1000),
+    );
+    const text = seconds + "s";
+    if (elapsed.textContent !== text) elapsed.textContent = text;
+  }
+
+  function mount(parent) {
+    if (!status) {
+      startedAt = performance.now();
+      status = document.createElement("span");
+      status.className = "reasoning-activity-status";
+      const label = document.createElement("span");
+      label.className = "reasoning-activity-label";
+      label.setAttribute("role", "status");
+      label.setAttribute("aria-live", "polite");
+      label.setAttribute("aria-atomic", "true");
+      label.setAttribute("aria-label", "Model reasoning in progress");
+      label.textContent = "Reasoning";
+      elapsed = document.createElement("span");
+      elapsed.className = "reasoning-activity-elapsed";
+      // The clock and streamed trace are outside the live announcement.
+      // Neither tokens nor timer ticks should repeatedly interrupt a reader.
+      elapsed.setAttribute("role", "timer");
+      elapsed.setAttribute("aria-live", "off");
+      elapsed.setAttribute("aria-label", "Elapsed reasoning time");
+      elapsed.textContent = "0s";
+      status.append(label, elapsed);
+    }
+    parent.appendChild(status);
+    if (status.isConnected) tick();
+    if (timer === null) timer = setInterval(tick, 1000);
+  }
+
+  return {
+    start(container) {
+      if (status && status.isConnected) return;
+      finish();
+      mount(container);
+    },
+    hideWaiting() {
+      if (row) return;
+      stopTimer();
+      if (status) status.remove();
+      // thinking_stop precedes the first token. Keep the clock origin for
+      // the reasoning handoff; content/terminal events call finish instead.
+    },
+    attach(nextRow) {
+      if (!nextRow || row === nextRow) return;
+      releaseTrace();
+      row = nextRow;
+      trace = _reasoningTrace(row);
+      traceHidden = trace.getAttribute("aria-hidden");
+      trace.setAttribute("aria-hidden", "true");
+      row.dataset.reasoningActive = "true";
+      mount(row);
+      row.appendChild(trace);
+    },
+    finish,
+  };
+}
+
+const COMPACT_BLOCKER_SELECTOR = [
+  ".conv-actions",
+  ".conv-verdict-spinner",
+  ".conv-warning",
+  ".conv-row.error",
+  ".conv-row-result--error",
+  ".conv-row-status--error",
+  ".conv-status--error",
+  ".conv-batch--pending",
+  ".conv-batch--running",
+  '.conv-row[data-tool-name="task_agent"]',
+  '.conv-agent[data-state="running"]',
+  '[data-agent-step-exceptional="true"]',
+  ".compaction-running",
+  ".conv-agent-compaction-notice",
+  '[data-output-review-incomplete="true"]',
+  '[aria-busy="true"]',
+  ".conv-verdict--high",
+  ".conv-verdict--critical",
+  ".conv-verdict-rec--deny",
+  ".conv-verdict-rec--review",
+].join(", ");
+
+// A judge-pending spinner is provisional. Once the canonical accepted tool
+// result arrives, execution is terminal and that spinner must not remain as a
+// permanent compact blocker. A late intent_verdict can still replace/rebuild
+// the verdict and re-expand the batch when its disposition is exceptional.
+export function clearConvVerdictPending(row) {
+  if (!row) return false;
+  let badge = Array.from(row.children || []).find((child) =>
+    child.classList.contains("conv-verdict"),
+  );
+  if (!badge && row.parentNode) {
+    const siblings = Array.from(row.parentNode.children || []);
+    const start = siblings.indexOf(row);
+    for (let index = start + 1; index < siblings.length; index += 1) {
+      const candidate = siblings[index];
+      if (candidate.classList.contains("conv-row")) break;
+      if (candidate.classList.contains("conv-verdict")) {
+        badge = candidate;
+        break;
+      }
+    }
+  }
+  if (!badge) return false;
+  const spinner = badge.querySelector(".conv-verdict-spinner");
+  if (!spinner) return false;
+  spinner.remove();
+  if (!(badge.children || []).length) badge.remove();
+  return true;
+}
+
+// Cancellation can replace a real executor receipt with controller-authored
+// text because output review never completed. Effect disposition is
+// orthogonal: even a committed effect remains unresolved for presentation,
+// so stamp a dedicated fail-open marker instead of overloading effectStatus.
+export function setToolOutputReviewState(row, output) {
+  if (!row) return false;
+  const incomplete = String(output == null ? "" : output).includes(
+    OUTPUT_REVIEW_INCOMPLETE_TEXT,
+  );
+  if (incomplete) row.dataset.outputReviewIncomplete = "true";
+  else delete row.dataset.outputReviewIncomplete;
+  return incomplete;
+}
+
+function _directConvRows(batch) {
+  return Array.from(batch.children || []).filter((child) =>
+    child.classList.contains("conv-row"),
+  );
+}
+
+function _convBatchHead(batch) {
+  return Array.from(batch.children || []).find((child) =>
+    child.classList.contains("conv-batch-head"),
+  );
+}
+
+function _convBatchDisclosure(batch) {
+  return batch.querySelector(".conv-batch-disclosure");
+}
+
+export function convBatchSummaryText(batch) {
+  const summary = batch.querySelector(".conv-batch-summary");
+  const text = summary ? String(summary.textContent || "").trim() : "";
+  return text || "tool batch";
+}
+
+export function isConvVerdictCompactBlocker(verdict) {
+  if (!verdict) return false;
+  const risk = normalizeRiskLevel(verdict.risk_level);
+  const recommendation = verdict.recommendation || "review";
+  return risk === "high" || risk === "critical" || recommendation !== "approve";
+}
+
+function _playingBatchMedia(batch) {
+  return Array.from(batch.querySelectorAll("audio, video")).filter(
+    (media) => media.paused === false && media.ended !== true,
+  );
+}
+
+function _batchHasProtectedFocus(batch) {
+  const active = document.activeElement;
+  if (!active || !batch.contains(active)) return false;
+  const head = _convBatchHead(batch);
+  return !head || !head.contains(active);
+}
+
+// Focus a non-interactive element without pre-selecting an answer: a
+// temporary tabindex, so the element takes focus (and a visible ring)
+// while Space and Enter stay unarmed on any action button or link inside
+// it.  The tabindex leaves with the focus, so the element never joins the
+// Tab order.  preventScroll: callers own the viewport (a smooth scroll is
+// usually already running toward the element).
+export function focusTemporarily(el) {
+  if (!el || typeof el.focus !== "function") return;
+  const temporary = !el.hasAttribute("tabindex");
+  if (temporary) el.setAttribute("tabindex", "-1");
+  el.focus({ preventScroll: true });
+  if (temporary) {
+    el.addEventListener(
+      "blur",
+      () => {
+        el.removeAttribute("tabindex");
+      },
+      { once: true },
+    );
+  }
+}
+
+// Focus a batch's head — used when a blocker expansion steals focus from
+// the disclosure, and by the status-bar approval chip's reveal on the
+// coordinator (which has no feedback field to land on).
+export function focusConvBatchHead(batch) {
+  focusTemporarily(_convBatchHead(batch));
+}
+
+function _syncConvBatchDisclosure(batch, expanded) {
+  const disclosure = _convBatchDisclosure(batch);
+  if (!disclosure) return;
+  const action = expanded ? "Hide" : "Show";
+  const summary = convBatchSummaryText(batch);
+  disclosure.setAttribute("aria-expanded", expanded ? "true" : "false");
+  disclosure.setAttribute(
+    "aria-label",
+    action + " completed tool details for " + summary,
+  );
+  disclosure.title = action + " completed tool details";
+  disclosure.textContent = "Completed · " + action + " details";
+}
+
+// Structural compact eligibility is independent of the selected presentation:
+// Default may stage a fold marker without hiding anything so a later switch to
+// Compact is immediate.  Every ambiguous or exceptional state fails open.
+export function isConvBatchCompactEligible(batch) {
+  if (!batch || !batch.classList.contains("conv-batch")) return false;
+  if (batch.dataset.resultsSettled !== "true") return false;
+  if (
+    !batch.classList.contains("conv-batch--approved") &&
+    !batch.classList.contains("conv-batch--auto")
+  ) {
+    return false;
+  }
+  for (const state of [
+    "conv-batch--pending",
+    "conv-batch--running",
+    "conv-batch--denied",
+    "conv-batch--error",
+  ]) {
+    if (batch.classList.contains(state)) return false;
+  }
+  if (batch.getAttribute("aria-busy") === "true") return false;
+  const rows = _directConvRows(batch);
+  if (!rows.length) return false;
+  for (const row of rows) {
+    if (row.dataset.resultSettled !== "true") return false;
+    if (
+      Object.prototype.hasOwnProperty.call(row.dataset, "effectStatus") &&
+      row.dataset.effectStatus !== "committed"
+    ) {
+      return false;
+    }
+  }
+  return !batch.querySelector(COMPACT_BLOCKER_SELECTOR);
+}
+
+// The only disclosure-state mutator.  Automatic folds preserve focused detail
+// and playing media; an explicit fold pauses media first.  A late blocker can
+// make the disclosure itself inapplicable, so its focused button hands off to
+// the surviving batch head before the renderer adds that blocker.
+export function setConvBatchExpanded(batch, expanded, options) {
+  options = options || {};
+  if (!batch || !batch.classList.contains("conv-batch")) return false;
+  const disclosure = _convBatchDisclosure(batch);
+  if (
+    expanded &&
+    options.blocker &&
+    disclosure &&
+    document.activeElement === disclosure
+  ) {
+    focusConvBatchHead(batch);
+  }
+  const playing = _playingBatchMedia(batch);
+  if (!expanded && !options.manual) {
+    if (_batchHasProtectedFocus(batch) || playing.length) return false;
+  }
+  if (!expanded && options.manual) {
+    for (const media of playing) {
+      try {
+        media.pause();
+      } catch (_) {
+        // A detached/broken media element must not strand disclosure state.
+      }
+    }
+  }
+  const wasExpanded = batch.dataset.compactFolded !== "true";
+  if (expanded) delete batch.dataset.compactFolded;
+  else batch.dataset.compactFolded = "true";
+  _syncConvBatchDisclosure(batch, expanded);
+  return wasExpanded !== expanded;
+}
+
+// Project accepted terminal-result truth onto the row/batch DOM.  The caller
+// must apply effect/error/warning/running state before this finalization step.
+export function markConvRowResultSettled(row, options) {
+  options = options || {};
+  const batch =
+    row && row.classList && row.classList.contains("conv-row")
+      ? row.closest(".conv-batch")
+      : null;
+  const result = { becameSettled: false, autoFolded: false, batch };
+  if (!batch) return result;
+  if ((row.parentElement || row.parentNode) !== batch) return result;
+
+  row.dataset.resultSettled = "true";
+  const rows = _directConvRows(batch);
+  if (
+    !rows.length ||
+    rows.some((candidate) => candidate.dataset.resultSettled !== "true")
+  ) {
+    if (batch.dataset.resultsSettled === "true") {
+      delete batch.dataset.resultsSettled;
+      setConvBatchExpanded(batch, true);
+    }
+    return result;
+  }
+  if (batch.dataset.resultsSettled === "true") return result;
+
+  batch.dataset.resultsSettled = "true";
+  result.becameSettled = true;
+  if (options.autoFold !== false && isConvBatchCompactEligible(batch)) {
+    result.autoFolded = setConvBatchExpanded(batch, false);
+  }
+  return result;
+}
+
+export function buildConvBatchDisclosure() {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "conv-batch-disclosure";
+  button.setAttribute("aria-expanded", "true");
+  button.setAttribute("aria-label", "Hide completed tool details");
+  button.title = "Hide completed tool details";
+  button.textContent = "Completed · Hide details";
+  button.addEventListener("click", () => {
+    const batch = button.closest(".conv-batch");
+    if (!batch || !isConvBatchCompactEligible(batch)) return;
+    const expanded = batch.dataset.compactFolded === "true";
+    setConvBatchExpanded(batch, expanded, { manual: true });
+  });
+  return button;
+}
+
 // Empty batch shell (.conv-batch) + header strip (kicker / summary / tier).
 // The caller appends rows + actions/status and flips the state modifier
 // (--pending/--auto/--running/--approved/--denied/--error).  opts:
@@ -448,6 +839,7 @@ export function buildConvBatchShell(opts) {
     tier.textContent = opts.tierText;
     head.appendChild(tier);
   }
+  head.appendChild(buildConvBatchDisclosure());
   batch.appendChild(head);
   return batch;
 }
@@ -1004,7 +1396,12 @@ export function buildAgentCardBody() {
   context.className = "conv-agent-context";
   context.hidden = true;
   context.setAttribute("aria-hidden", "true");
-  toggle.append(caret, label, context);
+  const issue = document.createElement("span");
+  issue.className = "conv-agent-step-issue";
+  issue.hidden = true;
+  issue.textContent = "child issue";
+  issue.title = "Contains an exceptional child step";
+  toggle.append(caret, label, context, issue);
   const body = document.createElement("div");
   body.className = "conv-agent-body";
   body.id = bodyId;
@@ -1014,5 +1411,5 @@ export function buildAgentCardBody() {
     toggle.setAttribute("aria-expanded", collapsed ? "true" : "false");
   });
   wrap.append(toggle, body);
-  return { wrap, body, label, context, toggle };
+  return { wrap, body, label, context, issue, toggle };
 }

@@ -25,6 +25,7 @@ from turnstone.core.providers._protocol import (
     finish_shim_due,
     merge_reasoning_template_kwargs,
     refuse_aborted_request,
+    request_uses_native_tools,
     serialized_tool_chars,
     snap_reasoning_effort,
 )
@@ -78,6 +79,11 @@ _WEB_SEARCH_TOOL_TYPE = "web_search_20250305"
 
 # Tool search: server-side BM25 tool discovery for deferred tools
 _TOOL_SEARCH_TOOL_TYPE = "tool_search_tool_bm25"
+# Beta value that unlocks ``thinking.block_binding`` (see
+# ``ModelCapabilities.thinking_prefix_bound``).  Sent as an
+# ``anthropic-beta`` request header, comma-joined with any value a caller
+# already put there.
+_THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01"
 
 # extra_params keys consumed internally (``_reasoning_params``) — never
 # forwarded to the wire ``extra_body``.  Keeps real-Anthropic request
@@ -140,6 +146,35 @@ _ANTHROPIC_COMPAT_DEFAULT = ModelCapabilities(
 )
 
 _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
+    # Fable 5.1: the fable-5 surface (below) plus three documented breaking
+    # changes, of which only the last reaches this lane:
+    #   * forced tool choice (``tool_choice`` any/tool) is a 400 -- this lane
+    #     never sends ``tool_choice`` at all, so unreachable.
+    #   * thinking blocks are bound to the producing model -- a block the
+    #     target model cannot read is dropped server-side, unbilled, before
+    #     the prompt is priced; replay stays verbatim, nothing to strip.
+    #   * thinking blocks are bound to the conversation prefix -- see
+    #     ``thinking_prefix_bound``; the row opts into drop_block.
+    # Same tokenizer, limits, effort ladder (default high) and pricing tier
+    # as fable-5.  ``display: "summarized"`` also returns the model's
+    # between-tool-call progress notes as thinking text.
+    "claude-fable-5-1": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
+        thinking_prefix_bound=True,
+    ),
     # Fable 5: same wire surface as opus-4-8 (adaptive-only thinking, no
     # sampling params, prefill rejected) with one extra constraint — an
     # explicit thinking={"type": "disabled"} is a 400 on this model; thinking
@@ -483,6 +518,8 @@ class AnthropicProvider:
             thinking_dict: dict[str, Any] = {"type": "adaptive"}
             if caps.thinking_display:
                 thinking_dict["display"] = caps.thinking_display
+            if caps.thinking_prefix_bound:
+                thinking_dict["block_binding"] = {"prefix_mismatch_behavior": "drop_block"}
             thinking_params = {"thinking": thinking_dict}
             if caps.supports_temperature:
                 temperature = 1.0  # Required with thinking
@@ -529,6 +566,9 @@ class AnthropicProvider:
             wire_extra = {k: v for k, v in extra_params.items() if k not in _INTERNAL_EXTRA_PARAMS}
             if wire_extra:
                 kwargs["extra_body"] = wire_extra
+
+        if "block_binding" in thinking_params.get("thinking", {}):
+            kwargs["extra_headers"] = {"anthropic-beta": _THINKING_BINDING_BETA}
 
         return kwargs
 
@@ -942,13 +982,20 @@ class AnthropicProvider:
             deferred_names,
         )
         if extra_headers:
-            kwargs["extra_headers"] = extra_headers
+            kwargs["extra_headers"] = _merge_extra_headers(
+                kwargs.get("extra_headers"), extra_headers
+            )
 
         refuse_aborted_request(cancel_ref)
         if request_metrics_ref is not None:
             request_metrics_ref.append(
                 ProviderRequestMetrics(
-                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools"))
+                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools")),
+                    native_tools_enabled=request_uses_native_tools(
+                        # Anthropic client tools may omit type or use "custom".
+                        kwargs,
+                        client_tool_types=(None, "custom"),
+                    ),
                 )
             )
 
@@ -1301,6 +1348,25 @@ class AnthropicProvider:
         return _join_reasoning_with_cap(parts)
 
 
+def _merge_extra_headers(wire: dict[str, str] | None, caller: dict[str, str]) -> dict[str, str]:
+    """Overlay caller headers on the wire-built ones.
+
+    Callers win on every header except ``anthropic-beta``, where both
+    sides carry independent beta values and the header is a comma-joined
+    list -- dropping either half would silently disable one feature.
+    """
+    merged = dict(wire or {})
+    for name, value in caller.items():
+        existing = next((k for k in merged if k.lower() == name.lower()), None)
+        if existing is not None and name.lower() == "anthropic-beta" and merged[existing]:
+            merged[existing] = f"{merged[existing]},{value}"
+            continue
+        if existing is not None:
+            del merged[existing]
+        merged[name] = value
+    return merged
+
+
 def _normalize_finish_reason(reason: str) -> str:
     """Normalize Anthropic stop reasons to OpenAI-compatible strings."""
     if reason == "end_turn":
@@ -1309,9 +1375,6 @@ def _normalize_finish_reason(reason: str) -> str:
         return "tool_calls"
     if reason == "max_tokens":
         return "length"
-    if reason == "pause_turn":
-        # Server-side tool (web search) paused a long turn; treat as stop
-        return "stop"
     if reason == "refusal":
         # A safety classifier declined the request.  This arrives as a
         # SUCCESSFUL HTTP 200 with content empty (declined before any

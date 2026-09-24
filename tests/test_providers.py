@@ -13,6 +13,7 @@ import pytest
 from tests._session_helpers import fake_anthropic_stream, fake_chat_stream
 from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
 from turnstone.core.lowering import repair_wire_messages
+from turnstone.core.providers import create_provider
 from turnstone.core.providers._openai import OpenAIProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_common import (
@@ -34,8 +35,87 @@ from turnstone.core.providers._protocol import (
     ToolCallDelta,
     UsageInfo,
     drain_stream,
+    request_uses_native_tools,
     serialized_tool_chars,
 )
+
+# ---------------------------------------------------------------------------
+# Prepared request facts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("family", ["openai-compatible", "openai", "anthropic-compatible"])
+@pytest.mark.parametrize(
+    "mode", ["none", "client", "search", "deferred", "extra_native", "extra_disable", "mcp"]
+)
+def test_prepared_request_reports_native_tool_posture(family, mode):
+    provider = create_provider(family)
+    client = MagicMock()
+    client.chat.completions.create.return_value = iter([])
+    client.responses.create.return_value = iter([])
+    client.messages.stream.return_value.__enter__.return_value = iter([])
+    tool_name = "web_search" if mode in ("search", "extra_disable") else "lookup"
+    tools = (
+        None
+        if mode == "none"
+        else [
+            {
+                "type": "function",
+                "function": {"name": tool_name, "parameters": {}},
+            }
+        ]
+    )
+    extra = None
+    if mode == "extra_native":
+        extra = {"tools": [{"type": "code_interpreter"}]}
+    elif mode == "extra_disable":
+        extra = {"tools": None, "web_search_options": None}
+    elif mode == "mcp":
+        extra = {
+            "mcp_servers": [{"type": "url", "name": "remote", "url": "https://example.com/mcp"}]
+        }
+    metrics = []
+    stream = provider.create_streaming(
+        client=client,
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=tools,
+        capabilities=ModelCapabilities(
+            supports_web_search=True,
+            supports_tool_search=True,
+        ),
+        deferred_names=frozenset({"lookup"}) if mode == "deferred" else None,
+        extra_params=extra,
+        request_metrics_ref=metrics,
+    )
+    list(stream)
+    # The Responses adapter does not forward extra_params. Its metrics must
+    # describe what was actually prepared, not the caller's requested override.
+    native = mode == "search" or (mode == "deferred" and family != "openai-compatible")
+    if family == "openai":
+        native = native or mode == "extra_disable"
+    else:
+        native = native or mode in ("extra_native", "mcp")
+    assert len(metrics) == 1
+    assert metrics[0].native_tools_enabled is native
+
+
+@pytest.mark.parametrize(
+    "body,native",
+    [
+        ({"tools": [{"type": "function"}]}, False),
+        ({"tools": [{"type": "function", "defer_loading": True}]}, False),
+        ({"extra_body": None}, False),
+        ({"tools": [{}]}, True),
+        ({"tools": ["unknown"]}, True),
+        ({"tools": {"type": "function"}}, True),
+        ({"web_search_options": {}}, True),
+        ({"tools": [{"type": "code_exec"}], "extra_body": {"tools": None}}, False),
+    ],
+)
+def test_native_tool_posture_handles_overrides_and_unknown_shapes(body, native):
+    assert request_uses_native_tools(body) is native
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2020,6 +2100,7 @@ class TestAnthropicHelpers:
         assert caps.supports_vision is True
         assert caps.supports_reasoning_replay is True
         assert caps.supports_mid_conversation_system is True
+        assert caps.thinking_prefix_bound is False
 
     def test_capabilities_fable_5_dated(self) -> None:
         from turnstone.core.providers._anthropic import AnthropicProvider
@@ -2030,6 +2111,38 @@ class TestAnthropicHelpers:
         assert caps.supports_temperature is False
         assert caps.thinking_display == "summarized"
         assert caps.supports_mid_conversation_system is True
+        # A dated fable-5 snapshot must not slide onto the fable-5-1 row.
+        assert caps.thinking_prefix_bound is False
+
+    def test_capabilities_fable_5_1(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-fable-5-1")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert caps.effort_levels == ("low", "medium", "high", "xhigh", "max")
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_pdf is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
+        assert caps.thinking_prefix_bound is True
+
+    def test_capabilities_fable_5_1_dated(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-fable-5-1-20260901")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.thinking_prefix_bound is True
 
     def test_capabilities_opus_5(self) -> None:
         from turnstone.core.providers._anthropic import AnthropicProvider
@@ -3441,11 +3554,11 @@ class TestAnthropicWebSearch:
         assert len(info_chunks) == 1
         assert "test query" in info_chunks[0].info_delta
 
-    def test_pause_turn_normalized_to_stop(self) -> None:
-        """pause_turn stop reason should normalize to 'stop'."""
+    def test_pause_turn_preserved(self) -> None:
+        """A server-tool continuation is distinct from an ordinary stop."""
         from turnstone.core.providers._anthropic import _normalize_finish_reason
 
-        assert _normalize_finish_reason("pause_turn") == "stop"
+        assert _normalize_finish_reason("pause_turn") == "pause_turn"
 
     def test_drained_stream_skips_server_blocks(self) -> None:
         """Server-side blocks surface as transient info (dropped by the
@@ -3793,7 +3906,8 @@ class TestOpenAIWebSearch:
         )
         assert request_metrics == [
             ProviderRequestMetrics(
-                serialized_tool_chars=serialized_tool_chars(call_kwargs.get("tools"))
+                serialized_tool_chars=serialized_tool_chars(call_kwargs.get("tools")),
+                native_tools_enabled=True,
             )
         ]
         assert request_metrics[0].serialized_tool_chars == 0
@@ -4819,7 +4933,9 @@ class TestOpenAIPromptCaching:
     def setup_method(self) -> None:
         self.provider = OpenAIProvider()
 
-    @pytest.mark.parametrize("model", ("gpt-5.5-local-lora", "gpt-5.6-local-lora"))
+    @pytest.mark.parametrize(
+        "model", ("gpt-5.5-local-lora", "gpt-5.6-local-lora", "gpt-6-astra-local-lora")
+    )
     def test_chat_compat_streaming_omits_commercial_cache_params(self, model: str) -> None:
         """A local model name must not activate commercial OpenAI cache controls."""
         client = MagicMock()
@@ -5525,7 +5641,7 @@ class TestResponsesParamBuilding:
 
     def test_compat_responses_omits_commercial_cache_params(self) -> None:
         provider = type(self.provider)(compat=True)
-        for model in ("gpt-5.5-local-lora", "gpt-5.6-local-lora"):
+        for model in ("gpt-5.5-local-lora", "gpt-5.6-local-lora", "gpt-6-astra-local-lora"):
             kwargs = provider._build_kwargs(
                 model=model,
                 messages=[{"role": "user", "content": "Hi"}],
@@ -6148,15 +6264,16 @@ class TestResponsesDrainedStream:
         assert result.usage.prompt_tokens == 10
         assert result.usage.completion_tokens == 5
 
-    def test_refusal_renders_in_content(self) -> None:
+    @pytest.mark.parametrize("refusal", ["cannot help with that", ""])
+    def test_refusal_renders_in_content(self, refusal: str) -> None:
         # The response.refusal.done handler (CHANGELOG "refusals render in
-        # content") — a refused turn must not drain to empty content.
+        # content") — the event identifies a refusal even when its text is empty.
         events = [
-            SimpleNamespace(type="response.refusal.done", refusal="cannot help with that"),
+            SimpleNamespace(type="response.refusal.done", refusal=refusal),
             *self._make_events(),
         ]
         result = self._drain(events)
-        assert result.content == "[Refused: cannot help with that]"
+        assert result.content == f"[Refused: {refusal}]"
 
     def test_truncation_rebuilds_blocks_from_terminal_response_output(self) -> None:
         # The item being generated at max_output_tokens truncation never
@@ -6370,3 +6487,146 @@ def test_commercial_lanes_declare_server_parses_reasoning():
     ]:
         caps = create_provider(name).get_capabilities(model)
         assert caps.server_parses_reasoning is False, (name, model)
+
+
+# ===========================================================================
+# TestAnthropicThinkingPrefixBinding
+# ===========================================================================
+
+
+class TestAnthropicThinkingPrefixBinding:
+    """``thinking_prefix_bound`` rows opt into drop_block + the controls beta."""
+
+    _BETA = "thinking-binding-controls-2026-08-01"
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def _kwargs(self, model: str) -> dict[str, Any]:
+        caps = self.provider.get_capabilities(model)
+        return self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="high",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=None,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model=model,
+            tools=None,
+        )
+
+    def test_fable_5_1_sends_drop_block_and_beta(self) -> None:
+        kwargs = self._kwargs("claude-fable-5-1")
+        assert kwargs["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert kwargs["extra_headers"] == {"anthropic-beta": self._BETA}
+
+    def test_fable_5_sends_neither(self) -> None:
+        kwargs = self._kwargs("claude-fable-5")
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert "extra_headers" not in kwargs
+
+    def test_caller_beta_header_is_joined_not_replaced(self) -> None:
+        from tests._wire_capture import RecordingClient
+
+        client = RecordingClient()
+        gen = self.provider.create_streaming(
+            client=client,
+            model="claude-fable-5-1",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=64,
+            extra_headers={"anthropic-beta": "other-beta-2026-01-01", "x-trace": "t1"},
+        )
+        gen.close()
+        headers = client.captured["payload"]["extra_headers"]
+        assert headers == {
+            "anthropic-beta": f"{self._BETA},other-beta-2026-01-01",
+            "x-trace": "t1",
+        }
+
+    def test_caller_beta_header_joins_case_insensitively(self) -> None:
+        from tests._wire_capture import RecordingClient
+
+        client = RecordingClient()
+        gen = self.provider.create_streaming(
+            client=client,
+            model="claude-fable-5-1",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=64,
+            extra_headers={"Anthropic-Beta": "other-beta-2026-01-01"},
+        )
+        gen.close()
+        headers = client.captured["payload"]["extra_headers"]
+        assert headers == {"anthropic-beta": f"{self._BETA},other-beta-2026-01-01"}
+
+    def test_caller_headers_pass_through_on_unbound_rows(self) -> None:
+        from tests._wire_capture import RecordingClient
+
+        client = RecordingClient()
+        gen = self.provider.create_streaming(
+            client=client,
+            model="claude-fable-5",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=64,
+            extra_headers={"x-trace": "t1"},
+        )
+        gen.close()
+        assert client.captured["payload"]["extra_headers"] == {"x-trace": "t1"}
+
+    def test_real_sdk_puts_control_on_the_wire(self) -> None:
+        """Drive the real SDK: the untyped control must reach the HTTP body
+        verbatim and the beta must land as a request header (the SDK
+        floor is below the release that types ``block_binding``)."""
+        import anthropic
+        import httpx
+
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["beta"] = request.headers.get("anthropic-beta")
+            captured["body"] = json.loads(request.content)
+            sse = (
+                "event: message_start\n"
+                'data: {"type":"message_start","message":{"id":"m","type":"message",'
+                '"role":"assistant","model":"claude-fable-5-1","content":[],'
+                '"stop_reason":null,"stop_sequence":null,'
+                '"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+                "event: message_delta\n"
+                'data: {"type":"message_delta","delta":{"stop_reason":"end_turn",'
+                '"stop_sequence":null},"usage":{"output_tokens":1}}\n\n'
+                "event: message_stop\n"
+                'data: {"type":"message_stop"}\n\n'
+            )
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, content=sse.encode()
+            )
+
+        client = anthropic.Anthropic(
+            api_key="test-key",
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        try:
+            chunks = list(
+                self.provider.create_streaming(
+                    client=client,
+                    model="claude-fable-5-1",
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=64,
+                )
+            )
+        finally:
+            client.close()
+        assert captured["beta"] == self._BETA
+        assert captured["body"]["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        finishes = [c.finish_reason for c in chunks if c.finish_reason]
+        assert finishes == ["stop"]
