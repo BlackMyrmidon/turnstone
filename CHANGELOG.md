@@ -12,6 +12,41 @@ that minor, so the current stable line never has two independently writable
 branches. Earlier stable lines (`stable/1.7`, `stable/1.6`, `stable/1.5`) are
 frozen.
 
+## [1.8.6]
+
+### Changed
+
+- **Containers run under an init process.** The image starts Turnstone under `tini`, and the Helm
+  chart's pods share a process namespace, so orphaned helper processes are reaped. Stopping a
+  container now exits with code 143 instead of 0.
+
+### Fixed
+
+- **Helm chart (#1319, #1330).** The bundled PostgreSQL chart comes from its OCI registry, Services
+  take their own labels, annotations and `externalTrafficPolicy`, and the default image is the
+  current release instead of `0.3.0`.
+- **Dashboard certificate (#1289).** On a Docker install, the dashboard keeps one HTTPS certificate
+  across restarts, valid for a year instead of 12 hours. Re-running `run.sh` restarts Caddy to
+  apply this, and `turnstone-doctor` flags a Caddy still running its old config.
+- **Leftover stdio MCP helpers (#1226).** Processes a stdio MCP server started are stopped when its
+  connection closes, instead of leaking on every reconnect, reload or shutdown.
+- **MCP OAuth consent.** A malformed return URL falls back to the home page instead of aborting
+  consent.
+- **Claude Opus 5.5.** On newer Anthropic organizations, requests no longer fail with a 400 after
+  compaction or another history edit.
+- **GPT-6 Sol, GPT-6 Luna and GPT-6.1 Sol.** Each model has its own capability row, so its context
+  window, output cap, reasoning effort, temperature handling and image input are right. A window
+  saved as 32,768 from the Models tab's Detect stays until set to 0 (auto-detect) or 1,050,000.
+
+### Security
+
+- **Credential redaction.** The output guard and the browser's redaction remove whole JSON Web
+  Tokens and credential query parameters such as `access_token`, `client_secret` and `password`.
+- **Redaction speed.** Redacting long runs of nested URLs no longer slows down quadratically;
+  128 KB of them took 8.5 seconds.
+- **Dependency advisories.** The container image moves from PyJWT 2.13.0, which has 14 advisories,
+  to 2.15.1, and the TypeScript SDK builds with source-map-js 1.2.2 (GHSA-68fv-2mgg-jv7q).
+
 ## [1.8.5]
 
 ### Fixed
