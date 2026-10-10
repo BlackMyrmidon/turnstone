@@ -17,6 +17,7 @@ from turnstone.core.providers import create_provider
 from turnstone.core.providers._openai import OpenAIProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_common import (
+    OPENAI_CAPABILITIES,
     OPENAI_COMPAT_DEFAULT,
     apply_cache_retention,
     apply_temperature_and_effort,
@@ -2176,6 +2177,38 @@ class TestAnthropicHelpers:
         assert caps.thinking_display == "summarized"
         assert caps.supports_effort is True
         assert caps.supports_mid_conversation_system is True
+        # A dated opus-5 snapshot must not slide onto the opus-5-5 row.
+        assert caps.thinking_prefix_bound is False
+
+    def test_capabilities_opus_5_5(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-5-5")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert caps.effort_levels == ("low", "medium", "high", "xhigh", "max")
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_pdf is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
+        assert caps.thinking_prefix_bound is True
+
+    def test_capabilities_opus_5_5_dated(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-5-5-20260922")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.thinking_prefix_bound is True
 
     def test_capabilities_opus_4_8(self) -> None:
         from turnstone.core.providers._anthropic import AnthropicProvider
@@ -3128,6 +3161,78 @@ class TestOpenAIParameterGating:
             kwargs: dict[str, Any] = {}
             apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="max")
             assert kwargs["reasoning_effort"] == "max", tier
+
+    def test_gpt6_sol_luna_rows(self) -> None:
+        """GPT-6 Sol and Luna: 1.05M context / 128K output, the none..max
+        ladder with a medium default, and the documented Responses surface.
+        Neither id prefix-matches the Astra row."""
+        for model in ("gpt-6-sol", "gpt-6-luna", "gpt-6-sol-2026-09-01"):
+            caps = lookup_openai_capabilities(model)
+            assert caps.context_window == 1050000, model
+            assert caps.max_output_tokens == 128000, model
+            assert caps.reasoning_effort_values == (
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            ), model
+            assert caps.default_reasoning_effort == "medium", model
+            assert caps.supports_tool_search is True, model
+            assert caps.supports_vision is True, model
+            assert caps.supports_pdf is True, model
+            assert caps.supports_reasoning_replay is True, model
+            assert caps.supports_verbosity is True, model
+            assert caps.supports_pro_mode is True, model
+            assert caps.supports_mid_conversation_system is False, model
+
+    def test_gpt6_sol_luna_temperature_only_at_effort_none(self) -> None:
+        """Sampling parameters ride only when reasoning is explicitly off;
+        every effort level, including none and max, reaches the wire."""
+        for model in ("gpt-6-sol", "gpt-6-luna"):
+            caps = lookup_openai_capabilities(model)
+            for effort in ("low", "high", "max"):
+                kwargs: dict[str, Any] = {}
+                apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort=effort)
+                assert "temperature" not in kwargs, (model, effort)
+                assert kwargs["reasoning_effort"] == effort, (model, effort)
+            unset: dict[str, Any] = {}
+            apply_temperature_and_effort(unset, caps, temperature=0.7, reasoning_effort=None)
+            assert "temperature" not in unset, model
+            none_kwargs: dict[str, Any] = {}
+            apply_temperature_and_effort(
+                none_kwargs, caps, temperature=0.7, reasoning_effort="none"
+            )
+            assert none_kwargs["temperature"] == 0.7, model
+            assert none_kwargs["reasoning_effort"] == "none", model
+
+    def test_gpt6_astra_row_unchanged_by_sol_luna(self) -> None:
+        """Astra keeps its own contract: no none effort, never a temperature."""
+        caps = lookup_openai_capabilities("gpt-6-astra")
+        assert "none" not in caps.reasoning_effort_values
+        assert caps.supports_temperature is False
+        assert caps.supports_mid_conversation_system is True
+
+    def test_gpt6_1_sol_row(self) -> None:
+        """GPT-6.1 Sol: the GPT-6 limits and surface with Astra's always-on
+        reasoning (no none level, never a temperature) and a documented
+        medium default.  The dotted id must neither fall to the default row
+        nor inherit the gpt-6-sol row's none level."""
+        for model in ("gpt-6.1-sol", "gpt-6.1-sol-2026-09-29"):
+            caps = lookup_openai_capabilities(model)
+            assert caps.context_window == 1050000, model
+            assert caps.max_output_tokens == 128000, model
+            assert caps.supports_temperature is False, model
+            assert caps.reasoning_effort_values == ("low", "medium", "high", "xhigh", "max"), model
+            assert caps.default_reasoning_effort == "medium", model
+            assert caps.supports_tool_search is True, model
+            assert caps.supports_vision is True, model
+            assert caps.supports_pdf is True, model
+            assert caps.supports_reasoning_replay is True, model
+            assert caps.supports_verbosity is True, model
+            assert caps.supports_pro_mode is True, model
+            assert caps.supports_mid_conversation_system is False, model
 
 
 class TestAnthropicOrphanedToolUse:
@@ -4979,6 +5084,17 @@ class TestOpenAIPromptCaching:
             assert kwargs.get("prompt_cache_options") == {"ttl": "30m"}, model
             assert "prompt_cache_retention" not in kwargs
 
+    def test_gpt6_uses_prompt_cache_options(self) -> None:
+        """Every GPT-6 family row in the table, point releases included, uses
+        the replacement cache API."""
+        tiers = [name for name in OPENAI_CAPABILITIES if name.startswith("gpt-6")]
+        assert {"gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"} <= set(tiers)
+        for model in tiers:
+            kwargs: dict[str, Any] = {}
+            apply_cache_retention(kwargs, model)
+            assert kwargs.get("prompt_cache_options") == {"ttl": "30m"}, model
+            assert "prompt_cache_retention" not in kwargs, model
+
     def test_cache_retention_not_set_for_non_gpt5(self) -> None:
         """Non-GPT-5 models do not get cache retention."""
         for model in ("o3", "o4-mini", "local-model", "gpt-4o"):
@@ -6529,6 +6645,20 @@ class TestAnthropicThinkingPrefixBinding:
 
     def test_fable_5_sends_neither(self) -> None:
         kwargs = self._kwargs("claude-fable-5")
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert "extra_headers" not in kwargs
+
+    def test_opus_5_5_sends_drop_block_and_beta(self) -> None:
+        kwargs = self._kwargs("claude-opus-5-5")
+        assert kwargs["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert kwargs["extra_headers"] == {"anthropic-beta": self._BETA}
+
+    def test_opus_5_sends_neither(self) -> None:
+        kwargs = self._kwargs("claude-opus-5")
         assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert "extra_headers" not in kwargs
 
