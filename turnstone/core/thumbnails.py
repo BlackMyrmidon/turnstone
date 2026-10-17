@@ -9,6 +9,12 @@ from __future__ import annotations
 
 from io import BytesIO
 
+from turnstone.core.images import (
+    MAX_JPEG_SCANS,
+    exif_orientation,
+    too_many_jpeg_scans,
+    turn_upright,
+)
 from turnstone.core.log import get_logger
 
 log = get_logger(__name__)
@@ -20,11 +26,18 @@ _THUMB_MAX_PX = 160
 # Tighten it so a malicious upload can't OOM the node while we build a thumbnail.
 _MAX_IMAGE_PIXELS = 40_000_000
 
+# The formats a stored image can be.  Uploads and read_file results are PNG,
+# JPEG or WebP, but uploads once included GIF, and read_file once stored
+# whatever bytes a file with an image extension held, TIFF, BMP and ICO
+# included.  Pillow is offered nothing else: its EPS decoder runs Ghostscript
+# on the bytes.
+_IMAGE_FORMATS = ("PNG", "JPEG", "GIF", "WEBP", "TIFF", "BMP", "ICO")
+
 
 def make_thumbnail(data: bytes, kind: str, *, max_px: int = _THUMB_MAX_PX) -> bytes | None:
     """Return a small PNG thumbnail for an ``image``/``pdf`` blob, else ``None``."""
     try:
-        from PIL import Image, ImageOps
+        from PIL import Image, JpegImagePlugin
     except ImportError:  # pragma: no cover - declared dependency; defensive
         log.warning("Pillow not installed; thumbnails unavailable")
         return None
@@ -41,14 +54,17 @@ def make_thumbnail(data: bytes, kind: str, *, max_px: int = _THUMB_MAX_PX) -> by
                 return None
             img = Image.open(BytesIO(pages[0]))
         elif kind == "image":
-            img = Image.open(BytesIO(data))
+            if too_many_jpeg_scans(data):
+                log.warning("thumbnail rejected: JPEG has more than %d scans", MAX_JPEG_SCANS)
+                return None
+            img = Image.open(BytesIO(data), formats=_IMAGE_FORMATS)
         else:
             return None
         # Reject oversized images explicitly before any decode.  Pillow's
         # MAX_IMAGE_PIXELS only *raises* above 2x the cap; between the cap and 2x
         # it merely warns and decodes fully (a 40-80M px image → ~480MB RGB),
         # defeating the bound.  The header-declared size is known after open(),
-        # so gate on it before exif_transpose / convert (both decode the pixels).
+        # so gate on it before load / convert (both decode the pixels).
         # (Explicit check, not a warnings filter: make_thumbnail runs in a thread
         # and the global warnings state is not thread-safe.)
         px = img.size[0] * img.size[1]
@@ -61,10 +77,17 @@ def make_thumbnail(data: bytes, kind: str, *, max_px: int = _THUMB_MAX_PX) -> by
                 _MAX_IMAGE_PIXELS,
             )
             return None
+        # A JPEG (multi-picture ones included) decodes at the smallest scale
+        # that still covers twice the thumbnail: a phone photo decodes at an
+        # eighth of its size, in a fraction of the time and memory.
+        if isinstance(img, JpegImagePlugin.JpegImageFile):
+            img.draft("RGB", (max_px * 2, max_px * 2))
         # Honour EXIF orientation so a phone photo's thumbnail isn't rotated:
-        # Pillow doesn't auto-apply the tag and PNG can't carry it.  No-op for
+        # Pillow doesn't auto-apply the tag and PNG can't carry it.  Read after
+        # decoding, since a PNG may store its EXIF after the pixels.  No-op for
         # the rasterized-PDF branch (its pages carry no EXIF).
-        oriented = ImageOps.exif_transpose(img) or img
+        img.load()
+        oriented = turn_upright(img, exif_orientation(img))
         rgb = oriented.convert("RGB")
         rgb.thumbnail((max_px, max_px))
         buf = BytesIO()

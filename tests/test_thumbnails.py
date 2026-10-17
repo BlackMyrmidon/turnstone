@@ -44,6 +44,14 @@ class TestMakeThumbnail:
         out = make_thumbnail(PNG_1x1, "image")
         assert out is not None and out[:8] == _PNG_MAGIC
 
+    def test_no_thumbnail_for_a_jpeg_with_too_many_scans(self) -> None:
+        # Each scan costs a decode pass over the whole picture.
+        pytest.importorskip("PIL.Image")
+        from tests._jpeg_helpers import jpeg_with_scans
+
+        assert make_thumbnail(jpeg_with_scans(0), "image") is not None
+        assert make_thumbnail(jpeg_with_scans(150), "image") is None
+
     def test_image_thumbnail_honours_exif_orientation(self) -> None:
         pil = pytest.importorskip("PIL.Image")
         src = pil.new("RGB", (40, 20), "red")  # landscape source
@@ -56,6 +64,54 @@ class TestMakeThumbnail:
         thumb = pil.open(BytesIO(out))
         assert thumb.height > thumb.width, "thumbnail must reflect the applied EXIF rotation"
 
+    def test_exif_after_the_pixels_counts(self) -> None:
+        pil = pytest.importorskip("PIL.Image")
+        from tests._exif_helpers import exif_block, orientation_entry, png_with_exif
+
+        out = make_thumbnail(
+            png_with_exif(exif_block([orientation_entry(6)]), after_pixels=True), "image"
+        )
+        assert out is not None
+        assert pil.open(BytesIO(out)).size == (20, 40)
+
+    def test_a_rotated_photo_with_oddly_typed_tags_still_has_a_thumbnail(self) -> None:
+        # Pillow's own transpose rewrote the remaining EXIF, and failed on a tag
+        # stored in a type other than the one it expects.
+        import struct
+
+        pil = pytest.importorskip("PIL.Image")
+        from tests._exif_helpers import exif_block, jpeg_with_exif, orientation_entry
+
+        resolution_unit = (0x0128, 4, 1, struct.pack("<L", 70000))
+        out = make_thumbnail(
+            jpeg_with_exif(exif_block([orientation_entry(6), resolution_unit])), "image"
+        )
+        assert out is not None
+        assert pil.open(BytesIO(out)).size == (20, 40)
+
+    def test_a_large_jpeg_decodes_at_reduced_scale(self, monkeypatch) -> None:
+        # A create can attach ten phone photos, whose thumbnails are all asked
+        # for at once.
+        pil = pytest.importorskip("PIL.Image")
+        from PIL import JpegImagePlugin
+
+        scaled: list[tuple[int, int]] = []
+        real_draft = JpegImagePlugin.JpegImageFile.draft
+
+        def spy(self, mode, size):
+            result = real_draft(self, mode, size)
+            scaled.append(self.size)
+            return result
+
+        monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "draft", spy)
+        buf = BytesIO()
+        pil.new("RGB", (2400, 1600), (30, 160, 90)).save(buf, format="JPEG")
+        out = make_thumbnail(buf.getvalue(), "image")
+        assert out is not None
+        # A quarter of the size still covers twice the 160px thumbnail.
+        assert scaled == [(600, 400)]
+        assert pil.open(BytesIO(out)).size == (160, 107)
+
     def test_pdf_thumbnail_is_png(self) -> None:
         out = make_thumbnail(_minimal_pdf(), "pdf")
         assert out is not None and out[:8] == _PNG_MAGIC
@@ -65,6 +121,24 @@ class TestMakeThumbnail:
 
     def test_garbage_image_returns_none(self) -> None:
         assert make_thumbnail(b"not an image", "image") is None
+
+    def test_other_decoders_are_never_offered_the_bytes(self, monkeypatch) -> None:
+        # read_file once stored any bytes behind an image extension, and
+        # Pillow's EPS decoder runs Ghostscript on what it is given.
+        eps_plugin = pytest.importorskip("PIL.EpsImagePlugin")
+        monkeypatch.setattr(
+            eps_plugin.EpsImageFile, "load", lambda *a, **k: pytest.fail("EPS was decoded")
+        )
+        eps = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 8 8\n%%EndComments\nshowpage\n"
+        assert make_thumbnail(eps, "image") is None
+
+    @pytest.mark.parametrize("fmt", ["GIF", "TIFF", "BMP", "ICO"])
+    def test_formats_stored_before_still_render(self, fmt: str) -> None:
+        pil = pytest.importorskip("PIL.Image")
+        buf = BytesIO()
+        pil.new("RGB", (16, 16), "red").save(buf, format=fmt)
+        out = make_thumbnail(buf.getvalue(), "image")
+        assert out is not None and out[:8] == _PNG_MAGIC
 
     @pytest.mark.filterwarnings("ignore::PIL.Image.DecompressionBombWarning")
     def test_oversized_image_rejected(self, monkeypatch) -> None:
@@ -77,6 +151,8 @@ class TestMakeThumbnail:
         from PIL import Image
 
         monkeypatch.setattr("turnstone.core.thumbnails._MAX_IMAGE_PIXELS", 50)
+        # make_thumbnail copies the cap into Pillow's global limit; restore it.
+        monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", Image.MAX_IMAGE_PIXELS)
         buf = BytesIO()
         Image.new("RGB", (6, 10)).save(buf, format="PNG")  # 60 px, in (50, 100]
         assert make_thumbnail(buf.getvalue(), "image") is None
@@ -88,6 +164,7 @@ class TestMakeThumbnail:
         from PIL import Image
 
         monkeypatch.setattr("turnstone.core.thumbnails._MAX_IMAGE_PIXELS", 64)
+        monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", Image.MAX_IMAGE_PIXELS)
         buf = BytesIO()
         Image.new("RGB", (8, 8)).save(buf, format="PNG")  # 64 px == cap
         out = make_thumbnail(buf.getvalue(), "image")

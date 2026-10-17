@@ -12,6 +12,33 @@ that minor, so the current stable line never has two independently writable
 branches. Earlier stable lines (`stable/1.7`, `stable/1.6`, `stable/1.5`) are
 frozen.
 
+## [1.8.7]
+
+### Changed
+
+- **GIF uploads.** Providers differ on accepting GIF, so uploads refuse it and the upload pickers no
+  longer offer it. A GIF already in a conversation still displays, and a model reads it as an
+  unreadable attachment.
+
+### Fixed
+
+- **Images from `read_file`.** The tool typed an image by its file extension, so a TIFF went out as
+  `image/tiff` and every later request in the workstream failed. It now reads the type from the
+  file's bytes and sends only PNG, JPEG and WebP.
+- **JPEGs saved in an extreme number of passes.** Uploads refuse a JPEG of more than 100 scans, and
+  thumbnails and the copy sent to the model skip one already stored, instead of tying up a CPU.
+- **Rotated photos with unusual EXIF.** They get an upright thumbnail and reach the model upright;
+  the orientation is read directly instead of through a transpose that failed on such photos.
+- **Pictures in a conversation.** A rotated photo is no longer decoded and re-encoded on every turn,
+  and large photos' thumbnails take a fraction of the time and memory.
+- **Several attachments on a create.** The error says which file was refused.
+
+### Security
+
+- **curl in the container image.** The image's curl moves from 8.14.1-2+deb13u5 to at least
+  8.14.1-2+deb13u7 (CVE-2026-8286, CVE-2026-8924, CVE-2026-8927, CVE-2026-92392), and the image
+  build refuses an older one.
+
 ## [1.8.6]
 
 ### Changed
